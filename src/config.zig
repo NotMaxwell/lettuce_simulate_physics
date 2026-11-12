@@ -23,6 +23,9 @@ pub const base_conduct_mult: f32 = 0.0005;
 pub const impact_heat_mult: f32 = 1.5;
 pub const base_explosion_heat: f32 = 350;
 pub const base_explosion_force: f32 = 10_000;
+/// Balls within this fraction of the blast radius are set alight regardless of mass;
+/// the outer ring only gets the mass-scaled heat.
+pub const explosion_fire_frac: f32 = 0.6;
 
 pub const hoop_left: f32 = 335;
 pub const hoop_right: f32 = 375;

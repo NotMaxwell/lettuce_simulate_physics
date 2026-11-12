@@ -327,6 +327,7 @@ pub fn knockback(w: *World, ex: f32, ey: f32, blast: f32) void {
     const flags: []const u8 = @ptrCast(s.items(.flags));
     const alive_bit: u8 = @bitCast(world.BallFlags{});
     const heat_k = cfg.base_explosion_heat * 100.0;
+    const fire_r = blast * cfg.explosion_fire_frac;
 
     var i: usize = 0;
     while (i + V <= n) : (i += V) {
@@ -344,7 +345,9 @@ pub fn knockback(w: *World, ex: f32, ey: f32, blast: f32) void {
         vxs[i..][0..V].* = @as(F, vxs[i..][0..V].*) + dx * k;
         vys[i..][0..V].* = @as(F, vys[i..][0..V].*) + dy * k;
         const heat = @select(f32, hit, @as(F, @splat(heat_k)) * inv_m * fall, @as(F, @splat(0)));
-        temps[i..][0..V].* = @as(F, temps[i..][0..V].*) + heat;
+        const heated = @as(F, temps[i..][0..V].*) + heat;
+        const ignite = hit & (d <= @as(F, @splat(fire_r)));
+        temps[i..][0..V].* = @select(f32, ignite, @max(heated, @as(F, @splat(cfg.flame_temp))), heated);
     }
     while (i < n) : (i += 1) {
         if (flags[i] & alive_bit == 0) continue;
@@ -357,5 +360,21 @@ pub fn knockback(w: *World, ex: f32, ey: f32, blast: f32) void {
         vxs[i] += dx * k;
         vys[i] += dy * k;
         temps[i] += heat_k / masses[i] * fall;
+        if (d <= fire_r) temps[i] = @max(temps[i], cfg.flame_temp);
     }
+}
+
+test "explosion sets nearby balls alight and only heats the outer ring" {
+    var w = World.init(std.testing.allocator, 3);
+    defer w.deinit();
+    // Heavy balls so mass-scaled heat alone would not reach ignition.
+    for ([_]f32{ 50, 200, 2000 }) |dx| {
+        try w.spawnBall(500 + dx, 300);
+        w.balls.items(.mass)[w.balls.len - 1] = 2000;
+    }
+    knockback(&w, 500, 300, 300);
+    const temps = w.balls.items(.temp);
+    try std.testing.expect(temps[0] >= cfg.flame_temp); // inside fire radius (180)
+    try std.testing.expect(temps[1] > cfg.room_temp and temps[1] < cfg.ignition_temp); // outer ring
+    try std.testing.expectEqual(cfg.room_temp, temps[2]); // outside the blast
 }
