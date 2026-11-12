@@ -5,3 +5,7 @@ __pycache__/
 .env
 venv/
 ENV/
+.zig-cache/
+zig-out/
+.scratch/
+.venv/
