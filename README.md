@@ -25,7 +25,16 @@ zig build bench -- 1000 600   # headless physics timing: <balls> <ticks>
 zig build test-bench          # physics unit tests
 ```
 
-Needs Zig 0.17 and the SDL3 development package. Extra keys in the Zig version:
+A prebuilt Linux x86-64 binary is in `bin/`. Run it from the repo root so it finds `assets/`:
+
+```bash
+./bin/lettuce-linux-x86_64
+```
+
+It needs SDL3 installed and a CPU with AVX2 (2013 or newer), and was built on Arch against a
+recent glibc, so older distros may need to build from source instead.
+
+Building needs Zig 0.17 and the SDL3 development package. Extra keys in the Zig version:
 **T** stress test (+1000 balls, merging off), **N** toggle merging, **P** perf overlay,
 **Ctrl with + / -** change balls per click by 25.
 
