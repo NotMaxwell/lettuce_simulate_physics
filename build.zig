@@ -2,7 +2,8 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
+    // Speed is the point of this project, so plain `zig build` is ReleaseFast; pass -Doptimize=debug for safety checks.
+    const optimize = b.option(std.builtin.Optimize, "optimize", "debug, safe, fast or small (default fast)") orelse .fast;
 
     const translate_c = b.addTranslateC(.{
         .root_source_file = b.path("src/c.h"),

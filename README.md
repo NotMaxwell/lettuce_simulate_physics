@@ -14,7 +14,22 @@ Balls can also be set on fire, which can transfer to other balls based on their 
 - **Press M:** toggle background music
 - **Press + or -:** increase or decrease balls spawned per click
 
-## Setup
+## Zig rewrite (branch `zig-rewrite`)
+
+The game is being rewritten in **Zig 0.17 + SDL3** to run 1000+ balls at 60 fps. The Python
+files remain as the behavioural reference.
+
+```bash
+zig build run                 # play (optimized build)
+zig build bench -- 1000 600   # headless physics timing: <balls> <ticks>
+zig build test-bench          # physics unit tests
+```
+
+Needs Zig 0.17 and the SDL3 development package. Extra keys in the Zig version:
+**T** stress test (+1000 balls, merging off), **N** toggle merging, **P** perf overlay,
+**Ctrl with + / -** change balls per click by 25.
+
+## Setup (original Python version)
 
 **Python 3.13** with **pygame 2.6.1**.
 

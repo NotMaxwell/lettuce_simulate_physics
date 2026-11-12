@@ -29,6 +29,7 @@ pub const Ball = struct {
     prev_y: f32,
     vx: f32,
     vy: f32,
+    /// Degrees, counter-clockwise positive (pygame.transform.rotate convention).
     angle: f32 = 0,
     prev_angle: f32 = 0,
     ang_vel: f32 = 0,
@@ -47,6 +48,8 @@ pub const Ball = struct {
     trail: [cfg.max_trail]Vec2 = undefined,
     trail_len: u8 = 0,
     trail_head: u8 = 0,
+    /// Position before the last grab-follow step; the throw impulse is measured from it.
+    grab_prev: Vec2 = .{},
 };
 
 pub const Particle = struct { x: f32, y: f32, vx: f32, vy: f32, size: f32, age: u16, life: u16, r: u8, g: u8, b: u8 };
@@ -74,6 +77,19 @@ pub const TickEvents = struct {
     explosions: u32 = 0,
     any_burning: bool = false,
     won: bool = false,
+    scores: u32 = 0,
+};
+
+/// Wall-clock cost of the last tick, filled by physics for the perf overlay and bench.
+pub const TickProfile = struct {
+    total_ns: u64 = 0,
+    gravity_ns: u64 = 0,
+    collide_ns: u64 = 0,
+    effects_ns: u64 = 0,
+    /// Narrow-phase distance tests done by the ball broad-phase.
+    pair_tests: u32 = 0,
+    /// Threads that took part in mutual gravity (1 = single-threaded).
+    gravity_threads: u32 = 1,
 };
 
 pub const TickInput = struct {
@@ -98,14 +114,21 @@ pub const World = struct {
     /// Highest level reached so far (min start_level); new balls spawn at 1..current_level.
     current_level: u8 = cfg.start_level,
     events: TickEvents = .{},
+    /// Events from actions taken between ticks (lasso, explodeAt); folded into the next tick's events.
+    pending_events: TickEvents = .{},
+    profile: TickProfile = .{},
     tick: u64 = 0,
     prng: std.Random.DefaultPrng,
+    /// Buffers owned by physics.zig, kept alive between ticks so steady-state ticks never allocate.
+    scratch: ?*anyopaque = null,
+    scratch_free: ?*const fn (std.mem.Allocator, *anyopaque) void = null,
 
     pub fn init(gpa: std.mem.Allocator, seed: u64) World {
         return .{ .gpa = gpa, .prng = .init(seed) };
     }
 
     pub fn deinit(w: *World) void {
+        if (w.scratch) |s| w.scratch_free.?(w.gpa, s);
         w.balls.deinit(w.gpa);
         w.particles.deinit(w.gpa);
         w.ashes.deinit(w.gpa);

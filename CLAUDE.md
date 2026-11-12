@@ -29,7 +29,7 @@ behavioural reference for the port; do not edit them.
   allocator is `std.heap.smp_allocator`; containers are unmanaged (`.empty`, pass `gpa`).
 
 ## Build and verify
-- `zig build` / `zig build run` — the game (ReleaseFast by default; `-Doptimize=Debug` to debug).
+- `zig build` / `zig build run` — the game (optimized by default; `-Doptimize=debug` for bounds/overflow checks).
 - `zig build test` — unit tests. `zig build bench -- <balls> <ticks>` — headless physics timing.
 - Headless runs: `SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy` (gives a real OpenGL renderer).
 - Scratch files go in `.scratch/` (git-ignored), never `/tmp`.
