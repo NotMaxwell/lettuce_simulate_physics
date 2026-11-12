@@ -23,7 +23,9 @@ recent glibc, so older distros may need to build from source.
 
 ## Build
 
-Needs Zig 0.17 and the SDL3 development package.
+Needs only Zig 0.17: SDL3 is fetched and built from source by the Zig package manager
+(`castholm/SDL`) and linked statically. Sound on Linux needs libpulse or libasound at runtime;
+without them the game runs silent.
 
 ```bash
 zig build run                 # play (optimized build)

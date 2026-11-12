@@ -5,12 +5,18 @@ pub fn build(b: *std.Build) void {
     // Speed is the point of this project, so plain `zig build` is ReleaseFast; pass -Doptimize=debug for safety checks.
     const optimize = b.option(std.builtin.Optimize, "optimize", "debug, safe, fast or small (default fast)") orelse .fast;
 
+    // SDL3 is built from source through the Zig package manager (static, X11/Wayland/audio are
+    // dlopened at runtime), so no system SDL3 or C toolchain is needed. Always ReleaseFast: our
+    // debug builds only need safety checks in our own code.
+    const sdl_lib = b.dependency("sdl", .{ .target = target, .optimize = .ReleaseFast }).artifact("SDL3");
+
     const translate_c = b.addTranslateC(.{
         .root_source_file = b.path("src/c.h"),
         .target = target,
         .optimize = optimize,
     });
     translate_c.addIncludePath(b.path("vendor"));
+    translate_c.addIncludePath(sdl_lib.getEmittedIncludeTree());
     const c_mod = translate_c.createModule();
 
     const exe_mod = b.createModule(.{
@@ -22,7 +28,7 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addIncludePath(b.path("vendor"));
     exe_mod.addCSourceFile(.{ .file = b.path("vendor/impl.c"), .flags = &.{"-O2"} });
-    exe_mod.linkSystemLibrary("SDL3", .{});
+    exe_mod.linkLibrary(sdl_lib);
 
     const exe = b.addExecutable(.{ .name = "lettuce", .root_module = exe_mod });
     b.installArtifact(exe);
@@ -53,7 +59,7 @@ pub fn build(b: *std.Build) void {
         });
         mod.addIncludePath(b.path("vendor"));
         mod.addCSourceFile(.{ .file = b.path("vendor/impl.c"), .flags = &.{"-O2"} });
-        mod.linkSystemLibrary("SDL3", .{});
+        mod.linkLibrary(sdl_lib);
         const tool_exe = b.addExecutable(.{ .name = tool.step, .root_module = mod });
         const tool_run = b.addRunArtifact(tool_exe);
         tool_run.setCwd(b.path("."));

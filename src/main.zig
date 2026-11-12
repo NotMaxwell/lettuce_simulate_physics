@@ -189,12 +189,20 @@ pub fn main(init: std.process.Init) !void {
     const gpa = std.heap.smp_allocator;
     const opts = parseOptions(try init.minimal.args.toSlice(init.arena.allocator()));
 
-    if (!c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_AUDIO)) return error.SdlInit;
+    // Audio is not initialised here: Audio.init brings it up itself and degrades to silence, so a
+    // machine with no sound backend (e.g. WSL without libpulse) still runs the game.
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
+        std.debug.print("SDL_Init failed: {s}\n", .{c.SDL_GetError()});
+        return error.SdlInit;
+    }
     defer c.SDL_Quit();
 
     var window: ?*c.SDL_Window = null;
     var sdl_opt: ?*c.SDL_Renderer = null;
-    if (!c.SDL_CreateWindowAndRenderer("Lettuce Simulate Physics", cfg.base_w, cfg.base_h, c.SDL_WINDOW_RESIZABLE, &window, &sdl_opt)) return error.SdlWindow;
+    if (!c.SDL_CreateWindowAndRenderer("Lettuce Simulate Physics", cfg.base_w, cfg.base_h, c.SDL_WINDOW_RESIZABLE, &window, &sdl_opt)) {
+        std.debug.print("SDL window/renderer failed: {s}\n", .{c.SDL_GetError()});
+        return error.SdlWindow;
+    }
     const sdl = sdl_opt.?;
     defer c.SDL_DestroyRenderer(sdl);
     defer c.SDL_DestroyWindow(window);
@@ -207,6 +215,7 @@ pub fn main(init: std.process.Init) !void {
         .sound = .init(gpa),
         .sdl = sdl,
     };
+    if (!g.sound.isActive()) std.debug.print("audio unavailable: no SDL audio backend could open a device (Linux needs libpulse or libasound); running silent\n", .{});
     defer g.lasso.deinit(gpa);
     defer g.sound.deinit();
     defer g.renderer.deinit();
