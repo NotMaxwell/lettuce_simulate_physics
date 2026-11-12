@@ -409,6 +409,12 @@ fn integrate(w: *World, in: TickInput) void {
     const temps = s.items(.temp);
     const flags = s.items(.flags);
     const radii = s.items(.radius);
+    // The background stretches to fill the play area, so the hoop drawn in it moves and
+    // scales with the bounds; config gives its position in base-window coordinates.
+    const hoop_scale = b.w / cfg.base_w;
+    const hoop_y = b.y + cfg.hoop_y * hoop_scale;
+    const hoop_left = b.x + cfg.hoop_left * hoop_scale;
+    const hoop_right = b.x + cfg.hoop_right * hoop_scale;
     for (0..w.balls.len) |i| {
         const f = &flags[i];
         // Ball.update_fire
@@ -445,10 +451,10 @@ fn integrate(w: *World, in: TickInput) void {
             continue;
         }
 
-        if (f.thrown and !f.scored and old_y < cfg.hoop_y and cfg.hoop_y <= ys[i]) {
-            const frac = (cfg.hoop_y - old_y) / (ys[i] - old_y);
+        if (f.thrown and !f.scored and old_y < hoop_y and hoop_y <= ys[i]) {
+            const frac = (hoop_y - old_y) / (ys[i] - old_y);
             const crossing = old_x + frac * (xs[i] - old_x);
-            if (cfg.hoop_left <= crossing and crossing <= cfg.hoop_right) {
+            if (hoop_left <= crossing and crossing <= hoop_right) {
                 f.scored = true;
                 w.events.scores += 1;
             }

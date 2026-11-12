@@ -1,29 +1,16 @@
 # physics_simulation
 
-A little pygame merge-sandbox with bouncy balls. Click anywhere empty to spawn a ball with random size, color, mass, bounciness, and friction. Balls will merge with balls of the same image to create bigger balls, and a higher level. 38 is the highest level. Balls bounce off the walls and off each other (mass-based elastic collisions, so heavy balls shove light ones around). Balls are gravitationally attracted to each other by the mass. The bigger the ball, the bigger the pull. Balls will turn into ashes after burning for long enough
-Balls can also be set on fire, which can transfer to other balls based on their temperature (°C) and kinetic energy. Additionally balls can explode, which also transfers heat. (Both are based on mass & distance) To put out the fires, click rapidly on the ball before it burns up.
+A merge-sandbox with bouncy balls, written in **Zig 0.17 + SDL3** and built to run thousands of
+balls at 60 fps. Click anywhere empty to spawn a ball with random size, mass, bounciness and
+friction. Balls merge with balls of the same image into a bigger, higher-level ball; 38 is the
+highest level. Balls bounce off the walls and each other (mass-based elastic collisions) and are
+gravitationally attracted to each other. Balls can be set on fire, which spreads by temperature
+and impact; explosions knock balls away and set the ones near the centre alight. Burning balls
+turn to ash unless you click them to cool them down. The play area grows as you add balls.
 
-## Controls
+It started as a Python/pygame learning project; that version lives on in [`python/`](python/).
 
-- **Left click empty space:** spawn a random ball
-- **Right click a ball:** set the ball on fire
-- **Left click a ball:** cool it down; hold and drag to move it, then release to throw it
-- **Hold Shift and drag around a ball:** lasso it to cause an explosion
-- **Hold G and left click:** attract balls toward the mouse while energy lasts
-- **Press F:** switch between downward gravity and attraction between balls
-- **Press M:** toggle background music
-- **Press + or -:** increase or decrease balls spawned per click
-
-## Zig rewrite (branch `zig-rewrite`)
-
-The game is being rewritten in **Zig 0.17 + SDL3** to run 1000+ balls at 60 fps. The Python
-files remain as the behavioural reference.
-
-```bash
-zig build run                 # play (optimized build)
-zig build bench -- 1000 600   # headless physics timing: <balls> <ticks>
-zig build test-bench          # physics unit tests
-```
+## Run
 
 A prebuilt Linux x86-64 binary is in `bin/`. Run it from the repo root so it finds `assets/`:
 
@@ -32,29 +19,49 @@ A prebuilt Linux x86-64 binary is in `bin/`. Run it from the repo root so it fin
 ```
 
 It needs SDL3 installed and a CPU with AVX2 (2013 or newer), and was built on Arch against a
-recent glibc, so older distros may need to build from source instead.
+recent glibc, so older distros may need to build from source.
 
-Building needs Zig 0.17 and the SDL3 development package. Extra keys in the Zig version:
-**T** stress test (+1000 balls, merging off), **N** toggle merging, **P** perf overlay,
-**Ctrl with + / -** change balls per click by 25.
+## Build
 
-## Setup (original Python version)
+Needs Zig 0.17 and the SDL3 development package.
 
-**Python 3.13** with **pygame 2.6.1**.
+```bash
+zig build run                 # play (optimized build)
+zig build run -Doptimize=debug  # with bounds and overflow checks
+zig build bench -- 1000 600   # headless physics timing: <balls> <ticks>
+zig build test-bench          # physics unit tests
+```
+
+## Controls
+
+- **Left click empty space:** spawn balls (balls per click shown bottom-left)
+- **Right click a ball:** set it on fire
+- **Left click a ball:** cool it down; hold and drag to move it, release to throw it
+- **Hold Shift and drag around balls:** lasso them to make them explode
+- **Hold G and left click:** attract balls toward the mouse while energy lasts
+- **F:** switch between downward gravity and attraction between balls
+- **+ / -:** change balls per click (hold Ctrl to step by 25)
+- **T:** stress test, adds 1000 balls and turns merging off
+- **N:** toggle merging
+- **P:** toggle the performance overlay
+- **M:** toggle background music
+
+## Layout
+
+- `src/main.zig` — window, input, fixed-timestep game loop
+- `src/physics.zig` — simulation tick: SIMD gravity, grid collisions, merging, heat, hoop
+- `src/effects.zig` — fire particles, ash, explosions
+- `src/render.zig` — batched GPU drawing, zooming camera, HUD
+- `src/audio.zig` — sound effects and music
+- `src/world.zig`, `src/config.zig` — shared data and tuning constants
+- `vendor/` — single-header image and MP3 decoders
+- `python/` — the original pygame version
+
+## Original Python version
 
 ```bash
 python3 -m venv venv
-source venv/bin/activate   # on Windows: venv\Scripts\activate
-pip install -r requirements.txt
-python main.py
+source venv/bin/activate      # on Windows: venv\Scripts\activate
+pip install -r python/requirements.txt
+python python/main.py         # run from the repo root so it finds assets/
 ```
-## Layout
-
-- `main.py` — pygame setup, event handling, and the main game loop
-- `ball.py` — the `Ball` class: gravity, wall bounces, floor friction, mouse clicking for putting out fires
-- `ash.py` — the `Ash` class: gravity, wall collisions, and fades away
-- `utils.py` — ball-to-ball and ash-to-ash collision handling
-- `particle.py` — reusable particle class for an effect controller to use
-- `fire_effect.py` — fire effect that is used when a ball is on fire
-- `explosion_effect.py` — explosion effect that is used when you lasso around a ball
-- `constants.py` — constants that are used around the project

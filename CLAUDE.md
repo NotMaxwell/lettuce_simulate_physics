@@ -1,10 +1,10 @@
 # Rules for AI agents working in this repo
 
 ## Project
-A merge-sandbox physics game, being rewritten from Python/pygame into Zig 0.17 + SDL3.
+A merge-sandbox physics game in Zig 0.17 + SDL3, rewritten from a Python/pygame original.
 Goal: 1000+ balls at a locked 60 fps with headroom, and the game should visibly show off
-its optimizations (perf overlay, stress mode). The Python files at the repo root are the
-behavioural reference for the port; do not edit them.
+its optimizations (perf overlay, stress mode). The original Python version lives in `python/`
+as the behavioural reference; do not edit it.
 
 ## Hard rules
 - All work goes to the fork `NotMaxwell/lettuce_simulate_physics` (remote `origin`).

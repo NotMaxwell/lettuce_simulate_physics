@@ -378,31 +378,20 @@ pub const Renderer = struct {
     }
 
     fn drawBackground(self: *Renderer, b: world.Rect, cam: Camera) !void {
-        // The image sits at the world origin at native size; show only the part inside the bounds.
-        const x0 = @max(b.x, 0);
-        const y0 = @max(b.y, 0);
-        const x1 = @min(b.x + b.w, self.bg_w);
-        const y1 = @min(b.y + b.h, self.bg_h);
+        // The original window showed the image's top-left base_w x base_h crop; that crop is
+        // stretched over the whole play area so the hoop stays where physics expects it.
         const q = &self.quads;
-        if (x1 > x0 and y1 > y0) {
-            try q.reserve(self.gpa, 4, 6);
-            q.texRect(cam.sx(x0), cam.sy(y0), (x1 - x0) * cam.s, (y1 - y0) * cam.s, .{ x0 / self.bg_w, y0 / self.bg_h, x1 / self.bg_w, y1 / self.bg_h }, fcolor(.{ .r = 1, .g = 1, .b = 1 }));
-            q.flush(self.sdl, self.bg);
-        }
+        try q.reserve(self.gpa, 4, 6);
+        q.texRect(cam.sx(b.x), cam.sy(b.y), b.w * cam.s, b.h * cam.s, .{ 0, 0, cfg.base_w / self.bg_w, cfg.base_h / self.bg_h }, fcolor(.{ .r = 1, .g = 1, .b = 1 }));
+        q.flush(self.sdl, self.bg);
         const t = &self.tris;
-        try t.reserve(self.gpa, 24, 36);
+        try t.reserve(self.gpa, 16, 24);
         const wc = rgb8(70, 72, 84);
         const l = cam.sx(b.x);
         const tp = cam.sy(b.y);
         const bw = b.w * cam.s;
         const bh = b.h * cam.s;
         const th = @max(cfg.wall * cam.s, 1);
-        // Fill whatever part of the play area the background image does not cover.
-        if (b.x + b.w > self.bg_w or b.y + b.h > self.bg_h) {
-            const dark = rgb8(24, 24, 30);
-            if (b.x + b.w > self.bg_w) t.rect(cam.sx(@max(self.bg_w, b.x)), tp, (b.x + b.w - @max(self.bg_w, b.x)) * cam.s, bh, dark);
-            if (b.y + b.h > self.bg_h) t.rect(l, cam.sy(@max(self.bg_h, b.y)), bw, (b.y + b.h - @max(self.bg_h, b.y)) * cam.s, dark);
-        }
         t.rect(l, tp, bw, th, wc);
         t.rect(l, tp + bh - th, bw, th, wc);
         t.rect(l, tp + th, th, bh - 2 * th, wc);
