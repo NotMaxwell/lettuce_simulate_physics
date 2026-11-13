@@ -15,8 +15,8 @@
 - Zig's SPIR-V backend omits the `Block` decoration (VUID-04680); `src/tools/spirv_fixup.zig` patches
   it at build time (9d83558). Every shader passes `spirv-val --target-env vulkan1.2`
   (gravity_kernels fixed on the sim branch).
-- The game clamps escaped bodies into a fixed, loose gravity box (pull from the box edge). The sim's
-  GPU-computed tight box made 1M disk 6.8 ms/tick vs the game's 16 ms: try it in galaxy mode.
+- The first `zig build test` after a source change ends with a "failed command: ...test --listen=-"
+  line but exits 0: stderr from tests that print, not a failure. Check the exit code, not the text.
 
 ## Not yet ported to the GPU
 - Impact heat (the solver does not expose approach speed); ash-ash collisions.
@@ -35,11 +35,14 @@ pull g·m/r), so circular speed is sqrt(g·M_enclosed) at any radius; disks have
 3. [x] Galaxy mode in the GPU world: explicit g and softening, fixed open bounds, collision modes
        solid / accrete / ghost (galaxy-only), keys O, 1-4, X, [ ], click spawns a star system;
        `--galaxy`, `--collide`. Body radius capped at 10 (`galaxy.max_body_radius`) so solid mode is
-       playable; this costs ~20% per tick (disk 100k 1.57 -> 1.95 ms, 1M 13.9 -> 16.4 ms; cap 40 is
-       baseline). Worth revisiting: why a radius cap slows the gravity pass.
+       playable; placement uses the uncapped `layoutRadius`, so the cap costs nothing. The gravity tree
+       box is computed on the GPU each tick inside the old fixed box as a window (one far escapee
+       still widens it back to the old box). Galaxy gravity ms/tick, 2026-11-13: disk 100k 0.62-0.66,
+       1M 5.05-5.23 (was 14.1), collision 200k 2.58-2.69 (was 6.15).
 4. [x] GPU trails so orbits are visible (key R); cleared whenever the world is cleared. Only checked
        headless: look at the head segment and R toggle in a window.
-5. [ ] Diagnostics on the HUD: energy and angular-momentum drift.
+5. [x] Diagnostics on the HUD: KE, Lz, sampled PE, E and drift since load (~0.29 ms per diag tick at 1M,
+       every 20 ticks).
 
 ## Scale (game): features at 1M balls, optimize toward 1B (standing goal, 2026-11-12)
 Every game feature must work at 1M balls on one GPU.
