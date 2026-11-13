@@ -5,9 +5,8 @@
 //! binned in (gpu_sim/collide.zig Sim).
 //! Bindings: ro 0 pos, 1 body, 2 ball_cell, 3 starts, 4 sorted_id, 5 meta, 6 heat, 7 fx;
 //!           rw 0 tmp.
-//! Deviations from physics.zig resolvePair: impact heat is not applied (the solver does not
-//! expose the approach speed), and a pair transfers heat once per tick, from the post-solve
-//! positions, instead of at each sequential contact.
+//! Deviations from physics.zig resolvePair: a pair transfers heat once per tick, from the
+//! post-solve positions, instead of at each sequential contact. Impact heat is gpu_sim k_finish.
 const c = @import("common.zig");
 const L = c.L;
 

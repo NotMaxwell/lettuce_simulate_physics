@@ -44,7 +44,7 @@ const GameParams = extern struct {
     fx_flags: u32 = 0,
     /// 1 = accrete (gpu_game/common.zig GameParams.collide).
     collide: u32 = 0,
-    _pad1: u32 = 0,
+    event_cap: u32 = 0,
     _pad2: u32 = 0,
     _pad3: u32 = 0,
     _pad4: u32 = 0,
@@ -98,6 +98,8 @@ pub const Pool = struct {
 /// is thinned so a ring holds a full lifetime of particles; see k_emit.zig.
 pub const fire_pool_cap: u32 = 1 << 20;
 pub const ash_pool_cap: u32 = 1 << 19;
+/// Cells of the ash contact hash (k_particles.zig); a power of two.
+const ash_table: u32 = 1 << 19;
 
 /// Latest fire counters read back from the GPU (about two ticks old).
 pub const FxStats = struct {
@@ -114,6 +116,8 @@ const event_burnout: u32 = 5;
 const c_fx_fire_alive: u32 = 2;
 const c_fx_ash_alive: u32 = 3;
 const fx_slots: u32 = 16;
+/// gpu_game/common.zig fx_impact.
+const c_fx_impact: u32 = 10;
 
 const Blast = extern struct { x: f32, y: f32, blast: f32, force: f32 };
 
@@ -126,9 +130,11 @@ comptime {
 pub const spawn_batch: u32 = 1 << 16;
 const max_poly: u32 = 4096;
 const max_blasts: u32 = 256;
-/// Game events per tick. Merges are bounded by gpu_sim's candidate list (max_events - 1); a
-/// state change that finds the list full is skipped, never lost, so the CPU mirror stays exact.
-const out_cap: u32 = 1 << 15;
+/// Game events per tick; the whole list is read back every tick (out_bytes). Merges are
+/// bounded by gpu_sim's candidate list (max_events - 1); a state change that finds the list full is
+/// skipped, never lost, so the CPU mirror stays exact: merging pairs keep overlapping and are
+/// found again next tick.
+const out_cap: u32 = L.max_events;
 const ring = 3;
 const out_bytes: u32 = (out_cap + 1) * @sizeOf(L.Event);
 const fx_bytes: u32 = fx_slots * 4;
@@ -136,15 +142,18 @@ const diag_offset: u32 = out_bytes + 16 + fx_bytes;
 const download_bytes: u32 = diag_offset + 16;
 /// Galaxy energy diagnostics run every this many ticks (a few ms of GPU time per second at most).
 const diag_every_ticks: u32 = 20;
+/// The HUD's max level is a GPU reduction over every ball, recorded on every this-many-th tick.
+const max_level_every: u32 = 4;
 /// Pair terms of the sampled potential sum: 0.2 ms or less at 100k bodies.
 const diag_pair_budget: u32 = 1 << 26;
 
-const Kernel = enum { spawn, reset, merge, hoop, clearPick, pick, grab, release, lasso, explode, conduct, fxReset, igniteGrab, burn, emitFire, emitAsh, fireUpdate, ashUpdate };
+const Kernel = enum { spawn, reset, merge, maxLevel, hoop, clearPick, pick, grab, release, lasso, explode, conduct, fxReset, igniteGrab, burn, emitFire, emitAsh, fireUpdate, ashUpdate, ashClear, ashBin, ashCollide };
 const Module = enum { spawn, merge, act, conduct, burn, emit, particles };
 const module_of = std.enums.EnumArray(Kernel, Module).init(.{
     .spawn = .spawn,
     .reset = .merge,
     .merge = .merge,
+    .maxLevel = .merge,
     .hoop = .merge,
     .clearPick = .act,
     .pick = .act,
@@ -160,6 +169,9 @@ const module_of = std.enums.EnumArray(Kernel, Module).init(.{
     .emitAsh = .emit,
     .fireUpdate = .particles,
     .ashUpdate = .particles,
+    .ashClear = .particles,
+    .ashBin = .particles,
+    .ashCollide = .particles,
 });
 const module_spv = std.enums.EnumArray(Module, []const u8).init(.{
     .spawn = @embedFile("gpu_game_spawn.spv"),
@@ -174,7 +186,7 @@ const Layout = struct { ro: u32, rw: u32 };
 const module_layout = std.enums.EnumArray(Module, Layout).init(.{
     .spawn = .{ .ro = 1, .rw = 7 },
     .merge = .{ .ro = 2, .rw = 6 },
-    .act = .{ .ro = 3, .rw = 6 },
+    .act = .{ .ro = 3, .rw = 7 },
     .conduct = .{ .ro = 8, .rw = 1 },
     .burn = .{ .ro = 1, .rw = 6 },
     .emit = .{ .ro = 3, .rw = 8 },
@@ -211,6 +223,8 @@ const Slot = struct {
     tb: *c.SDL_GPUTransferBuffer,
     fence: ?*c.SDL_GPUFence = null,
     picked: bool = false,
+    /// gw.tick_no this slot was recorded in.
+    tick: u32 = 0,
     /// Energy epoch this tick's diagnostics were recorded in (null: none were), and what turns the
     /// raw sums into physical values.
     diag_epoch: ?u32 = null,
@@ -246,12 +260,17 @@ pub const GpuWorld = struct {
     /// One tile {0, 0, 1, 1}: the tile table for drawing pools with a white texture.
     pool_tiles: Buffer,
     claim: Buffer,
+    /// Ash contact spatial hash: list heads per cell, and each ash's next link.
+    ash_heads: Buffer,
+    ash_next: Buffer,
     out: Buffer,
     pick_buf: Buffer,
     spawn_buf: Buffer,
     poly_buf: Buffer,
     blast_buf: Buffer,
     upload_tb: *c.SDL_GPUTransferBuffer,
+    /// Readback of `pick_buf` for pickNow.
+    pick_tb: *c.SDL_GPUTransferBuffer,
     pipes: std.enums.EnumArray(Kernel, *c.SDL_GPUComputePipeline),
     slots: [ring]Slot,
     /// Index of the oldest submitted slot whose results are not yet processed.
@@ -282,6 +301,8 @@ pub const GpuWorld = struct {
     stats: FxStats = .{},
     /// false skips every fire pass (to measure their cost).
     fire_enabled: bool = true,
+    /// false skips ash-ash contacts (test hook).
+    ash_collide: bool = true,
     /// Ticks left in which something may have been heated that the (late) counters do not show
     /// yet: set by ignition, blasts and hot spawns, so idle fire passes can be skipped safely.
     fire_wake: u32 = 0,
@@ -329,17 +350,22 @@ pub const GpuWorld = struct {
             .ash = try Pool.init(dev, ash_pool_cap),
             .pool_tiles = try buffer(dev, 16, true),
             .claim = try buffer(dev, cap * 4, false),
+            .ash_heads = try buffer(dev, ash_table * 4, false),
+            .ash_next = try buffer(dev, ash_pool_cap * 4, false),
             .out = try buffer(dev, out_bytes, false),
             .pick_buf = try buffer(dev, 16, false),
             .spawn_buf = try buffer(dev, spawn_batch * @sizeOf(SpawnRec), false),
             .poly_buf = try buffer(dev, max_poly * @sizeOf(L.Vec2), false),
             .blast_buf = try buffer(dev, max_blasts * @sizeOf(Blast), false),
             .upload_tb = c.SDL_CreateGPUTransferBuffer(dev, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = uploadBytes() }) orelse return error.GpuSetupFailed,
+            .pick_tb = c.SDL_CreateGPUTransferBuffer(dev, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD, .size = 16 }) orelse return error.GpuSetupFailed,
             .pipes = undefined,
             .slots = undefined,
             .radius = try gpa.alloc(f32, cap),
         };
         @memset(gw.radius, 0);
+        gw.sim.heat_buf = gw.heat;
+        gw.sim.fx_buf = gw.fx;
         for (&gw.slots) |*s| s.* = .{ .tb = c.SDL_CreateGPUTransferBuffer(dev, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD, .size = download_bytes }) orelse return error.GpuSetupFailed };
         const kernels = comptime std.enums.values(Kernel);
         var infos: [kernels.len]c.SDL_GPUComputePipelineCreateInfo = undefined;
@@ -379,9 +405,10 @@ pub const GpuWorld = struct {
             c.SDL_ReleaseGPUTransferBuffer(gw.dev, s.tb);
         }
         for (std.enums.values(Kernel)) |k| c.SDL_ReleaseGPUComputePipeline(gw.dev, gw.pipes.get(k));
-        for ([_]Buffer{ gw.heat, gw.tmp, gw.fx, gw.pool_tiles, gw.claim, gw.out, gw.pick_buf, gw.spawn_buf, gw.poly_buf, gw.blast_buf }) |b| c.SDL_ReleaseGPUBuffer(gw.dev, b);
+        for ([_]Buffer{ gw.heat, gw.tmp, gw.fx, gw.pool_tiles, gw.claim, gw.ash_heads, gw.ash_next, gw.out, gw.pick_buf, gw.spawn_buf, gw.poly_buf, gw.blast_buf }) |b| c.SDL_ReleaseGPUBuffer(gw.dev, b);
         for ([_]*const Pool{ &gw.fire, &gw.ash }) |p| for (p.all()) |b| c.SDL_ReleaseGPUBuffer(gw.dev, b);
         c.SDL_ReleaseGPUTransferBuffer(gw.dev, gw.upload_tb);
+        c.SDL_ReleaseGPUTransferBuffer(gw.dev, gw.pick_tb);
         gw.grav.deinit();
         gw.sim.deinit();
         gw.gpa.free(gw.radius);
@@ -575,6 +602,28 @@ pub const GpuWorld = struct {
         gw.pick_result = null;
     }
 
+    /// Picks and grabs the ball under `mouse` immediately, in its own submit that waits for the GPU,
+    /// and returns whether one was grabbed (null: the GPU call failed). The result is known before
+    /// this tick is recorded, so a miss can start a spawn that lands in the same tick, where
+    /// requestPick's answer comes back through the readback ring one to three ticks later. It
+    /// stalls the CPU for the pick pass plus whatever earlier ticks still have queued, on click
+    /// ticks only.
+    pub fn pickNow(gw: *GpuWorld, mouse: Vec2) ?bool {
+        const cmd = c.SDL_AcquireGPUCommandBuffer(gw.dev) orelse return null;
+        const gp: GameParams = .{ .ball_count = gw.count, .stamp = gw.tick_no + 1, .items = 0, .out_cap = out_cap, .mouse_x = mouse.x, .mouse_y = mouse.y };
+        const groups = divCeil(@max(gw.count, 1), L.group_size);
+        gw.dispatch(cmd, .clearPick, &gp, 1);
+        gw.dispatch(cmd, .pick, &gp, groups);
+        gw.dispatch(cmd, .grab, &gp, 1);
+        const cp = c.SDL_BeginGPUCopyPass(cmd);
+        c.SDL_DownloadFromGPUBuffer(cp, &.{ .buffer = gw.pick_buf, .size = 16 }, &.{ .transfer_buffer = gw.pick_tb, .offset = 0 });
+        c.SDL_EndGPUCopyPass(cp);
+        gs.submitWait(gw.dev, cmd) catch return null;
+        const m: [*]const u8 = @ptrCast(c.SDL_MapGPUTransferBuffer(gw.dev, gw.pick_tb, false) orelse return null);
+        defer c.SDL_UnmapGPUTransferBuffer(gw.dev, gw.pick_tb);
+        return std.mem.readInt(u32, m[0..4], .little) != 0;
+    }
+
     /// Right-click: set the ball under the mouse alight (main.onRightClick).
     pub fn requestIgnite(gw: *GpuWorld) void {
         gw.ignite_req = true;
@@ -662,6 +711,41 @@ pub const GpuWorld = struct {
         }
     }
 
+    pub const Sanity = struct { alive: u32, nonfinite: u32, outside: u32, max_speed: f32, mean_speed: f32 };
+
+    /// Blocking readback of every ball to check the simulation is sane: non-finite values, balls
+    /// outside the play area (by more than their radius), speeds. For tests and `--check on`.
+    pub fn sanity(gw: *GpuWorld, w: *const world.World) !Sanity {
+        const n = gw.count;
+        const gpa = gw.gpa;
+        const pos = try gpa.alloc(L.Vec2, n);
+        defer gpa.free(pos);
+        const vel = try gpa.alloc(L.Vec2, n);
+        defer gpa.free(vel);
+        const body = try gpa.alloc(L.BallBody, n);
+        defer gpa.free(body);
+        const meta = try gpa.alloc(L.BallMeta, n);
+        defer gpa.free(meta);
+        gw.sim.download(0, .{ .pos = pos, .vel = vel, .body = body, .meta = meta }) catch return error.GpuSetupFailed;
+        var s: Sanity = .{ .alive = 0, .nonfinite = 0, .outside = 0, .max_speed = 0, .mean_speed = 0 };
+        var sum: f64 = 0;
+        const b = w.bounds;
+        for (pos, vel, body, meta) |p, v, bd, m| {
+            if (m & L.flag_alive == 0) continue;
+            s.alive += 1;
+            if (!(std.math.isFinite(p.x) and std.math.isFinite(p.y) and std.math.isFinite(v.x) and std.math.isFinite(v.y))) {
+                s.nonfinite += 1;
+                continue;
+            }
+            if (p.x < b.x - bd.radius or p.x > b.x + b.w + bd.radius or p.y < b.y - bd.radius or p.y > b.y + b.h + bd.radius) s.outside += 1;
+            const sp = @sqrt(v.x * v.x + v.y * v.y);
+            s.max_speed = @max(s.max_speed, sp);
+            sum += sp;
+        }
+        if (s.alive > 0) s.mean_speed = @floatCast(sum / @as(f64, @floatFromInt(s.alive)));
+        return s;
+    }
+
     /// Blocks until every submitted tick is done and processed (bench, shutdown, tests).
     pub fn drain(gw: *GpuWorld, w: *world.World) void {
         while (gw.in_flight > 0) gw.collect(w, true);
@@ -707,6 +791,9 @@ pub const GpuWorld = struct {
             },
             else => {},
         };
+        // Reduction done after this tick's merges and deaths: it replaces the running maximum, so the
+        // level falls when the top balls merge away or die (level + 1; 0 = not recorded this tick).
+        if (ev[0].b != 0) w.current_level = @intCast(@max(cfg.start_level, ev[0].b - 1));
         const fxw: [*]const u32 = @ptrCast(@alignCast(m + out_bytes + 16));
         gw.stats = .{
             .burning = fxw[0],
@@ -717,6 +804,9 @@ pub const GpuWorld = struct {
             .ash_head = fxw[5],
         };
         if (gw.stats.burning > 0) w.events.any_burning = true;
+        // The solver warmed a ball by impact this tick: the counters do not know yet, so run the fire
+        // passes for a few ticks (they then keep running while anything is above room temperature).
+        if (fxw[c_fx_impact] == s.tick +% 1) gw.fire_wake = @max(gw.fire_wake, 4);
         if (s.picked) {
             const pick_word = std.mem.readInt(u32, m[out_bytes..][0..4], .little);
             gw.pick_result = pick_word != 0;
@@ -780,11 +870,12 @@ pub const GpuWorld = struct {
             .flags = (if (in.mutual_gravity) L.sim_flag_mutual_gravity else 0) |
                 (if (in.merging) L.sim_flag_merging else 0) |
                 (if (in.attract) L.sim_flag_attract else 0) |
-                (if (gw.galaxy_on) L.sim_flag_galaxy else 0) |
+                (if (gw.galaxy_on) L.sim_flag_galaxy else L.sim_flag_impact_heat) |
                 @as(u32, @backingInt(in.collide)) << L.sim_collide_shift,
             .mouse_x = in.mouse.x,
             .mouse_y = in.mouse.y,
             .attraction_strength = cfg.attraction_strength,
+            .event_cap = gw.sim.event_cap,
         };
         gw.sim.prepare(&p);
         return p;
@@ -793,6 +884,7 @@ pub const GpuWorld = struct {
     fn record(gw: *GpuWorld, w: *world.World, in: Input, sample: bool) !void {
         const slot = &gw.slots[gw.write_slot];
         std.debug.assert(slot.fence == null);
+        slot.tick = gw.tick_no;
 
         // Stage uploads: spawns (into free slots first, then the tail), lasso polygon, blasts.
         const up: [*]u8 = @ptrCast(c.SDL_MapGPUTransferBuffer(gw.dev, gw.upload_tb, true) orelse return gpuFail("SDL_MapGPUTransferBuffer (upload)"));
@@ -873,6 +965,7 @@ pub const GpuWorld = struct {
             .hoop_left = b.x + cfg.hoop_left * hoop_scale,
             .hoop_right = b.x + cfg.hoop_right * hoop_scale,
             .collide = @intFromBool(in.collide == .accrete),
+            .event_cap = gw.sim.event_cap,
         };
         const groups = divCeil(@max(gw.count, 1), L.group_size);
 
@@ -949,6 +1042,7 @@ pub const GpuWorld = struct {
             slot.diag_g = gw.galaxyG();
             slot.diag_weight = @as(f64, @floatFromInt(@min(gw.count, gw.grav.capacity))) / @as(f64, @floatFromInt(gw.grav.last_samples));
         }
+        if (gw.tick_no % max_level_every == 0) gw.dispatch(cmd, .maxLevel, &gp, groups);
         const cp = c.SDL_BeginGPUCopyPass(cmd);
         if (want_diag) gw.grav.downloadDiag(cp.?, slot.tb, diag_offset);
         c.SDL_DownloadFromGPUBuffer(cp, &.{ .buffer = gw.out, .size = out_bytes }, &.{ .transfer_buffer = slot.tb, .offset = 0 });
@@ -1000,10 +1094,18 @@ pub const GpuWorld = struct {
             gp.items = c_fx_ash_alive;
             gw.dispatch(cmd, .ashUpdate, &gp, divCeil(ash_pool_cap, L.group_size));
         }
+        // Ash-ash contacts; the counter is a tick or two old, so the first ashes of a burst pass
+        // through each other until it shows two.
+        if (gw.ash_collide and st.ashes > 1) {
+            gp.items = ash_table - 1;
+            gw.dispatch(cmd, .ashClear, &gp, divCeil(ash_table, L.group_size));
+            gw.dispatch(cmd, .ashBin, &gp, divCeil(ash_pool_cap, L.group_size));
+            gw.dispatch(cmd, .ashCollide, &gp, divCeil(ash_pool_cap, L.group_size));
+        }
     }
 
     fn dispatch(gw: *GpuWorld, cmd: *c.SDL_GPUCommandBuffer, k: Kernel, gp: *const GameParams, groups: u32) void {
-        const pool = if (k == .emitAsh or k == .ashUpdate) &gw.ash else &gw.fire;
+        const pool = if (k == .emitAsh or k == .ashUpdate or k == .ashClear or k == .ashBin or k == .ashCollide) &gw.ash else &gw.fire;
         const pb = pool.all();
         if (groups == 0) return;
         c.SDL_PushGPUComputeUniformData(cmd, 0, gp, @sizeOf(GameParams));
@@ -1029,8 +1131,8 @@ pub const GpuWorld = struct {
                 ro_buf[0..3].* = .{ s.pos, gw.poly_buf, gw.blast_buf };
                 break :blk ro_buf[0..3];
             }, blk: {
-                rw_buf[0..6].* = .{ s.vel, s.body, s.meta, gw.pick_buf, gw.out, gw.heat };
-                break :blk rw_buf[0..6];
+                rw_buf[0..7].* = .{ s.vel, s.body, s.meta, gw.pick_buf, gw.out, gw.heat, s.events };
+                break :blk rw_buf[0..7];
             } },
             .conduct => .{ blk: {
                 ro_buf[0..8].* = .{ s.pos, s.body, s.ball_cell, s.counts, s.sorted_id, s.meta, gw.heat, gw.fx };
@@ -1058,6 +1160,11 @@ pub const GpuWorld = struct {
             .particles => .{ ro_buf[0..0], blk: {
                 rw_buf[0..6].* = pb;
                 rw_buf[6] = gw.fx;
+                // The ash contact kernels use the pool's prev_pos and body slots for the hash.
+                if (k == .ashClear or k == .ashBin or k == .ashCollide) {
+                    rw_buf[1] = gw.ash_heads;
+                    rw_buf[2] = gw.ash_next;
+                }
                 break :blk rw_buf[0..7];
             } },
         };
@@ -1471,4 +1578,316 @@ test "gpu world: a body outside the gravity box does not corrupt the others" {
     try std.testing.expect(clamp_diff < 1e-4);
     try std.testing.expect(std.math.isFinite(e.x) and std.math.isFinite(e.y));
     try std.testing.expect(e.x < 0 and e.y < 0);
+}
+
+const PairRun = struct { ticks: u32, merges: u32, max_per_tick: u32, alive: u32, mass_ok: bool };
+
+/// `n` isolated touching pairs of unit-mass bodies in accrete mode on a lattice that leaves the
+/// pairs out of each other's reach; ticks until every pair has merged (at most `limit`).
+fn pairMergeRun(gpa: std.mem.Allocator, dev: *c.SDL_GPUDevice, n: u32, event_cap: u32, limit: u32) !PairRun {
+    var gw = try GpuWorld.init(gpa, dev);
+    defer gw.deinit();
+    gw.profile_every = 0;
+    gw.sim.event_cap = event_cap;
+    var w = world.World.init(gpa, 31);
+    defer w.deinit();
+    try gw.loadGalaxy(&w, .disk, 2);
+    gw.clearBalls(&w);
+    const side: u32 = @intFromFloat(@ceil(@sqrt(@as(f32, @floatFromInt(n)))));
+    const spacing: f32 = 40;
+    const size = spacing * @as(f32, @floatFromInt(side + 2));
+    w.bounds = .{ .x = 0, .y = 0, .w = size, .h = size };
+    w.prev_bounds = w.bounds;
+    gw.galaxy_centre = .{ .x = size / 2, .y = size / 2 };
+    gw.galaxy_extent = size / (2 * galaxy_tree_reach);
+    for (0..n) |k| {
+        const x = spacing * (1 + @as(f32, @floatFromInt(k % side)));
+        const y = spacing * (1 + @as(f32, @floatFromInt(k / side)));
+        for ([_]f32{ 0, 5 }) |dx| try gw.queueBody(&w, x + dx, y, galaxy.toNewBall(.{ .x = 0, .y = 0, .vx = 0, .vy = 0, .mass = 1, .radius = 3 }));
+    }
+    var run: PairRun = .{ .ticks = 0, .merges = 0, .max_per_tick = 0, .alive = 0, .mass_ok = false };
+    var last: u32 = 0;
+    while (run.ticks < limit) {
+        gw.tick(&w, .{ .collide = .accrete });
+        run.ticks += 1;
+        run.merges += w.events.merges;
+        run.max_per_tick = @max(run.max_per_tick, w.events.merges);
+        last = w.events.merges;
+        if (run.merges >= n) break;
+    }
+    gw.drain(&w);
+    run.merges += w.events.merges - last;
+    run.alive = gw.alive;
+    const d = try GalaxyDump.read(gpa, &gw);
+    defer d.free(gpa);
+    var live: u32 = 0;
+    var mass_ok = true;
+    for (d.body, d.meta) |b, mt| if (mt & L.flag_alive != 0) {
+        live += 1;
+        // A double merge would leave a mass-3 or mass-4 body (or a dead one still counted).
+        if (b.mass != 2) mass_ok = false;
+    };
+    run.mass_ok = mass_ok and live == gw.alive;
+    return run;
+}
+
+test "gpu world: more merge candidates than one tick can hold carry over without loss or double merges" {
+    _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SkipZigTest;
+    defer c.SDL_Quit();
+    const gfx = @import("gfx.zig");
+    var gpu = gfx.Gfx.init(.{ .window = null }) catch return error.SkipZigTest;
+    defer gpu.deinit();
+    const gpa = std.testing.allocator;
+
+    // 40000 candidates arrive over two ticks (spawn batches), the first with 32768: more than the list holds.
+    const all = try pairMergeRun(gpa, gpu.dev, 40_000, 0, 20);
+    std.debug.print("merge candidates 40000: {d} ticks, {d} merges (max {d} in one tick), alive {d}\n", .{ all.ticks, all.merges, all.max_per_tick, all.alive });
+    try std.testing.expectEqual(@as(u32, 40_000), all.merges);
+    try std.testing.expectEqual(@as(u32, 40_000), all.alive);
+    try std.testing.expect(all.mass_ok);
+
+    // A list of 1500 candidates against 6000 pairs: the rest wait for later ticks.
+    const capped = try pairMergeRun(gpa, gpu.dev, 6000, 1500, 60);
+    std.debug.print("merge candidates 6000, cap 1500: {d} ticks, {d} merges (max {d} in one tick), alive {d}\n", .{ capped.ticks, capped.merges, capped.max_per_tick, capped.alive });
+    try std.testing.expectEqual(@as(u32, 6000), capped.merges);
+    try std.testing.expectEqual(@as(u32, 6000), capped.alive);
+    try std.testing.expect(capped.max_per_tick <= 1500);
+    try std.testing.expect(capped.ticks >= 4);
+    try std.testing.expect(capped.mass_ok);
+}
+
+test "gpu world: HUD max level follows the balls down as well as up" {
+    _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SkipZigTest;
+    defer c.SDL_Quit();
+    const gfx = @import("gfx.zig");
+    var gpu = gfx.Gfx.init(.{ .window = null }) catch return error.SkipZigTest;
+    defer gpu.deinit();
+    const gpa = std.testing.allocator;
+    var gw = try GpuWorld.init(gpa, gpu.dev);
+    defer gw.deinit();
+    gw.profile_every = 0;
+    var w = world.World.init(gpa, 41);
+    defer w.deinit();
+    const in: Input = .{ .mutual_gravity = false, .merging = false, .random_explosions = false };
+
+    for ([_]f32{ 400, 800 }) |x| try gw.queueBall(&w, x, 300);
+    for (gw.pending.items, [_]u8{ 12, 7 }) |*nb, lvl| {
+        nb.vx = 0;
+        nb.vy = 0;
+        nb.gravity = 0;
+        nb.level = lvl;
+    }
+    for (0..8) |_| gw.tick(&w, in);
+    gw.drain(&w);
+    try std.testing.expectEqual(@as(u8, 12), w.current_level);
+
+    // Lasso the level-12 ball: the HUD level drops to the remaining ball's.
+    const poly = [_]Vec2{ .{ .x = 380, .y = 280 }, .{ .x = 420, .y = 280 }, .{ .x = 420, .y = 320 }, .{ .x = 380, .y = 320 } };
+    try gw.requestLasso(&poly);
+    for (0..10) |_| gw.tick(&w, in);
+    gw.drain(&w);
+    try std.testing.expectEqual(@as(u32, 1), gw.alive);
+    try std.testing.expectEqual(@as(u8, 7), w.current_level);
+}
+
+/// Ticks between a click on empty space and the tick that records the spawned ball, with main.zig's
+/// logic: `ring_path` is the old requestPick + readback answer, otherwise pickNow. 0 = same tick.
+fn clickToSpawnTicks(gpa: std.mem.Allocator, dev: *c.SDL_GPUDevice, ring_path: bool, frame_ms: u32) !u32 {
+    var gw = try GpuWorld.init(gpa, dev);
+    defer gw.deinit();
+    gw.profile_every = 0;
+    var w = world.World.init(gpa, 51);
+    defer w.deinit();
+    const in: Input = .{ .mutual_gravity = false, .merging = false, .random_explosions = false, .mouse = .{ .x = 600, .y = 200 } };
+    for ([_]f32{ 300, 400 }) |x| try gw.queueBall(&w, x, 300);
+    for (0..6) |_| gw.tick(&w, in);
+    gw.drain(&w);
+    const before = gw.alive;
+    var click_pending = true;
+    var spawn_next = false;
+    if (ring_path) gw.requestPick();
+    var t: u32 = 0;
+    while (t < 12) : (t += 1) {
+        if (!ring_path and click_pending) {
+            click_pending = false;
+            if (gw.pickNow(in.mouse) == false) try gw.queueBall(&w, in.mouse.x, in.mouse.y);
+        }
+        if (spawn_next) {
+            spawn_next = false;
+            try gw.queueBall(&w, in.mouse.x, in.mouse.y);
+        }
+        gw.tick(&w, in);
+        if (gw.alive > before) return t;
+        if (ring_path and click_pending) if (gw.pick_result) |hit| {
+            click_pending = false;
+            spawn_next = !hit;
+        };
+        if (frame_ms > 0) c.SDL_Delay(frame_ms);
+    }
+    return error.NeverSpawned;
+}
+
+test "gpu world: a click on empty space spawns in the same tick" {
+    _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SkipZigTest;
+    defer c.SDL_Quit();
+    const gfx = @import("gfx.zig");
+    var gpu = gfx.Gfx.init(.{ .window = null }) catch return error.SkipZigTest;
+    defer gpu.deinit();
+    const gpa = std.testing.allocator;
+    const old_fast = try clickToSpawnTicks(gpa, gpu.dev, true, 0);
+    const old_paced = try clickToSpawnTicks(gpa, gpu.dev, true, 16);
+    const new_fast = try clickToSpawnTicks(gpa, gpu.dev, false, 0);
+    const new_paced = try clickToSpawnTicks(gpa, gpu.dev, false, 16);
+    std.debug.print("click to spawn, ticks: readback ring {d} (unpaced) / {d} (16 ms frames); pickNow {d} / {d}\n", .{ old_fast, old_paced, new_fast, new_paced });
+    try std.testing.expectEqual(@as(u32, 0), new_fast);
+    try std.testing.expectEqual(@as(u32, 0), new_paced);
+}
+
+test "gpu world: releasing a grab adds the last follow step to the throw" {
+    _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SkipZigTest;
+    defer c.SDL_Quit();
+    const gfx = @import("gfx.zig");
+    var gpu = gfx.Gfx.init(.{ .window = null }) catch return error.SkipZigTest;
+    defer gpu.deinit();
+    const gpa = std.testing.allocator;
+    var gw = try GpuWorld.init(gpa, gpu.dev);
+    defer gw.deinit();
+    gw.profile_every = 0;
+    var w = world.World.init(gpa, 61);
+    defer w.deinit();
+
+    try gw.queueBall(&w, 400, 300);
+    gw.pending.items[0].vx = 0;
+    gw.pending.items[0].vy = 0;
+    gw.pending.items[0].gravity = 0;
+    gw.tick(&w, .{ .random_explosions = false });
+    try std.testing.expectEqual(@as(?bool, true), gw.pickNow(.{ .x = 400, .y = 300 }));
+
+    // Mouse x = 400 + 2k^2: the follow step adds 4 each tick from the second on, so after four
+    // ticks v = 14 and the last follow step is 4. A release adds it: 18, not 14.
+    for (1..5) |k| {
+        const kf: f32 = @floatFromInt(k);
+        gw.tick(&w, .{ .mouse = .{ .x = 400 + 2 * kf * kf, .y = 300 }, .random_explosions = false });
+    }
+    gw.requestRelease();
+    gw.tick(&w, .{ .mouse = .{ .x = 432, .y = 300 }, .random_explosions = false });
+    gw.drain(&w);
+    var pos: [1]L.Vec2 = undefined;
+    try gw.sim.download(0, .{ .pos = &pos });
+    std.debug.print("release throw: x after the release tick {d:.3} (432 + 18 = 450 with the impulse, 446 without)\n", .{pos[0].x});
+    try std.testing.expectApproxEqAbs(@as(f32, 450), pos[0].x, 0.05);
+}
+
+test "gpu world: an impact that reaches ignition lights both balls, a gentler one leaves them cold" {
+    _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SkipZigTest;
+    defer c.SDL_Quit();
+    const gfx = @import("gfx.zig");
+    var gpu = gfx.Gfx.init(.{ .window = null }) catch return error.SkipZigTest;
+    defer gpu.deinit();
+    const gpa = std.testing.allocator;
+    const in: Input = .{ .mutual_gravity = false, .merging = false, .random_explosions = false };
+
+    // Heat gained per ball = closing speed * 1.5 / mass * 10. Mass 5 closing at 56 px/tick: +168, past
+    // ignition. Mass 140 at 20: +2.1, which update_fire would reset anyway.
+    for ([_]struct { speed: f32, mass: f32, lit: bool }{ .{ .speed = 28, .mass = 5, .lit = true }, .{ .speed = 10, .mass = 140, .lit = false } }) |cs| {
+        var gw = try GpuWorld.init(gpa, gpu.dev);
+        defer gw.deinit();
+        gw.profile_every = 0;
+        var w = world.World.init(gpa, 71);
+        defer w.deinit();
+        for ([_]f32{ 400, 460 }) |x| try gw.queueBall(&w, x, 300);
+        for (gw.pending.items, [_]f32{ cs.speed, -cs.speed }) |*nb, vx| {
+            nb.vx = vx;
+            nb.vy = 0;
+            nb.gravity = 0;
+            nb.radius = 30;
+            nb.density = 1;
+            nb.mass = cs.mass;
+            nb.level = 5;
+        }
+        for (0..6) |_| gw.tick(&w, in);
+        gw.drain(&w);
+        var heat: [2]L.BallHeat = undefined;
+        try gw.sim.readBuffer(gw.heat, std.mem.sliceAsBytes(&heat));
+        var meta: [2]u32 = undefined;
+        try gw.sim.download(0, .{ .meta = &meta });
+        std.debug.print("impact heat (speed {d}, mass {d}): temps {d:.1} {d:.1}, burning {d}\n", .{ cs.speed, cs.mass, heat[0].temp, heat[1].temp, gw.stats.burning });
+        for (heat, meta) |h, m| {
+            try std.testing.expectEqual(cs.lit, h.temp >= cfg.ignition_temp);
+            try std.testing.expectEqual(cs.lit, m & L.flag_burning != 0);
+        }
+    }
+}
+
+/// Most ash pairs closer than 3 px (contact is 4) at one sampling instant over a burn-out.
+fn ashOverlapPeak(gpa: std.mem.Allocator, dev: *c.SDL_GPUDevice, collide: bool) !struct { peak_pairs: u32, peak_ashes: u32 } {
+    var gw = try GpuWorld.init(gpa, dev);
+    defer gw.deinit();
+    gw.profile_every = 0;
+    gw.ash_collide = collide;
+    gw.ignite_every = 1;
+    gw.ignite_temp = 100_000;
+    var w = world.World.init(gpa, 81);
+    defer w.deinit();
+    const in: Input = .{ .mutual_gravity = false, .merging = false, .random_explosions = false };
+    // A tight column of balls so the ashes land on top of each other.
+    for (0..24) |k| try gw.queueBall(&w, 500 + @as(f32, @floatFromInt(k % 3)) * 4, 100 + @as(f32, @floatFromInt(k)) * 20);
+    for (gw.pending.items) |*nb| {
+        nb.vx = 0;
+        nb.vy = 0;
+        nb.radius = 12;
+        nb.density = 1;
+        nb.mass = 100;
+        nb.level = 5;
+    }
+    const sample = 2048;
+    const pos = try gpa.alloc(L.Vec2, sample);
+    defer gpa.free(pos);
+    const meta = try gpa.alloc(u32, sample);
+    defer gpa.free(meta);
+    var peak: u32 = 0;
+    var peak_ashes: u32 = 0;
+    for (0..1500) |t| {
+        gw.tick(&w, in);
+        if (t % 10 != 9) continue;
+        gw.drain(&w);
+        try gw.sim.readBuffer(gw.ash.pos, std.mem.sliceAsBytes(pos));
+        try gw.sim.readBuffer(gw.ash.meta, std.mem.sliceAsBytes(meta));
+        var pairs: u32 = 0;
+        var alive: u32 = 0;
+        for (pos, meta, 0..) |p, m, i| {
+            if (m & L.flag_alive == 0) continue;
+            alive += 1;
+            for (pos[i + 1 ..], meta[i + 1 ..]) |q, mq| {
+                if (mq & L.flag_alive == 0) continue;
+                const dx = p.x - q.x;
+                const dy = p.y - q.y;
+                if (dx * dx + dy * dy < 9) pairs += 1;
+            }
+        }
+        peak = @max(peak, pairs);
+        peak_ashes = @max(peak_ashes, alive);
+    }
+    return .{ .peak_pairs = peak, .peak_ashes = peak_ashes };
+}
+
+test "gpu world: ashes collide with each other" {
+    _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SkipZigTest;
+    defer c.SDL_Quit();
+    const gfx = @import("gfx.zig");
+    var gpu = gfx.Gfx.init(.{ .window = null }) catch return error.SkipZigTest;
+    defer gpu.deinit();
+    const gpa = std.testing.allocator;
+    const off = try ashOverlapPeak(gpa, gpu.dev, false);
+    const on = try ashOverlapPeak(gpa, gpu.dev, true);
+    std.debug.print("ash overlap (pairs closer than 3 px, peak): contacts off {d} of {d} ashes, on {d} of {d} ashes\n", .{ off.peak_pairs, off.peak_ashes, on.peak_pairs, on.peak_ashes });
+    try std.testing.expect(off.peak_ashes > 40 and on.peak_ashes > 40);
+    try std.testing.expect(off.peak_pairs > 10);
+    try std.testing.expect(on.peak_pairs * 4 < off.peak_pairs);
 }

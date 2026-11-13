@@ -47,7 +47,8 @@ pub const GameParams = extern struct {
     fx_flags: u32,
     /// 1 = accrete: the merge kernel merges any touching pair, summing mass (L.CollideMode).
     collide: u32 = 0,
-    _pad1: u32 = 0,
+    /// gpu_layout SimParams.event_cap (0 = full), so merge reads the candidate list as it was written.
+    event_cap: u32 = 0,
     _pad2: u32 = 0,
     _pad3: u32 = 0,
     _pad4: u32 = 0,
@@ -142,6 +143,9 @@ pub const fx_prev_burning = 6;
 pub const fx_prev_warm = 7;
 pub const fx_deaths = 8;
 pub const fx_prev_deaths = 9;
+/// Written by the solver's finish pass (gpu_sim/common.zig fx_impact): tick + 1 of the last tick
+/// in which impact heat warmed a ball, so the host wakes the fire passes.
+pub const fx_impact = 10;
 pub const fx_slots = 16;
 
 pub inline fn lid() u32 {
@@ -166,6 +170,21 @@ pub inline fn blockSum(v: u32) u32 {
     const total = red[l - l];
     spirv.workgroupBarrier();
     return total;
+}
+
+/// Maximum of `v` over the workgroup, on every thread (same hazards and calling rule as blockSum).
+pub inline fn blockMax(v: u32) u32 {
+    const l = lid();
+    red[l] = v;
+    spirv.workgroupBarrier();
+    var s: u32 = L.group_size / 2;
+    while (s > 0) : (s >>= 1) {
+        if (l < s) red[l] = @max(red[l], red[l + s]);
+        spirv.workgroupBarrier();
+    }
+    const top = red[l - l];
+    spirv.workgroupBarrier();
+    return top;
 }
 
 pub inline fn hash(seed: u32) u32 {
