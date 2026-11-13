@@ -1,9 +1,6 @@
 # TODO
 
 ## Dead-code cleanup (left over from the CPU → GPU move)
-- `src/render.zig`: the CPU ball path (`drawTrails`, `drawBalls`, `drawParticles`) is unreachable from
-  the game now that main always draws GPU balls. Keep only what `render_demo.zig` still needs, or move
-  the demo to GPU balls and delete it.
 - The CPU ball simulation (`world.zig` / `physics.zig` / `effects.zig`) stays as the `zig build bench`
   baseline for comparison (decided 2026-11-12).
 
