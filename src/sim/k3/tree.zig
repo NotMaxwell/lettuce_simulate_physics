@@ -2,37 +2,15 @@
 //! ropes and depth-ordered moments over bodies already sorted by Morton key. src/sim/ref3.zig is
 //! the spec; tree3.zig records the passes in this order:
 //!   leafCount -> scanBlock/scanAdd (multi-level) -> leafWrite -> leafFinish -> karras ->
-//!   depthLeaf -> moments (once per depth, deepest first).
-//! No atomics: every output word has exactly one writer, so a rerun is bit-identical.
+//!   depthLeaf -> bigLeaves -> depthArgs -> moments (once per depth, deepest first).
+//! No atomics: every output word has exactly one writer and every sum has a fixed order, so a
+//! rerun is bit-identical.
 const C = @import("common.zig");
 const L = C.L;
 
-/// Uniform block; must stay identical to `KParams` in src/sim/tree3.zig. Scratch offsets are in
-/// u32 words. Every index into a buffer goes through a uniform or a thread id: a comptime-folded
-/// index miscompiles in the SPIR-V backend.
-pub const Params = extern struct {
-    n: u32,
-    node_cap: u32,
-    leaf_cap: u32,
-    depth: u32,
-    box_scale: f32,
-    theta: f32,
-    scan_count: u32,
-    scan_data: u32,
-    scan_sums: u32,
-    off_hdr: u32,
-    off_lstart: u32,
-    off_lkey: u32,
-    off_parent: u32,
-    off_bbox: u32,
-    off_sums0: u32,
-    off_total: u32,
-    /// 1.0, opaque to the driver compiler: see Kahan.
-    one: f32,
-    off_rem: u32,
-    _pad0: u32,
-    _pad1: u32,
-};
+/// Every index into a buffer goes through a uniform or a thread id: a comptime-folded index
+/// miscompiles in the SPIR-V backend.
+const Params = L.TreeParams3;
 
 const pos = C.ro(L.Pos3, 0, "pos");
 const mass = C.ro(f32, 1, "mass");
@@ -40,7 +18,9 @@ const keys = C.ro(L.SortRec, 2, "keys");
 const nodes = C.rw(L.Node, 0, "nodes");
 const quads = C.rw(L.NodeQuad, 1, "quads");
 const scr = C.rw(u32, 2, "scratch");
-/// Indirect dispatch arguments and the host-visible status; only leafFinish binds it.
+/// Indirect dispatch arguments and the status words; only leafFinish and depthArgs bind it.
+/// Layout (u32): [0..3] dispatch over leaves, [3..6] over all nodes, [6] leaves, [7] nodes,
+/// [8] overflow, [9] deepest internal node, [10 + 3d ..] moments pass at depth d.
 const args = C.rw(u32, 3, "args");
 const P = C.uniform(Params, "params");
 
@@ -54,6 +34,8 @@ const leaf_flag: u32 = 0x8000_0000;
 const end: u32 = 0xFFFF_FFFF;
 const depth_shift = 26;
 const count_mask: u32 = (1 << depth_shift) - 1;
+pub const arg_moments: u32 = 10;
+pub const depth_passes: u32 = 63;
 
 // ---- leaf buckets ----
 
@@ -220,17 +202,27 @@ fn writeDispatch(o: u32, threads: u32) void {
     C.store(args, o + 2, 1);
 }
 
+fn fits(m: u32) bool {
+    return m <= P.leaf_cap and 2 * m - 1 <= P.node_cap;
+}
+
 /// One thread: leaf count, overflow check, end sentinel, indirect arguments and status.
-/// args: [0..3] dispatch over leaves, [3..6] dispatch over all nodes, [6] leaves, [7] nodes,
-/// [8] overflow. On overflow every later pass dispatches nothing.
+/// On overflow every later pass dispatches nothing and the root becomes an empty leaf (no bodies,
+/// no mass, rope = end), so a walk over the stale buffers computes zero force instead of reading
+/// last build's tree.
 export fn leafFinish() callconv(C.cc) void {
     const l = C.lid();
     if (l != 0 or C.groupId() != 0) return;
     const m = C.load(scr, P.off_total);
     const total = 2 * m - 1;
-    const ok = m <= P.leaf_cap and total <= P.node_cap;
+    const ok = fits(m);
     C.store(scr, P.off_hdr, m);
-    if (ok) C.store(scr, P.off_lstart + m, P.n);
+    if (ok) {
+        C.store(scr, P.off_lstart + m, P.n);
+    } else {
+        C.store(nodes, l, .{ .com = .{ .x = 0, .y = 0, .z = 0 }, .mass = 0, .open_r2 = 0, .child = leaf_flag, .skip = end, .info = 0 });
+        C.store(quads, l, .{ .xx = 0, .xy = 0, .xz = 0, .yy = 0, .yz = 0, .zz = 0 });
+    }
     // l is 0 here; it keeps the indices runtime values.
     writeDispatch(l, if (ok) m else 0);
     writeDispatch(l + 3, if (ok) total else 0);
@@ -346,22 +338,32 @@ fn offsetIn(base: u32, off: f32, lo: u32, hi: u32) u32 {
     return @min(@max(v, lo), hi);
 }
 
-/// Compensated sums for leaf moments: a leaf of one long equal-key run can hold thousands of
-/// bodies, where plain f32 accumulation drifts by ~count * 2^-24. SPIR-V ops without NoContraction
-/// are inexact to the driver, which folds (s + y) - s to y and drops the compensation; the
-/// multiply by the uniform 1.0 hides that pattern.
-fn Kahan(comptime n: usize) type {
+/// Sums in a fixed order: terms into a block partial, every `blk` terms the partial into the
+/// total. A leaf of one long equal-key run can hold thousands of bodies, where one running f32 sum
+/// drifts by ~count * 2^-24; blocking cuts that to ~(blk + count/blk) * 2^-24 without compensation
+/// tricks a driver compiler may fold away.
+fn Blocked(comptime n: usize) type {
     return struct {
-        s: [n]f32 = @splat(0),
-        c: [n]f32 = @splat(0),
-        inline fn add(k: @This(), x: [n]f32) @This() {
-            var r = k;
-            inline for (0..n) |i| {
-                const y = x[i] - k.c[i];
-                const t = k.s[i] + y;
-                r.c[i] = (t * P.one - k.s[i]) - y;
-                r.s[i] = t;
+        const blk = 16;
+        tot: [n]f32 = @splat(0),
+        part: [n]f32 = @splat(0),
+        k: u32 = 0,
+        inline fn add(b: @This(), x: [n]f32) @This() {
+            var r = b;
+            inline for (0..n) |i| r.part[i] += x[i];
+            r.k += 1;
+            if (r.k == blk) {
+                inline for (0..n) |i| {
+                    r.tot[i] += r.part[i];
+                    r.part[i] = 0;
+                }
+                r.k = 0;
             }
+            return r;
+        }
+        inline fn sum(b: @This()) [n]f32 {
+            var r: [n]f32 = undefined;
+            inline for (0..n) |i| r[i] = b.tot[i] + b.part[i];
             return r;
         }
     };
@@ -431,58 +433,203 @@ inline fn storeQuad(x: u32, q: Quad) void {
     C.store(quads, x, .{ .xx = q.xx, .xy = q.xy, .xz = q.xz, .yy = q.yy, .yz = q.yz, .zz = q.zz });
 }
 
-/// Thread x over all 2m-1 nodes: depth from the parent links, and leaf moments. A leaf's centre of
-/// mass is an f32 offset from its first body, so it keeps full precision whatever the box.
+inline fn quadTerm(m: f32, x: f32, y: f32, z: f32) [6]f32 {
+    const t = addQuad(.{}, m, x, y, z);
+    return .{ t.xx, t.xy, t.xz, t.yy, t.yz, t.zz };
+}
+
+/// Moments of a finished leaf; `o` is the exact centre of mass relative to `p0`.
+fn writeLeaf(x: u32, nd0: L.Node, p0: L.Pos3, msum: f32, o: L.Vel3, lo: L.Pos3, hi: L.Pos3, q: [6]f32) void {
+    var nd = nd0;
+    const com: L.Pos3 = .{ .x = offsetIn(p0.x, o.x, lo.x, hi.x), .y = offsetIn(p0.y, o.y, lo.y, hi.y), .z = offsetIn(p0.z, o.z, lo.z, hi.z) };
+    nd.com = com;
+    nd.mass = msum;
+    nd.open_r2 = openR2(com, lo, hi);
+    C.store(nodes, x, nd);
+    C.store(quads, x, .{ .xx = q[0], .xy = q[1], .xz = q[2], .yy = q[3], .yz = q[4], .zz = q[5] });
+    storeBox(x, lo, hi);
+    storeRem(x, .{ .x = o.x - sdelta(com.x, p0.x), .y = o.y - sdelta(com.y, p0.y), .z = o.z - sdelta(com.z, p0.z) });
+}
+
+inline fn centre(s: [4]f32) L.Vel3 {
+    // Massless leaves keep their first body as centre instead of 0/0.
+    const inv: f32 = if (s[0] > 0) 1 / s[0] else 0;
+    return .{ .x = s[1] * inv, .y = s[2] * inv, .z = s[3] * inv };
+}
+
+/// Leaves above this many bodies are summed by a whole workgroup in bigLeaves.
+pub const small_leaf: u32 = gs;
+
+/// Thread x over all 2m-1 nodes: depth from the parent links, leaf moments of leaves up to
+/// `small_leaf` bodies, and per-group maximum internal depth into scratch for depthArgs. A leaf's
+/// centre of mass is an f32 offset from its first body, so it keeps full precision whatever the box.
 export fn depthLeaf() callconv(C.cc) void {
     const g = C.groupId();
     const m = C.load(scr, P.off_hdr);
     const total = 2 * m - 1;
     if (g * gs >= total) return;
-    const x = g * gs + C.lid();
-    if (x >= total) return;
-    var d: u32 = 0;
-    var y = x;
-    // Internal depth <= 62 and leaf depth <= 63 (distinct 63-bit leaf keys), so 64 only guards bugs.
-    while (y != 0 and d < 64) : (d += 1) y = C.load(scr, P.off_parent + y);
-    var nd = C.load(nodes, x);
-    nd.info |= d << depth_shift;
-    if (x >= m - 1) {
+    const l = C.lid();
+    const x = g * gs + l;
+    var dint: u32 = 0;
+    if (x < total) {
+        var d: u32 = 0;
+        var y = x;
+        // Internal depth <= 62 and leaf depth <= 63 (distinct 63-bit leaf keys), so 64 only guards bugs.
+        while (y != 0 and d < 64) : (d += 1) y = C.load(scr, P.off_parent + y);
+        if (x + 1 < m) dint = d;
+        var nd = C.load(nodes, x);
+        nd.info |= d << depth_shift;
         const first = nd.child & ~leaf_flag;
         const cnt = nd.info & count_mask;
-        const p0 = C.load(pos, first);
-        var lo = p0;
-        var hi = p0;
-        var s1: Kahan(4) = .{};
-        var k: u32 = 0;
-        while (k < cnt) : (k += 1) {
-            const p = C.load(pos, first + k);
-            const w = C.load(mass, first + k);
-            s1 = s1.add(.{ w, w * sdelta(p.x, p0.x), w * sdelta(p.y, p0.y), w * sdelta(p.z, p0.z) });
-            lo = .{ .x = @min(lo.x, p.x), .y = @min(lo.y, p.y), .z = @min(lo.z, p.z) };
-            hi = .{ .x = @max(hi.x, p.x), .y = @max(hi.y, p.y), .z = @max(hi.z, p.z) };
-        }
-        const msum = s1.s[0];
-        // Massless leaves keep their first body as centre instead of 0/0.
-        const inv: f32 = if (msum > 0) 1 / msum else 0;
-        const o: L.Vel3 = .{ .x = s1.s[1] * inv, .y = s1.s[2] * inv, .z = s1.s[3] * inv };
-        const com: L.Pos3 = .{ .x = offsetIn(p0.x, o.x, lo.x, hi.x), .y = offsetIn(p0.y, o.y, lo.y, hi.y), .z = offsetIn(p0.z, o.z, lo.z, hi.z) };
-        const sc = P.box_scale;
-        var s2: Kahan(6) = .{};
-        k = 0;
-        while (k < cnt) : (k += 1) {
-            const p = C.load(pos, first + k);
-            const t = addQuad(.{}, C.load(mass, first + k), (sdelta(p.x, p0.x) - o.x) * sc, (sdelta(p.y, p0.y) - o.y) * sc, (sdelta(p.z, p0.z) - o.z) * sc);
-            s2 = s2.add(.{ t.xx, t.xy, t.xz, t.yy, t.yz, t.zz });
-        }
-        const q: Quad = .{ .xx = s2.s[0], .xy = s2.s[1], .xz = s2.s[2], .yy = s2.s[3], .yz = s2.s[4], .zz = s2.s[5] };
-        nd.com = com;
-        nd.mass = msum;
-        nd.open_r2 = openR2(com, lo, hi);
-        storeQuad(x, q);
-        storeBox(x, lo, hi);
-        storeRem(x, .{ .x = o.x - sdelta(com.x, p0.x), .y = o.y - sdelta(com.y, p0.y), .z = o.z - sdelta(com.z, p0.z) });
+        if (x >= m - 1 and cnt <= small_leaf) {
+            const p0 = C.load(pos, first);
+            var lo = p0;
+            var hi = p0;
+            var s1: Blocked(4) = .{};
+            var k: u32 = 0;
+            while (k < cnt) : (k += 1) {
+                const p = C.load(pos, first + k);
+                const w = C.load(mass, first + k);
+                s1 = s1.add(.{ w, w * sdelta(p.x, p0.x), w * sdelta(p.y, p0.y), w * sdelta(p.z, p0.z) });
+                lo = .{ .x = @min(lo.x, p.x), .y = @min(lo.y, p.y), .z = @min(lo.z, p.z) };
+                hi = .{ .x = @max(hi.x, p.x), .y = @max(hi.y, p.y), .z = @max(hi.z, p.z) };
+            }
+            const sm = s1.sum();
+            const o = centre(sm);
+            const sc = P.box_scale;
+            var s2: Blocked(6) = .{};
+            k = 0;
+            while (k < cnt) : (k += 1) {
+                const p = C.load(pos, first + k);
+                s2 = s2.add(quadTerm(C.load(mass, first + k), (sdelta(p.x, p0.x) - o.x) * sc, (sdelta(p.y, p0.y) - o.y) * sc, (sdelta(p.z, p0.z) - o.z) * sc));
+            }
+            writeLeaf(x, nd, p0, sm[0], o, lo, hi, s2.sum());
+        } else C.store(nodes, x, nd);
     }
-    C.store(nodes, x, nd);
+    red[l] = dint;
+    var off: u32 = gs / 2;
+    while (off > 0) : (off >>= 1) {
+        C.barrier();
+        if (l < off) red[l] = @max(red[l], red[l + off]);
+    }
+    C.barrier();
+    if (l == 0) C.store(scr, P.off_dmax + g, red[l]);
+}
+
+const sf = C.Shared(f32, 6 * gs, "sf");
+const su = C.Shared(u32, 6 * gs, "su");
+const big = C.Shared(u32, gs, "big");
+
+/// Fixed-order pairwise sum of sf rows 0..n-1; every thread gets the totals.
+fn reduceF(comptime n: u32, l: u32) [n]f32 {
+    var off: u32 = gs / 2;
+    while (off > 0) : (off >>= 1) {
+        C.barrier();
+        if (l < off) {
+            inline for (0..n) |f| sf[f * gs + l] += sf[f * gs + l + off];
+        }
+    }
+    C.barrier();
+    var r: [n]f32 = undefined;
+    inline for (0..n) |f| r[f] = sf[f * gs + (l - l)];
+    C.barrier();
+    return r;
+}
+
+/// Leaf j with more than `small_leaf` bodies, summed by the whole group: thread l takes bodies
+/// l, l + 256, ... in blocked order, then a pairwise tree combines the threads.
+fn bigLeaf(j: u32, m: u32, l: u32) void {
+    const first = lstart(j);
+    const cnt = lstart(j + 1) - first;
+    const p0 = C.load(pos, first);
+    var lo = p0;
+    var hi = p0;
+    var s1: Blocked(4) = .{};
+    var k = l;
+    while (k < cnt) : (k += gs) {
+        const p = C.load(pos, first + k);
+        const w = C.load(mass, first + k);
+        s1 = s1.add(.{ w, w * sdelta(p.x, p0.x), w * sdelta(p.y, p0.y), w * sdelta(p.z, p0.z) });
+        lo = .{ .x = @min(lo.x, p.x), .y = @min(lo.y, p.y), .z = @min(lo.z, p.z) };
+        hi = .{ .x = @max(hi.x, p.x), .y = @max(hi.y, p.y), .z = @max(hi.z, p.z) };
+    }
+    const part = s1.sum();
+    inline for (0..4) |f| sf[f * gs + l] = part[f];
+    su[l] = lo.x;
+    su[gs + l] = lo.y;
+    su[2 * gs + l] = lo.z;
+    su[3 * gs + l] = hi.x;
+    su[4 * gs + l] = hi.y;
+    su[5 * gs + l] = hi.z;
+    var off: u32 = gs / 2;
+    while (off > 0) : (off >>= 1) {
+        C.barrier();
+        if (l < off) {
+            inline for (0..3) |f| su[f * gs + l] = @min(su[f * gs + l], su[f * gs + l + off]);
+            inline for (3..6) |f| su[f * gs + l] = @max(su[f * gs + l], su[f * gs + l + off]);
+        }
+    }
+    const sm = reduceF(4, l);
+    const z = l - l;
+    const blo: L.Pos3 = .{ .x = su[z], .y = su[gs + z], .z = su[2 * gs + z] };
+    const bhi: L.Pos3 = .{ .x = su[3 * gs + z], .y = su[4 * gs + z], .z = su[5 * gs + z] };
+    const o = centre(sm);
+    const sc = P.box_scale;
+    var s2: Blocked(6) = .{};
+    k = l;
+    while (k < cnt) : (k += gs) {
+        const p = C.load(pos, first + k);
+        s2 = s2.add(quadTerm(C.load(mass, first + k), (sdelta(p.x, p0.x) - o.x) * sc, (sdelta(p.y, p0.y) - o.y) * sc, (sdelta(p.z, p0.z) - o.z) * sc));
+    }
+    const qp = s2.sum();
+    inline for (0..6) |f| sf[f * gs + l] = qp[f];
+    const q = reduceF(6, l);
+    if (l == 0) {
+        const x = m - 1 + j;
+        writeLeaf(x, C.load(nodes, x), p0, sm[0], o, blo, bhi, q);
+    }
+}
+
+/// Group g looks at leaves g*256 .. g*256+255 and sums each big one cooperatively, in leaf order.
+/// Dispatched like karras (one thread per leaf), so the cost without big leaves is one pass over
+/// the leaf starts.
+export fn bigLeaves() callconv(C.cc) void {
+    const g = C.groupId();
+    const m = C.load(scr, P.off_hdr);
+    if (g * gs >= m) return;
+    const l = C.lid();
+    const j = g * gs + l;
+    var is_big: u32 = 0;
+    if (j < m and lstart(j + 1) - lstart(j) > small_leaf) is_big = 1;
+    const at = groupScan(l, is_big);
+    const count = red[gs - 1 + (l - l)];
+    if (is_big != 0) big[at] = j;
+    C.barrier();
+    var b: u32 = 0;
+    while (b < count) : (b += 1) bigLeaf(big[b], m, l);
+}
+
+/// One group: deepest internal node from depthLeaf's group maxima, then the indirect arguments of
+/// the moments passes, empty for depths below it (and all empty on overflow).
+export fn depthArgs() callconv(C.cc) void {
+    if (C.groupId() != 0) return;
+    const l = C.lid();
+    const m = C.load(scr, P.off_hdr);
+    const ok = fits(m);
+    const groups = if (ok) (2 * m - 1 + gs - 1) / gs else 0;
+    var mx: u32 = 0;
+    var k = l;
+    while (k < groups) : (k += gs) mx = @max(mx, C.load(scr, P.off_dmax + k));
+    red[l] = mx;
+    var off: u32 = gs / 2;
+    while (off > 0) : (off >>= 1) {
+        C.barrier();
+        if (l < off) red[l] = @max(red[l], red[l + off]);
+    }
+    C.barrier();
+    const deepest = red[l - l];
+    if (l < depth_passes) writeDispatch(arg_moments + 3 * l, if (ok and m > 1 and l <= deepest) m else 0);
+    if (l == depth_passes) C.store(args, l - depth_passes + 9, deepest);
 }
 
 /// Internal nodes at depth P.depth from their two finished children (left = child, right =

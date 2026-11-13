@@ -7,6 +7,7 @@ const L = @import("gpu_layout");
 const sim = @import("sim.zig");
 const ref3 = @import("ref3.zig");
 const tree3 = @import("tree3.zig");
+const Sort3 = @import("sort3.zig").Sort3;
 
 const gpa = std.testing.allocator;
 const Buffer = *c.SDL_GPUBuffer;
@@ -313,7 +314,7 @@ fn permuted(cl: Cloud, perm: []const u32) !Cloud {
     return .{ .pos = pos, .mass = mass };
 }
 
-test "tree3: too small a node capacity sets the overflow flag and writes nothing out of bounds" {
+test "tree3: overflow sets the flag on the GPU and replaces the root with an empty leaf" {
     const dev = try device();
     defer c.SDL_DestroyGPUDevice(dev);
     const n = 5000;
@@ -321,6 +322,22 @@ test "tree3: too small a node capacity sets the overflow flag and writes nothing
     defer t.deinit();
     const g = try Gpu.init(dev, n);
     defer g.deinit();
+    const prm: tree3.Params = .{ .theta = 0.6, .box_size = 1 };
+
+    // A tree that fits first, so the overflow build has a stale tree to hide.
+    const few = try uniform(100, 12, 0, std.math.maxInt(u32));
+    defer few.deinit();
+    const sf = try ref3.sortKeys(gpa, few.pos);
+    defer sf.deinit(gpa);
+    const pf = try permuted(few, sf.perm);
+    defer pf.deinit();
+    try g.set(pf.pos, pf.mass, sf.keys, sf.perm);
+    const ok = try buildGpu(&t, g, 100, prm);
+    try std.testing.expect(!ok.overflow);
+    var root: [1]L.Node = undefined;
+    try tree3.download(dev, t.nodes, 0, std.mem.sliceAsBytes(&root));
+    try std.testing.expect(root[0].mass > 0);
+
     const u = try uniform(n, 11, 0, std.math.maxInt(u32));
     defer u.deinit();
     const s = try ref3.sortKeys(gpa, u.pos);
@@ -328,9 +345,77 @@ test "tree3: too small a node capacity sets the overflow flag and writes nothing
     const p = try permuted(u, s.perm);
     defer p.deinit();
     try g.set(p.pos, p.mass, s.keys, s.perm);
-    const st = try buildGpu(&t, g, n, .{ .theta = 0.6, .box_size = 1 });
+    const st = try buildGpu(&t, g, n, prm);
     try std.testing.expect(st.overflow);
     try std.testing.expect(st.nodes > 64);
+    var word: [1]u32 = undefined;
+    try tree3.download(dev, t.statusBuffer(), 4 * tree3.status_overflow, std.mem.sliceAsBytes(&word));
+    try std.testing.expectEqual(@as(u32, 1), word[0]);
+    try tree3.download(dev, t.nodes, 0, std.mem.sliceAsBytes(&root));
+    try std.testing.expectEqual(L.Node{ .com = .{ .x = 0, .y = 0, .z = 0 }, .mass = 0, .open_r2 = 0, .child = ref3.leaf_flag, .skip = ref3.end, .info = 0 }, root[0]);
+    var q: [1]L.NodeQuad = undefined;
+    try tree3.download(dev, t.quads, 0, std.mem.sliceAsBytes(&q));
+    try std.testing.expectEqual(L.NodeQuad{ .xx = 0, .xy = 0, .xz = 0, .yy = 0, .yz = 0, .zz = 0 }, q[0]);
+}
+
+test "tree3: one leaf of a 100k-body equal-key run is summed by a workgroup and matches ref3" {
+    const dev = try device();
+    defer c.SDL_DestroyGPUDevice(dev);
+    const n = 102_000;
+    var t = try tree3.Tree3.init(dev, n);
+    defer t.deinit();
+    const g = try Gpu.init(dev, n);
+    defer g.deinit();
+    var prng = std.Random.DefaultPrng.init(21);
+    const r = prng.random();
+    const cl = try uniform(n, 22, 0, std.math.maxInt(u32));
+    defer cl.deinit();
+    // 100k bodies inside one 2^11-quanta key cell, the rest uniform; also a 300-body run, just
+    // above the single-thread limit.
+    for (cl.pos[0..100_000]) |*p| p.* = .{ .x = 0x4000_0000 | r.uintLessThan(u32, 0x800), .y = 0x2000_0000 | r.uintLessThan(u32, 0x800), .z = 0x6000_0000 | r.uintLessThan(u32, 0x800) };
+    for (cl.pos[100_000..100_300]) |*p| p.* = .{ .x = 0x9000_0000 | r.uintLessThan(u32, 0x800), .y = 0x1000_0000 | r.uintLessThan(u32, 0x800), .z = 0x3000_0000 | r.uintLessThan(u32, 0x800) };
+    try checkCase("100k equal-key run + 300-body run + 1700 uniform", &t, g, cl.pos, cl.mass, 1, 0.6);
+}
+
+test "tree3: built on Sort3 output with the scratch aliased onto its idle records" {
+    const dev = try device();
+    defer c.SDL_DestroyGPUDevice(dev);
+    const n = 200_000;
+    var sort = try Sort3.init(dev, n);
+    defer sort.deinit();
+    var t = try tree3.Tree3.initOnSort(dev, &sort);
+    defer t.deinit();
+    const g = try Gpu.init(dev, n);
+    defer g.deinit();
+    const cl = try plummer(n, 31, 10);
+    defer cl.deinit();
+    try upload(dev, g.in.pos, std.mem.sliceAsBytes(cl.pos));
+    try upload(dev, g.in.mass, std.mem.sliceAsBytes(cl.mass));
+    const prm: tree3.Params = .{ .theta = 0.6, .box_size = 20 };
+    var cmd = c.SDL_AcquireGPUCommandBuffer(dev) orelse return error.GpuSubmit;
+    cmd = try sort.record(cmd, .{ .pos = g.in.pos, .mass = g.in.mass }, n);
+    try t.record(cmd, .{ .pos = g.in.pos, .mass = g.in.mass, .keys = sort.sorted() }, n, prm);
+    try tree3.submitWait(dev, cmd);
+    const st = try t.readStatus();
+    try std.testing.expect(!st.overflow);
+
+    const r = try ref3.build(gpa, cl.pos, cl.mass, .{ .box = 20, .theta = 0.6 });
+    defer r.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, @intCast(r.nodes.len)), st.nodes);
+    const res = try readTree(&t, st.nodes);
+    defer gpa.free(res.nodes);
+    defer gpa.free(res.quads);
+    const w = try compare(r, res);
+    std.debug.print("tree3 on sort3, aliased scratch: nodes/N {d:.4}, {d:.1} B/body own; worst error / tolerance: mass {d:.3} com {d:.3} reach {d:.3} quad {d:.3}\n", .{
+        @as(f64, @floatFromInt(st.nodes)) / n, t.bytesPerBody(), w.mass, w.com, w.reach, w.quad,
+    });
+    try std.testing.expect(w.mass <= 1 and w.com <= 1 and w.reach <= 1 and w.quad <= 1);
+
+    // The size check: more nodes than the borrowed 12 B/body holds must fail at init.
+    try std.testing.expectError(error.ScratchTooSmall, tree3.Tree3.initWith(dev, n, .{ .node_cap = n / 2, .scratch = sort.scratch(), .scratch_bytes = @as(u64, n) * 12 }));
+    var tiny = try Sort3.init(dev, 20);
+    defer tiny.deinit();
+    try std.testing.expectError(error.ScratchTooSmall, tree3.Tree3.initOnSort(dev, &tiny));
 }
 
 test "tree3: build time at 1M, 4M and 16M Plummer bodies (TREE3_BENCH=1)" {
@@ -361,8 +446,8 @@ test "tree3: build time at 1M, 4M and 16M Plummer bodies (TREE3_BENCH=1)" {
             best = @min(best, sim.msSince(t0));
         }
         const st = try t.readStatus();
-        std.debug.print("tree3 bench n={d}: build {d:.3} ms (min of 5, submit to fence), nodes/N {d:.4}, overflow {}, {d:.1} B/body tree+scratch at capacity\n", .{
-            n, best, @as(f64, @floatFromInt(st.nodes)) / @as(f64, @floatFromInt(n)), st.overflow, t.bytesPerBody(),
+        std.debug.print("tree3 bench n={d}: build {d:.3} ms (min of 5, submit to fence), nodes/N {d:.4}, deepest internal node {d}, overflow {}, {d:.1} B/body tree+scratch at capacity\n", .{
+            n, best, @as(f64, @floatFromInt(st.nodes)) / @as(f64, @floatFromInt(n)), st.max_depth, st.overflow, t.bytesPerBody(),
         });
         try std.testing.expect(!st.overflow);
     }
