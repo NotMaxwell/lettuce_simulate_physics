@@ -98,6 +98,8 @@ pub const Pool = struct {
 /// is thinned so a ring holds a full lifetime of particles; see k_emit.zig.
 pub const fire_pool_cap: u32 = 1 << 20;
 pub const ash_pool_cap: u32 = 1 << 19;
+/// Cells of the ash contact hash (k_particles.zig); a power of two.
+const ash_table: u32 = 1 << 19;
 
 /// Latest fire counters read back from the GPU (about two ticks old).
 pub const FxStats = struct {
@@ -145,7 +147,7 @@ const max_level_every: u32 = 4;
 /// Pair terms of the sampled potential sum: 0.2 ms or less at 100k bodies.
 const diag_pair_budget: u32 = 1 << 26;
 
-const Kernel = enum { spawn, reset, merge, maxLevel, hoop, clearPick, pick, grab, release, lasso, explode, conduct, fxReset, igniteGrab, burn, emitFire, emitAsh, fireUpdate, ashUpdate };
+const Kernel = enum { spawn, reset, merge, maxLevel, hoop, clearPick, pick, grab, release, lasso, explode, conduct, fxReset, igniteGrab, burn, emitFire, emitAsh, fireUpdate, ashUpdate, ashClear, ashBin, ashCollide };
 const Module = enum { spawn, merge, act, conduct, burn, emit, particles };
 const module_of = std.enums.EnumArray(Kernel, Module).init(.{
     .spawn = .spawn,
@@ -167,6 +169,9 @@ const module_of = std.enums.EnumArray(Kernel, Module).init(.{
     .emitAsh = .emit,
     .fireUpdate = .particles,
     .ashUpdate = .particles,
+    .ashClear = .particles,
+    .ashBin = .particles,
+    .ashCollide = .particles,
 });
 const module_spv = std.enums.EnumArray(Module, []const u8).init(.{
     .spawn = @embedFile("gpu_game_spawn.spv"),
@@ -255,6 +260,9 @@ pub const GpuWorld = struct {
     /// One tile {0, 0, 1, 1}: the tile table for drawing pools with a white texture.
     pool_tiles: Buffer,
     claim: Buffer,
+    /// Ash contact spatial hash: list heads per cell, and each ash's next link.
+    ash_heads: Buffer,
+    ash_next: Buffer,
     out: Buffer,
     pick_buf: Buffer,
     spawn_buf: Buffer,
@@ -293,6 +301,8 @@ pub const GpuWorld = struct {
     stats: FxStats = .{},
     /// false skips every fire pass (to measure their cost).
     fire_enabled: bool = true,
+    /// false skips ash-ash contacts (test hook).
+    ash_collide: bool = true,
     /// Ticks left in which something may have been heated that the (late) counters do not show
     /// yet: set by ignition, blasts and hot spawns, so idle fire passes can be skipped safely.
     fire_wake: u32 = 0,
@@ -340,6 +350,8 @@ pub const GpuWorld = struct {
             .ash = try Pool.init(dev, ash_pool_cap),
             .pool_tiles = try buffer(dev, 16, true),
             .claim = try buffer(dev, cap * 4, false),
+            .ash_heads = try buffer(dev, ash_table * 4, false),
+            .ash_next = try buffer(dev, ash_pool_cap * 4, false),
             .out = try buffer(dev, out_bytes, false),
             .pick_buf = try buffer(dev, 16, false),
             .spawn_buf = try buffer(dev, spawn_batch * @sizeOf(SpawnRec), false),
@@ -393,7 +405,7 @@ pub const GpuWorld = struct {
             c.SDL_ReleaseGPUTransferBuffer(gw.dev, s.tb);
         }
         for (std.enums.values(Kernel)) |k| c.SDL_ReleaseGPUComputePipeline(gw.dev, gw.pipes.get(k));
-        for ([_]Buffer{ gw.heat, gw.tmp, gw.fx, gw.pool_tiles, gw.claim, gw.out, gw.pick_buf, gw.spawn_buf, gw.poly_buf, gw.blast_buf }) |b| c.SDL_ReleaseGPUBuffer(gw.dev, b);
+        for ([_]Buffer{ gw.heat, gw.tmp, gw.fx, gw.pool_tiles, gw.claim, gw.ash_heads, gw.ash_next, gw.out, gw.pick_buf, gw.spawn_buf, gw.poly_buf, gw.blast_buf }) |b| c.SDL_ReleaseGPUBuffer(gw.dev, b);
         for ([_]*const Pool{ &gw.fire, &gw.ash }) |p| for (p.all()) |b| c.SDL_ReleaseGPUBuffer(gw.dev, b);
         c.SDL_ReleaseGPUTransferBuffer(gw.dev, gw.upload_tb);
         c.SDL_ReleaseGPUTransferBuffer(gw.dev, gw.pick_tb);
@@ -1047,10 +1059,18 @@ pub const GpuWorld = struct {
             gp.items = c_fx_ash_alive;
             gw.dispatch(cmd, .ashUpdate, &gp, divCeil(ash_pool_cap, L.group_size));
         }
+        // Ash-ash contacts; the counter is a tick or two old, so the first ashes of a burst pass
+        // through each other until it shows two.
+        if (gw.ash_collide and st.ashes > 1) {
+            gp.items = ash_table - 1;
+            gw.dispatch(cmd, .ashClear, &gp, divCeil(ash_table, L.group_size));
+            gw.dispatch(cmd, .ashBin, &gp, divCeil(ash_pool_cap, L.group_size));
+            gw.dispatch(cmd, .ashCollide, &gp, divCeil(ash_pool_cap, L.group_size));
+        }
     }
 
     fn dispatch(gw: *GpuWorld, cmd: *c.SDL_GPUCommandBuffer, k: Kernel, gp: *const GameParams, groups: u32) void {
-        const pool = if (k == .emitAsh or k == .ashUpdate) &gw.ash else &gw.fire;
+        const pool = if (k == .emitAsh or k == .ashUpdate or k == .ashClear or k == .ashBin or k == .ashCollide) &gw.ash else &gw.fire;
         const pb = pool.all();
         if (groups == 0) return;
         c.SDL_PushGPUComputeUniformData(cmd, 0, gp, @sizeOf(GameParams));
@@ -1105,6 +1125,11 @@ pub const GpuWorld = struct {
             .particles => .{ ro_buf[0..0], blk: {
                 rw_buf[0..6].* = pb;
                 rw_buf[6] = gw.fx;
+                // The ash contact kernels use the pool's prev_pos and body slots for the hash.
+                if (k == .ashClear or k == .ashBin or k == .ashCollide) {
+                    rw_buf[1] = gw.ash_heads;
+                    rw_buf[2] = gw.ash_next;
+                }
                 break :blk rw_buf[0..7];
             } },
         };
@@ -1762,4 +1787,72 @@ test "gpu world: an impact that reaches ignition lights both balls, a gentler on
             try std.testing.expectEqual(cs.lit, m & L.flag_burning != 0);
         }
     }
+}
+
+/// Most ash pairs closer than 3 px (contact is 4) at one sampling instant over a burn-out.
+fn ashOverlapPeak(gpa: std.mem.Allocator, dev: *c.SDL_GPUDevice, collide: bool) !struct { peak_pairs: u32, peak_ashes: u32 } {
+    var gw = try GpuWorld.init(gpa, dev);
+    defer gw.deinit();
+    gw.profile_every = 0;
+    gw.ash_collide = collide;
+    gw.ignite_every = 1;
+    gw.ignite_temp = 100_000;
+    var w = world.World.init(gpa, 81);
+    defer w.deinit();
+    const in: Input = .{ .mutual_gravity = false, .merging = false, .random_explosions = false };
+    // A tight column of balls so the ashes land on top of each other.
+    for (0..24) |k| try gw.queueBall(&w, 500 + @as(f32, @floatFromInt(k % 3)) * 4, 100 + @as(f32, @floatFromInt(k)) * 20);
+    for (gw.pending.items) |*nb| {
+        nb.vx = 0;
+        nb.vy = 0;
+        nb.radius = 12;
+        nb.density = 1;
+        nb.mass = 100;
+        nb.level = 5;
+    }
+    const sample = 2048;
+    const pos = try gpa.alloc(L.Vec2, sample);
+    defer gpa.free(pos);
+    const meta = try gpa.alloc(u32, sample);
+    defer gpa.free(meta);
+    var peak: u32 = 0;
+    var peak_ashes: u32 = 0;
+    for (0..1500) |t| {
+        gw.tick(&w, in);
+        if (t % 10 != 9) continue;
+        gw.drain(&w);
+        try gw.sim.readBuffer(gw.ash.pos, std.mem.sliceAsBytes(pos));
+        try gw.sim.readBuffer(gw.ash.meta, std.mem.sliceAsBytes(meta));
+        var pairs: u32 = 0;
+        var alive: u32 = 0;
+        for (pos, meta, 0..) |p, m, i| {
+            if (m & L.flag_alive == 0) continue;
+            alive += 1;
+            for (pos[i + 1 ..], meta[i + 1 ..]) |q, mq| {
+                if (mq & L.flag_alive == 0) continue;
+                const dx = p.x - q.x;
+                const dy = p.y - q.y;
+                if (dx * dx + dy * dy < 9) pairs += 1;
+            }
+        }
+        peak = @max(peak, pairs);
+        peak_ashes = @max(peak_ashes, alive);
+    }
+    return .{ .peak_pairs = peak, .peak_ashes = peak_ashes };
+}
+
+test "gpu world: ashes collide with each other" {
+    _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SkipZigTest;
+    defer c.SDL_Quit();
+    const gfx = @import("gfx.zig");
+    var gpu = gfx.Gfx.init(.{ .window = null }) catch return error.SkipZigTest;
+    defer gpu.deinit();
+    const gpa = std.testing.allocator;
+    const off = try ashOverlapPeak(gpa, gpu.dev, false);
+    const on = try ashOverlapPeak(gpa, gpu.dev, true);
+    std.debug.print("ash overlap (pairs closer than 3 px, peak): contacts off {d} of {d} ashes, on {d} of {d} ashes\n", .{ off.peak_pairs, off.peak_ashes, on.peak_pairs, on.peak_ashes });
+    try std.testing.expect(off.peak_ashes > 40 and on.peak_ashes > 40);
+    try std.testing.expect(off.peak_pairs > 10);
+    try std.testing.expect(on.peak_pairs * 4 < off.peak_pairs);
 }
