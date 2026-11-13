@@ -288,11 +288,13 @@ pub const GpuWorld = struct {
         };
         @memset(gw.radius, 0);
         for (&gw.slots) |*s| s.* = .{ .tb = c.SDL_CreateGPUTransferBuffer(dev, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD, .size = download_bytes }) orelse return error.GpuSetupFailed };
-        for (std.enums.values(Kernel)) |k| {
+        const kernels = comptime std.enums.values(Kernel);
+        var infos: [kernels.len]c.SDL_GPUComputePipelineCreateInfo = undefined;
+        for (kernels, &infos) |k, *info| {
             const m = module_of.get(k);
             const code = module_spv.get(m);
             const lay = module_layout.get(m);
-            const p = c.SDL_CreateGPUComputePipeline(dev, &.{
+            info.* = .{
                 .code_size = code.len,
                 .code = code.ptr,
                 .entrypoint = @tagName(k),
@@ -303,12 +305,11 @@ pub const GpuWorld = struct {
                 .threadcount_x = L.group_size,
                 .threadcount_y = 1,
                 .threadcount_z = 1,
-            }) orelse {
-                std.log.err("gpu_world: pipeline {s}: {s}", .{ @tagName(k), c.SDL_GetError() });
-                return error.GpuSetupFailed;
             };
-            gw.pipes.set(k, p);
         }
+        var made: [kernels.len]?*c.SDL_GPUComputePipeline = undefined;
+        if (!gs.createComputePipelines(dev, &infos, &made)) return error.GpuSetupFailed;
+        for (kernels, made) |k, p| gw.pipes.set(k, p.?);
         // Claims compare against a stamp that is never 0, so zeroed memory means "unclaimed".
         try gw.zeroBuffer(gw.claim, cap * 4);
         try gw.zeroBuffer(gw.fx, fx_bytes);

@@ -48,10 +48,10 @@ pub const Gravity = struct {
         g.capacity = @min(capacity, L.max_balls);
         g.max_leaf_level = @min(K.max_level, leafLevelFor(g.capacity, 1.0, K.max_level) + 1);
         g.last_leaf_level = 0;
-        var made: usize = 0;
-        errdefer for (g.pipes[0..made]) |p| c.SDL_ReleaseGPUComputePipeline(device, p);
-        inline for (@typeInfo(Kernel).@"enum".field_names, 0..) |name, i| {
-            g.pipes[i] = c.SDL_CreateGPUComputePipeline(device, &.{
+        const names = @typeInfo(Kernel).@"enum".field_names;
+        var infos: [names.len]c.SDL_GPUComputePipelineCreateInfo = undefined;
+        inline for (names, &infos) |name, *info| {
+            info.* = .{
                 .code_size = spv.len,
                 .code = spv.ptr,
                 .entrypoint = name,
@@ -62,12 +62,12 @@ pub const Gravity = struct {
                 .threadcount_x = L.group_size,
                 .threadcount_y = 1,
                 .threadcount_z = 1,
-            }) orelse {
-                std.log.err("gravity pipeline {s}: {s}", .{ name, c.SDL_GetError() });
-                return error.GpuPipeline;
             };
-            made += 1;
         }
+        var made: [names.len]?*c.SDL_GPUComputePipeline = undefined;
+        if (!@import("gpu_sim").createComputePipelines(device, &infos, &made)) return error.GpuPipeline;
+        errdefer for (g.pipes) |p| c.SDL_ReleaseGPUComputePipeline(device, p);
+        for (&g.pipes, made) |*p, m| p.* = m.?;
         const leaf_cells = @as(u32, 1) << @intCast(2 * g.max_leaf_level);
         const pyramid = K.levelOffset(g.max_leaf_level + 1);
         g.cells = try makeBuffer(device, K.cellsWords(leaf_cells) * 4);

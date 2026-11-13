@@ -171,6 +171,7 @@ const GpuModules = struct {
                 .{ .name = "c", .module = c_mod },
                 .{ .name = "gpu_layout", .module = layout_mod },
                 .{ .name = "config", .module = config_mod },
+                .{ .name = "gpu_sim", .module = sim },
             },
         });
         gravity.addAnonymousImport("gravity.spv", .{ .root_source_file = grav_spv });
