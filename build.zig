@@ -136,6 +136,12 @@ pub fn build(b: *std.Build) void {
     setGpuEnv(b, sort3_test);
     b.step("test-sort3", "Only the 3D Morton sort tests").dependOn(&sort3_test.step);
 
+    // 3D tree build kernels (docs/sim3d.md WP4); `zig build test-tree3` runs only their tests.
+    sim_mod.addAnonymousImport("k3_tree.spv", .{ .root_source_file = spirvObject(b, "k3_tree", b.path("src/sim/k3/tree.zig"), sim_layout, null) });
+    const tree3_test_run = b.addRunArtifact(b.addTest(.{ .root_module = sim_mod, .filters = &.{"tree3"} }));
+    setGpuEnv(b, tree3_test_run);
+    b.step("test-tree3", "GPU tree build tests only (src/sim/tree3_tests.zig)").dependOn(&tree3_test_run.step);
+
     // SDL_GPU demo: shaders are Zig compiled to SPIR-V and embedded with @embedFile.
     const demo_mod = b.createModule(.{
         .root_source_file = b.path("src/gfx_demo.zig"),

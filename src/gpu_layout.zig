@@ -188,3 +188,34 @@ comptime {
     std.debug.assert(@sizeOf(NodeQuad) == 24);
     std.debug.assert(@sizeOf(Params3) == 48);
 }
+
+/// Uniform block of the 3D tree build (src/sim/k3/tree.zig, recorded by src/sim/tree3.zig).
+/// Offsets are in u32 words of the build scratch buffer.
+pub const TreeParams3 = extern struct {
+    n: u32,
+    node_cap: u32,
+    leaf_cap: u32,
+    /// Depth handled by this moments pass.
+    depth: u32,
+    /// Length per position quantum: box_size / 2^32.
+    box_scale: f32,
+    theta: f32,
+    scan_count: u32 = 0,
+    scan_data: u32 = 0,
+    scan_sums: u32 = 0,
+    off_hdr: u32,
+    off_lstart: u32,
+    off_lkey: u32,
+    off_parent: u32,
+    off_bbox: u32,
+    off_sums0: u32,
+    off_total: u32,
+    off_rem: u32,
+    off_dmax: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+};
+
+comptime {
+    @import("std").debug.assert(@sizeOf(TreeParams3) == 80);
+}
