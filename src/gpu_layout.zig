@@ -67,12 +67,24 @@ pub const SimParams = extern struct {
     cell_size: f32,
     mutual_g: f32,
     wall: f32,
-    flags: u32, // bit0 mutual gravity, bit1 merging, bit2 attract
+    flags: u32, // sim_flag_* below
     mouse_x: f32,
     mouse_y: f32,
     attraction_strength: f32,
     _pad: f32 = 0,
 };
+
+/// SimParams.flags bits. gpu_sim/common.zig re-exports the first three under its old names.
+pub const sim_flag_mutual_gravity: u32 = 1 << 0;
+pub const sim_flag_merging: u32 = 1 << 1;
+pub const sim_flag_attract: u32 = 1 << 2;
+/// Galaxy mode: open-space play area (no wall piles, no hoop, no auto-growing bounds).
+pub const sim_flag_galaxy: u32 = 1 << 3;
+/// Collision response, two bits: solid (default solver), accrete (any touching pair merges,
+/// conserving mass and momentum), ghost (no contact forces; gravity softening only).
+pub const sim_collide_shift: u5 = 4;
+pub const sim_collide_mask: u32 = 3 << sim_collide_shift;
+pub const CollideMode = enum(u32) { solid = 0, accrete = 1, ghost = 2 };
 
 /// GPU→CPU event record appended by kernels (merge, ignite, explode, sound...).
 /// Read back one frame late; the CPU applies game logic and audio from these.
