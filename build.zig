@@ -48,7 +48,10 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{ .root_module = exe_mod });
     const test_run = b.addRunArtifact(tests);
     setGpuEnv(b, test_run); // gpu_world.zig has a test that needs the GPU
-    b.step("test", "Run tests").dependOn(&test_run.step);
+    const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&test_run.step);
+    const fixup_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/tools/spirv_fixup.zig"), .target = b.graph.host }) });
+    test_step.dependOn(&b.addRunArtifact(fixup_tests).step);
 
     // Each tool has its own root so modules can be built and verified independently.
     const Tool = struct { step: []const u8, root: []const u8, desc: []const u8 };
@@ -143,7 +146,7 @@ pub fn addShader(b: *std.Build, mod: *std.Build.Module, layout_mod: *std.Build.M
             .imports = &.{.{ .name = "gpu_layout", .module = layout_mod }},
         }),
     });
-    mod.addAnonymousImport(import_name, .{ .root_source_file = obj.getEmittedBin() });
+    mod.addAnonymousImport(import_name, .{ .root_source_file = gpu_sim_build.fixedSpirv(b, obj.getEmittedBin(), import_name) });
 }
 
 /// GPU simulation modules shared by the game and the bench: the gpu_sim solver, mutual
@@ -211,5 +214,5 @@ fn spirvObject(b: *std.Build, name: []const u8, root: std.Build.LazyPath, layout
                 &.{.{ .name = "gpu_layout", .module = layout }},
         }),
     });
-    return obj.getEmittedBin();
+    return gpu_sim_build.fixedSpirv(b, obj.getEmittedBin(), b.fmt("{s}.spv", .{name}));
 }

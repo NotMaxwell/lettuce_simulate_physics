@@ -49,7 +49,29 @@ pub fn addModule(b: *std.Build, o: Options) *std.Build.Module {
                 .imports = &.{.{ .name = "gpu_layout", .module = shader_layout }},
             }),
         });
-        mod.addAnonymousImport("gpu_sim_" ++ name ++ ".spv", .{ .root_source_file = obj.getEmittedBin() });
+        mod.addAnonymousImport("gpu_sim_" ++ name ++ ".spv", .{ .root_source_file = fixedSpirv(b, obj.getEmittedBin(), "gpu_sim_" ++ name ++ ".spv") });
     }
     return mod;
+}
+
+var fixup_exe: ?*std.Build.Step.Compile = null;
+
+/// Runs src/tools/spirv_fixup.zig over an emitted SPIR-V module (adds the Block decorations
+/// Zig's backend leaves off; see that file) and returns the fixed module, named `basename`.
+pub fn fixedSpirv(b: *std.Build, bin: std.Build.LazyPath, basename: []const u8) std.Build.LazyPath {
+    const exe = fixup_exe orelse blk: {
+        const e = b.addExecutable(.{
+            .name = "spirv_fixup",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/tools/spirv_fixup.zig"),
+                .target = b.graph.host,
+                .optimize = .ReleaseSafe,
+            }),
+        });
+        fixup_exe = e;
+        break :blk e;
+    };
+    const run = b.addRunArtifact(exe);
+    run.addFileArg(bin);
+    return run.addOutputFileArg(basename);
 }
