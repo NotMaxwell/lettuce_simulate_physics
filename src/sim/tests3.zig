@@ -12,7 +12,6 @@ fn device() !*c.SDL_GPUDevice {
     return sim.createDevice();
 }
 
-
 test "sim3: GPU forces on 10k Plummer bodies match an f64 direct sum" {
     const dev = try device();
     defer c.SDL_DestroyGPUDevice(dev);

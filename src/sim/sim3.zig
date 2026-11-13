@@ -236,7 +236,7 @@ pub const Sim3 = struct {
         var rwb: [4]c.SDL_GPUStorageBufferReadWriteBinding = undefined;
         for (rw, 0..) |b, i| rwb[i] = .{ .buffer = b };
         const cp = c.SDL_BeginGPUComputePass(cmd, null, 0, &rwb, @intCast(rw.len));
-        c.SDL_BindGPUComputePipeline(cp, s.pipes[@intFromEnum(k)]);
+        c.SDL_BindGPUComputePipeline(cp, s.pipes[@backingInt(k)]);
         if (ro.len > 0) c.SDL_BindGPUComputeStorageBuffers(cp, 0, @ptrCast(ro.ptr), @intCast(ro.len));
         const groups = (threads + L.group_size - 1) / L.group_size;
         c.SDL_DispatchGPUCompute(cp, @min(groups, dispatch_x), (groups + dispatch_x - 1) / dispatch_x, 1);

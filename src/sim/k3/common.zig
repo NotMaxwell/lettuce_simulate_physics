@@ -69,7 +69,7 @@ pub inline fn atomicAdd(p: *addrspace(.storage_buffer) u32, v: u32) u32 {
         : [ret] "" (-> u32),
         : [u32] "t" (u32),
           [p] "" (p),
-          [scope] "" (@as(u32, @intFromEnum(spirv.Scope.device))),
+          [scope] "" (@as(u32, @backingInt(spirv.Scope.device))),
           [sem] "" (@as(u32, 0)),
           [v] "" (v),
     );
