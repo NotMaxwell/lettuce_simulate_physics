@@ -48,7 +48,8 @@ inline fn atomicUMax(p: *addrspace(.storage_buffer) u32, v: u32) u32 {
 export fn clear() callconv(cc) void {
     const i = gid();
     if (i < params.width * params.height) grid.v[i] = 0;
-    if (i == 0) maxv.v[0] = 0;
+    // i == 0 here; a runtime index avoids a comptime-indexed buffer array field (RADV hazard).
+    if (i == 0) maxv.v[i] = 0;
 }
 
 export fn splat() callconv(cc) void {
@@ -60,8 +61,15 @@ export fn splat() callconv(cc) void {
     const fy = @floor(0.5 * h - (pos.v[i].y - params.cy) * params.scale);
     // Written so NaN fails the test and skips the body.
     if (!(fx >= 0 and fx < w and fy >= 0 and fy < h)) return;
-    const wt = @min(mass.v[i] * params.weight_scale + 0.5, 4.0e6);
-    _ = atomicAdd(&grid.v[@as(u32, @intFromFloat(fy)) * params.width + @as(u32, @intFromFloat(fx))], @intFromFloat(wt));
+    const m = mass.v[i];
+    if (!(m > 0)) return;
+    // Floor of 1 so light bodies still show, cap so one heavy body cannot saturate a pixel alone.
+    const wt: u32 = @intFromFloat(@min(@max(m * params.weight_scale + 0.5, 1.0), 4.0e6));
+    const cell = &grid.v[@as(u32, @intFromFloat(fy)) * params.width + @as(u32, @intFromFloat(fx))];
+    const old = atomicAdd(cell, wt);
+    // Saturate instead of wrapping: any add that wraps pins the pixel to the maximum, and a later
+    // add to the pinned value wraps again and re-pins it.
+    if (old +% wt < old) _ = atomicUMax(cell, 0xffffffff);
 }
 
 export fn findMax() callconv(cc) void {
@@ -70,7 +78,7 @@ export fn findMax() callconv(cc) void {
     var i = gid();
     var m: u32 = 0;
     while (i < n) : (i += stride) m = @max(m, grid.v[i]);
-    if (m > 0) _ = atomicUMax(&maxv.v[0], m);
+    if (m > 0) _ = atomicUMax(&maxv.v[spirv.local_invocation_id[0] -% spirv.local_invocation_id[0]], m);
 }
 
 inline fn sat(x: f32) f32 {
@@ -81,7 +89,7 @@ export fn tonemap() callconv(cc) void {
     const i = gid();
     if (i >= params.width * params.height) return;
     const v: f32 = @floatFromInt(grid.v[i]);
-    const top: f32 = @floatFromInt(@max(maxv.v[0], 1));
+    const top: f32 = @floatFromInt(@max(maxv.v[i -% i], 1));
     const t = if (params.log_scale != 0) @log(1.0 + v) / @log(1.0 + top) else v / top;
     // Dark blue, blue, red, yellow, white.
     const lo = sat(3.0 * t);

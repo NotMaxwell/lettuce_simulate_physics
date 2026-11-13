@@ -55,7 +55,8 @@ fn parse(args: []const [:0]const u8) !Options {
         } else if (std.mem.eql(u8, a, "--dt")) {
             o.dt = try std.fmt.parseFloat(f32, v);
         } else if (std.mem.eql(u8, a, "--every")) {
-            o.every = @max(1, try std.fmt.parseInt(u64, v, 10));
+            o.every = try std.fmt.parseInt(u64, v, 10);
+            if (o.every == 0) return error.ZeroEvery;
         } else if (std.mem.eql(u8, a, "--seed")) {
             o.seed = try std.fmt.parseInt(u64, v, 10);
         } else if (std.mem.eql(u8, a, "--soft")) {
@@ -81,6 +82,10 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("sim: {s}\n{s}", .{ @errorName(err), usage });
         return err;
     };
+    if (o.ticks == 0) {
+        std.debug.print("sim: --ticks must be at least 1\n{s}", .{usage});
+        return error.BadTicks;
+    }
     if (o.every_snap > 0 and o.out == null) {
         std.debug.print("sim: --every-snap needs --out\n{s}", .{usage});
         return error.MissingValue;
@@ -107,7 +112,10 @@ pub fn main(init: std.process.Init) !void {
     if (o.restart) |path| {
         const io = try snapshot.open(path);
         restart_io = io;
-        restart_header = try snapshot.readHeader(io);
+        restart_header = snapshot.readHeader(io) catch |err| {
+            std.debug.print("sim: cannot restart from {s}: {s} (incomplete or not a snapshot)\n", .{ path, @errorName(err) });
+            return err;
+        };
         const h = &restart_header;
         scenario = std.enums.fromInt(galaxy.Scenario, h.scenario) orelse o.scenario;
         seed = h.seed;

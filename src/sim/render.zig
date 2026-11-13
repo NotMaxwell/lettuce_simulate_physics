@@ -17,7 +17,7 @@ pub const Options = struct {
     height: u32 = 1080,
     /// World point at the image centre; null = mean position of the bodies.
     center: ?[2]f32 = null,
-    /// Half the shorter image side, in world units; null = 3x the rms radius about the centre.
+    /// Half the shorter image side, in world units; null = 1.05x the 99th percentile of the sampled distance from the centre.
     extent: ?f32 = null,
     log: bool = false,
 };
@@ -36,6 +36,8 @@ const n_kernels = @typeInfo(Kernel).@"enum".field_names.len;
 const chunk_bodies: usize = 4 << 20;
 /// Fixed-point mass weight of the average body: sums stay far below 2^32 even for 10^7 bodies in a pixel.
 const mean_weight: f32 = 64;
+/// Bodies sampled to pick the automatic extent.
+const max_samples: u64 = 1 << 20;
 
 pub const Renderer = struct {
     dev: *c.SDL_GPUDevice,
@@ -133,7 +135,11 @@ pub const Renderer = struct {
         var sum_m: f64 = 0;
         var sx: f64 = 0;
         var sy: f64 = 0;
-        var sxx: f64 = 0;
+        const stride: u64 = @max(1, h.n / max_samples);
+        var sample_x: std.ArrayList(f32) = .empty;
+        defer sample_x.deinit(gpa);
+        var sample_y: std.ArrayList(f32) = .empty;
+        defer sample_y.deinit(gpa);
         var at: u64 = 0;
         const need_pos = o.center == null or o.extent == null;
         while (at < h.n) : (at += chunk_bodies) {
@@ -146,7 +152,11 @@ pub const Renderer = struct {
                 for (xs[0..m], ys[0..m]) |x, y| {
                     sx += x;
                     sy += y;
-                    sxx += @as(f64, x) * x + @as(f64, y) * y;
+                }
+                var j: usize = @intCast((stride - at % stride) % stride);
+                while (j < m) : (j += stride) {
+                    try sample_x.append(gpa, xs[j]);
+                    try sample_y.append(gpa, ys[j]);
                 }
             }
         }
@@ -155,8 +165,7 @@ pub const Renderer = struct {
         const mean_y: f32 = @floatCast(sy / nf);
         const cx = if (o.center) |ctr| ctr[0] else mean_x;
         const cy = if (o.center) |ctr| ctr[1] else mean_y;
-        const rms = @sqrt(@max(sxx / nf - (sx / nf) * (sx / nf) - (sy / nf) * (sy / nf), 0));
-        const extent: f32 = o.extent orelse @floatCast(@max(3 * rms, 1e-3));
+        const extent: f32 = o.extent orelse try percentileRadius(gpa, sample_x.items, sample_y.items, cx, cy);
         const mean_mass = sum_m / nf;
         const base: sh.RenderParams = .{
             .count = 0,
@@ -218,6 +227,16 @@ pub const Renderer = struct {
         return .{ .n = h.n, .cx = cx, .cy = cy, .extent = extent, .render_ms = render_ms };
     }
 };
+
+fn percentileRadius(gpa: std.mem.Allocator, xs: []const f32, ys: []const f32, cx: f32, cy: f32) Error!f32 {
+    if (xs.len == 0) return 1;
+    const r = try gpa.alloc(f32, xs.len);
+    defer gpa.free(r);
+    for (r, xs, ys) |*o, x, y| o.* = std.math.hypot(x - cx, y - cy);
+    std.mem.sort(f32, r, {}, std.sort.asc(f32));
+    const p99 = r[(r.len - 1) * 99 / 100];
+    return @max(1.05 * p99, 1e-3);
+}
 
 fn waitRelease(dev: *c.SDL_GPUDevice, fence: *c.SDL_GPUFence) void {
     var f = fence;

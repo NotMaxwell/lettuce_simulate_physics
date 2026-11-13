@@ -63,6 +63,11 @@ pub const Header = extern struct {
         return fieldOffset(h.n, field_count);
     }
 
+    /// Size of a complete file: arrays plus footer.
+    pub fn completeSize(h: *const Header) u64 {
+        return h.fileSize() + footer_bytes;
+    }
+
     /// Payload bytes (arrays only, no padding).
     pub fn payloadBytes(h: *const Header) u64 {
         return h.n * 4 * field_count;
@@ -78,7 +83,11 @@ fn fieldOffset(n: u64, i: usize) u64 {
     return data_align + stride * i;
 }
 
-pub const Error = error{ FileOpen, FileIo, BadMagic, BadVersion, BadHeader };
+pub const Error = error{ FileOpen, FileIo, BadMagic, BadVersion, BadHeader, Truncated };
+
+/// Written after the last array, once everything else is on disk: `footer_magic` then the total file size.
+pub const footer_magic: [8]u8 = "LTCEND\x00\x00".*;
+pub const footer_bytes = 16;
 
 pub fn create(path: [:0]const u8, h: *const Header) Error!*c.SDL_IOStream {
     const io = c.SDL_IOFromFile(path.ptr, "wb") orelse return error.FileOpen;
@@ -102,6 +111,11 @@ pub fn readHeader(io: *c.SDL_IOStream) Error!Header {
     if (!std.mem.eql(u8, &h.magic, &magic)) return error.BadMagic;
     if (h.version != version) return error.BadVersion;
     if (h.dim != 2 or h.fields_used != field_count) return error.BadHeader;
+    const size = c.SDL_GetIOSize(io);
+    if (size < 0 or @as(u64, @intCast(size)) != h.completeSize()) return error.Truncated;
+    var footer: [footer_bytes]u8 = undefined;
+    try readAt(io, h.fileSize(), &footer);
+    if (!std.mem.eql(u8, footer[0..8], &footer_magic) or std.mem.readInt(u64, footer[8..16], .little) != h.completeSize()) return error.Truncated;
     return h;
 }
 
@@ -117,6 +131,13 @@ pub fn readField(io: *c.SDL_IOStream, h: *const Header, f: Field, start: u64, ou
 
 pub fn writeField(io: *c.SDL_IOStream, h: *const Header, f: Field, start: u64, data: []const f32) Error!void {
     try writeAt(io, h.offset(f) + start * 4, std.mem.sliceAsBytes(data));
+}
+
+pub fn writeFooter(io: *c.SDL_IOStream, h: *const Header) Error!void {
+    var footer: [footer_bytes]u8 = undefined;
+    footer[0..8].* = footer_magic;
+    std.mem.writeInt(u64, footer[8..16], h.completeSize(), .little);
+    try writeAt(io, h.fileSize(), &footer);
 }
 
 pub fn pathZ(buf: []u8, comptime fmt: []const u8, args: anytype) [:0]const u8 {

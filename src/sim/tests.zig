@@ -239,3 +239,28 @@ fn expectSameRun(a: []const u8, b: []const u8) !void {
     try std.testing.expect(d.pos < 2e-3);
     try std.testing.expect(d.vel < 1e-4);
 }
+
+test "snapshot: truncated or unfinished files are rejected, and no temp file is left behind" {
+    const dev = try device();
+    defer c.SDL_DestroyGPUDevice(dev);
+    const gpa = std.testing.allocator;
+    _ = c.SDL_CreateDirectory(".scratch");
+    var made = try diskSim(dev, gpa, 1000);
+    defer made.built.deinit(gpa);
+    defer made.s.deinit();
+    try takeSnapshot(gpa, &made.s, ".scratch/test_trunc.snap");
+    try std.testing.expect(!c.SDL_GetPathInfo(".scratch/test_trunc.snap.tmp", null));
+    const full = try loadFile(".scratch/test_trunc.snap");
+    defer freeFile(full);
+    {
+        const io = try snap.open(".scratch/test_trunc.snap");
+        defer _ = c.SDL_CloseIO(io);
+        _ = try snap.readHeader(io);
+    }
+    for ([_]usize{ full.len - 1, full.len - snap.footer_bytes, snap.header_bytes }) |len| {
+        try std.testing.expect(c.SDL_SaveFile(".scratch/test_trunc_cut.snap", full.ptr, len));
+        const io = try snap.open(".scratch/test_trunc_cut.snap");
+        defer _ = c.SDL_CloseIO(io);
+        try std.testing.expectError(error.Truncated, snap.readHeader(io));
+    }
+}

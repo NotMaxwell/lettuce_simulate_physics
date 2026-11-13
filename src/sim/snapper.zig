@@ -17,7 +17,7 @@ const slot_count = 3;
 /// Bodies the writer thread de-interleaves per file write.
 const block = 1 << 18;
 
-pub const Error = sim.Error || snap.Error || error{ OutOfMemory, ThreadSpawn };
+pub const Error = sim.Error || snap.Error || error{ OutOfMemory, ThreadSpawn, OutOfRange };
 
 const Job = struct {
     io: *c.SDL_IOStream = undefined,
@@ -58,9 +58,13 @@ pub const Snapper = struct {
     t_done: std.atomic.Value(u64) = .init(0),
     stats: Stats = .{},
     in_flight: bool = false,
+    tmp_path: [1100]u8 = undefined,
+    final_path: [1100]u8 = undefined,
 
     /// Heap-allocated because the writer thread holds a pointer to it.
     pub fn create(gpa: std.mem.Allocator, s: *sim.Sim) Error!*Snapper {
+        // SDL buffer regions use u32 offsets.
+        if (@as(u64, s.cfg.n) * @sizeOf(L.BallBody) > std.math.maxInt(u32)) return error.OutOfRange;
         const self = try gpa.create(Snapper);
         errdefer gpa.destroy(self);
         self.* = .{
@@ -121,7 +125,8 @@ pub const Snapper = struct {
     }
 
     /// Takes a snapshot now (applies the pending half kick first) and returns once all data is
-    /// downloaded; file writing continues in the background.
+    /// downloaded; file writing continues in the background. The data goes to `<path>.tmp` and is
+    /// renamed to `path` only after the footer is written, so `path` never holds a partial file.
     pub fn write(self: *Snapper, path: [:0]const u8, seed: u64, scenario: u32) Error!void {
         const s = self.s;
         const t0 = c.SDL_GetPerformanceCounter();
@@ -134,8 +139,22 @@ pub const Snapper = struct {
         // The synchronised state must be on the GPU before the first download is recorded; it is
         // the same command buffer when the solver does not split submits.
         const header = snap.Header.init(n, s.tick_no, s.cfg.dt, s.cfg.g, s.cfg.softening, s.half_pending, seed, scenario);
-        const io = try snap.create(path, &header);
+        const tmp = std.fmt.bufPrintSentinel(&self.tmp_path, "{s}.tmp", .{path}, 0) catch return error.FileOpen;
+        _ = std.fmt.bufPrintSentinel(&self.final_path, "{s}", .{path}, 0) catch return error.FileOpen;
+        const io = try snap.create(tmp, &header);
         self.in_flight = true;
+        var held = false;
+        self.writeChunks(io, header, &cmd, &held) catch |err| {
+            if (held) c.SDL_SignalSemaphore(self.free);
+            self.abortWrite(io);
+            return err;
+        };
+        self.stats = .{ .bytes = header.completeSize(), .stall_ms = ticksToMs(c.SDL_GetPerformanceCounter() - t0) };
+    }
+
+    fn writeChunks(self: *Snapper, io: *c.SDL_IOStream, header: snap.Header, cmd: *(*c.SDL_GPUCommandBuffer), held: *bool) Error!void {
+        const s = self.s;
+        const n: u64 = s.cfg.n;
         var at: u64 = 0;
         var k: u64 = 0;
         var first = true;
@@ -144,13 +163,14 @@ pub const Snapper = struct {
             const slot_i: u32 = @intCast(k % slot_count);
             const slot = &self.slots[slot_i];
             c.SDL_WaitSemaphore(self.free);
+            held.* = true;
             if (slot.mapped != null) {
                 c.SDL_UnmapGPUTransferBuffer(s.dev, slot.tb);
                 slot.mapped = null;
             }
-            if (!first) cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
+            if (!first) cmd.* = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
             first = false;
-            const cp = c.SDL_BeginGPUCopyPass(cmd);
+            const cp = c.SDL_BeginGPUCopyPass(cmd.*);
             var off: u32 = 0;
             const parts = [_]struct { buf: *c.SDL_GPUBuffer, elem: u32 }{
                 .{ .buf = s.pos, .elem = @sizeOf(L.Vec2) },
@@ -159,21 +179,31 @@ pub const Snapper = struct {
             };
             for (parts) |p| {
                 const bytes: u32 = count * p.elem;
+                // create() bounds n * sizeof(BallBody), so every offset fits SDL's u32.
                 c.SDL_DownloadFromGPUBuffer(cp, &.{ .buffer = p.buf, .offset = @intCast(at * p.elem), .size = bytes }, &.{ .transfer_buffer = slot.tb, .offset = off });
                 off += bytes;
             }
             c.SDL_EndGPUCopyPass(cp);
-            const f = c.SDL_SubmitGPUCommandBufferAndAcquireFence(cmd) orelse return error.GpuSubmit;
+            const f = c.SDL_SubmitGPUCommandBufferAndAcquireFence(cmd.*) orelse return error.GpuSubmit;
             var ff = f;
             _ = c.SDL_WaitForGPUFences(s.dev, true, &ff, 1);
             c.SDL_ReleaseGPUFence(s.dev, f);
             slot.mapped = @ptrCast(c.SDL_MapGPUTransferBuffer(s.dev, slot.tb, false) orelse return error.GpuBuffer);
             self.jobs[self.head % slot_count] = .{ .io = io, .header = header, .start = at, .count = count, .slot = slot_i, .last = at + count == n };
             self.head += 1;
+            held.* = false;
             c.SDL_SignalSemaphore(self.ready);
             at += count;
         }
-        self.stats = .{ .bytes = header.fileSize(), .stall_ms = ticksToMs(c.SDL_GetPerformanceCounter() - t0) };
+    }
+
+    /// Error path: lets queued chunks finish, then drops the incomplete temp file.
+    fn abortWrite(self: *Snapper, io: *c.SDL_IOStream) void {
+        for (0..slot_count) |_| c.SDL_WaitSemaphore(self.free);
+        for (0..slot_count) |_| c.SDL_SignalSemaphore(self.free);
+        _ = c.SDL_CloseIO(io);
+        _ = c.SDL_RemovePath(@ptrCast(&self.tmp_path));
+        self.in_flight = false;
     }
 };
 
@@ -197,10 +227,25 @@ fn writerMain(self: *Snapper) void {
         if (job.quit) return;
         writeChunk(self, job, &arrays) catch self.failed.store(true, .release);
         if (job.last) {
-            if (!c.SDL_CloseIO(job.io)) self.failed.store(true, .release);
+            finish(self, job);
             self.t_done.store(c.SDL_GetPerformanceCounter(), .release);
         }
         c.SDL_SignalSemaphore(self.free);
+    }
+}
+
+/// Footer, flush, close, then the atomic rename that publishes the file.
+fn finish(self: *Snapper, job: Job) void {
+    var ok = true;
+    snap.writeFooter(job.io, &job.header) catch {
+        ok = false;
+    };
+    if (!c.SDL_FlushIO(job.io)) ok = false;
+    if (!c.SDL_CloseIO(job.io)) ok = false;
+    if (ok and !c.SDL_RenamePath(@ptrCast(&self.tmp_path), @ptrCast(&self.final_path))) ok = false;
+    if (!ok) {
+        _ = c.SDL_RemovePath(@ptrCast(&self.tmp_path));
+        self.failed.store(true, .release);
     }
 }
 
