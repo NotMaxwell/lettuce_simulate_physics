@@ -99,7 +99,7 @@ pub const Snapper = struct {
     /// field order (e.g. 3D: pos xyz from a 12-byte source, vel xyz, then mass unless uniform).
     /// Heap-allocated because the writer thread holds a pointer to it.
     pub fn createGeneric(gpa: std.mem.Allocator, dev: *c.SDL_GPUDevice, n: u64, sources: []const Source, fields: []const FieldSpec, hooks: Hooks) Error!*Snapper {
-        if (sources.len == 0 or sources.len > max_sources or fields.len == 0 or fields.len > snap.max_fields) return error.BadHeader;
+        if (n == 0 or n >= (1 << 40) or sources.len == 0 or sources.len > max_sources or fields.len == 0 or fields.len > snap.max_fields) return error.BadHeader;
         var bpb: u32 = 0;
         for (sources, 0..) |src, i| {
             if (src.stride == 0 or src.stride % 4 != 0) return error.BadHeader;
