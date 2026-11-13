@@ -711,6 +711,41 @@ pub const GpuWorld = struct {
         }
     }
 
+    pub const Sanity = struct { alive: u32, nonfinite: u32, outside: u32, max_speed: f32, mean_speed: f32 };
+
+    /// Blocking readback of every ball to check the simulation is sane: non-finite values, balls
+    /// outside the play area (by more than their radius), speeds. For tests and `--check on`.
+    pub fn sanity(gw: *GpuWorld, w: *const world.World) !Sanity {
+        const n = gw.count;
+        const gpa = gw.gpa;
+        const pos = try gpa.alloc(L.Vec2, n);
+        defer gpa.free(pos);
+        const vel = try gpa.alloc(L.Vec2, n);
+        defer gpa.free(vel);
+        const body = try gpa.alloc(L.BallBody, n);
+        defer gpa.free(body);
+        const meta = try gpa.alloc(L.BallMeta, n);
+        defer gpa.free(meta);
+        gw.sim.download(0, .{ .pos = pos, .vel = vel, .body = body, .meta = meta }) catch return error.GpuSetupFailed;
+        var s: Sanity = .{ .alive = 0, .nonfinite = 0, .outside = 0, .max_speed = 0, .mean_speed = 0 };
+        var sum: f64 = 0;
+        const b = w.bounds;
+        for (pos, vel, body, meta) |p, v, bd, m| {
+            if (m & L.flag_alive == 0) continue;
+            s.alive += 1;
+            if (!(std.math.isFinite(p.x) and std.math.isFinite(p.y) and std.math.isFinite(v.x) and std.math.isFinite(v.y))) {
+                s.nonfinite += 1;
+                continue;
+            }
+            if (p.x < b.x - bd.radius or p.x > b.x + b.w + bd.radius or p.y < b.y - bd.radius or p.y > b.y + b.h + bd.radius) s.outside += 1;
+            const sp = @sqrt(v.x * v.x + v.y * v.y);
+            s.max_speed = @max(s.max_speed, sp);
+            sum += sp;
+        }
+        if (s.alive > 0) s.mean_speed = @floatCast(sum / @as(f64, @floatFromInt(s.alive)));
+        return s;
+    }
+
     /// Blocks until every submitted tick is done and processed (bench, shutdown, tests).
     pub fn drain(gw: *GpuWorld, w: *world.World) void {
         while (gw.in_flight > 0) gw.collect(w, true);
