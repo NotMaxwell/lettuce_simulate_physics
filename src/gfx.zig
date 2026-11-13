@@ -16,6 +16,12 @@ pub const Texture = *c.SDL_GPUTexture;
 
 const spv = @embedFile("sprite.spv");
 const balls_spv = @embedFile("balls.spv");
+const trails_spv = @embedFile("trails.spv");
+const trail_rec_spv = @embedFile("trail_rec.spv");
+const TC = @import("shaders/trail_common.zig");
+pub const trail_cap = TC.trail_cap;
+pub const trail_len = TC.trail_len;
+pub const trail_stride = TC.record_stride;
 
 /// World-to-screen camera: screen = o + (world - b) * scale (render.zig Camera).
 pub const BallCamera = struct { scale: f32 = 1, ox: f32 = 0, oy: f32 = 0, bx: f32 = 0, by: f32 = 0 };
@@ -52,6 +58,19 @@ pub const BallBuffers = struct {
     tiles: *c.SDL_GPUBuffer,
 };
 
+/// Ball trails drawn from a GPU ring of past positions (see shaders/trail_common.zig). Call once
+/// per frame before the ball pass; `record` appends this frame's positions as a new sample.
+pub const TrailPass = struct {
+    pos: *c.SDL_GPUBuffer,
+    prev_pos: *c.SDL_GPUBuffer,
+    body: *c.SDL_GPUBuffer,
+    meta: *c.SDL_GPUBuffer,
+    count: u32,
+    alpha: f32 = 1,
+    cam: BallCamera = .{},
+    record: bool = false,
+};
+
 pub const BallPass = struct {
     bufs: BallBuffers,
     /// Atlas texture the tile table indexes.
@@ -66,7 +85,7 @@ pub const BallPass = struct {
 /// Must match `View` in shaders/sprite.zig (std140 uniform).
 const View = extern struct { width: f32, height: f32, _pad0: f32 = 0, _pad1: f32 = 0 };
 
-const Kind = enum { sprites, triangles, balls };
+const Kind = enum { sprites, triangles, balls, trails };
 /// For `.balls`, `first` indexes `Gfx.ball_passes`.
 const Draw = struct { kind: Kind, tex: ?Texture, first: u32, count: u32 };
 
@@ -152,6 +171,17 @@ pub const Gfx = struct {
     draws: std.ArrayList(Draw) = .empty,
     ball_passes: std.ArrayList(BallPass) = .empty,
     clear: [4]f32 = .{ 0, 0, 0, 1 },
+    trail_pipe: ?*c.SDL_GPUGraphicsPipeline = null,
+    trail_rec_pipe: ?*c.SDL_GPUComputePipeline = null,
+    trail_ring: ?*c.SDL_GPUBuffer = null,
+    /// Samples recorded since the last clear.
+    trail_n: u32 = 0,
+    trail_clear: bool = true,
+    trail_pass: TrailPass = undefined,
+    trail_slot: u32 = 0,
+    trail_do_clear: bool = false,
+    trail_do_record: bool = false,
+    trail_active: bool = false,
 
     pub fn init(opts: Options) !Gfx {
         // SPIR-V 1.5 shaders (see build.zig) need a Vulkan 1.2 instance; SDL defaults to 1.0.
@@ -218,6 +248,9 @@ pub const Gfx = struct {
         _ = c.SDL_WaitForGPUIdle(g.dev);
         g.sprite_stage.deinit(g.dev);
         g.vert_stage.deinit(g.dev);
+        if (g.trail_pipe) |pp| c.SDL_ReleaseGPUGraphicsPipeline(g.dev, pp);
+        if (g.trail_rec_pipe) |pp| c.SDL_ReleaseGPUComputePipeline(g.dev, pp);
+        if (g.trail_ring) |b| c.SDL_ReleaseGPUBuffer(g.dev, b);
         g.draws.deinit(std.heap.smp_allocator);
         g.ball_passes.deinit(std.heap.smp_allocator);
         if (g.canvas) |t| c.SDL_ReleaseGPUTexture(g.dev, t);
@@ -272,6 +305,7 @@ pub const Gfx = struct {
         g.clear = clear;
         g.draws.clearRetainingCapacity();
         g.ball_passes.clearRetainingCapacity();
+        g.trail_active = false;
         if (g.window) |w| {
             var pw: c_int = 0;
             var ph: c_int = 0;
@@ -311,6 +345,78 @@ pub const Gfx = struct {
         if (pass.count == 0) return;
         try g.ball_passes.append(std.heap.smp_allocator, pass);
         try g.draws.append(std.heap.smp_allocator, .{ .kind = .balls, .tex = pass.atlas, .first = @intCast(g.ball_passes.items.len - 1), .count = pass.count });
+    }
+
+    /// Forgets all trail history (a new scene); applied by the next frame that draws trails.
+    pub fn clearTrails(g: *Gfx) void {
+        g.trail_clear = true;
+    }
+
+    /// Builds the trail pipelines and ring on first use, so the game without trails never
+    /// loads the trail shaders.
+    fn ensureTrails(g: *Gfx) !void {
+        if (g.trail_ring != null) return;
+        const dev = g.dev;
+        const vs = try shaderFrom(dev, trails_spv, "trailVs", c.SDL_GPU_SHADERSTAGE_VERTEX, 0, 5, 1);
+        defer c.SDL_ReleaseGPUShader(dev, vs);
+        const fs = try shader(dev, "spriteFs", c.SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0, 0);
+        defer c.SDL_ReleaseGPUShader(dev, fs);
+        g.trail_pipe = try pipelineBlend(dev, vs, fs, g.format, true);
+        g.trail_rec_pipe = c.SDL_CreateGPUComputePipeline(dev, &.{
+            .code_size = trail_rec_spv.len,
+            .code = trail_rec_spv.ptr,
+            .entrypoint = "record",
+            .format = c.SDL_GPU_SHADERFORMAT_SPIRV,
+            .num_readonly_storage_buffers = 2,
+            .num_readwrite_storage_buffers = 1,
+            .num_uniform_buffers = 1,
+            .threadcount_x = L.group_size,
+            .threadcount_y = 1,
+            .threadcount_z = 1,
+        }) orelse return fail("SDL_CreateGPUComputePipeline(trail_rec)");
+        g.trail_ring = c.SDL_CreateGPUBuffer(dev, &.{
+            .usage = c.SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ | c.SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_READ | c.SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE,
+            .size = TC.trail_cap * TC.trail_len * @sizeOf(L.Vec2),
+        }) orelse return fail("SDL_CreateGPUBuffer(trail ring)");
+        g.trail_clear = true;
+    }
+
+    /// Draws trails for the first `min(count, trail_cap)` ball ids; at most one per frame.
+    pub fn trailPass(g: *Gfx, pass: TrailPass) !void {
+        if (pass.count == 0) return;
+        try g.ensureTrails();
+        var p = pass;
+        p.count = @min(p.count, TC.trail_cap);
+        g.trail_do_clear = g.trail_clear;
+        if (g.trail_clear) g.trail_n = 0;
+        g.trail_clear = false;
+        g.trail_do_record = p.record;
+        g.trail_slot = g.trail_n % TC.trail_len;
+        if (p.record) g.trail_n += 1;
+        g.trail_pass = p;
+        g.trail_active = true;
+        try g.draws.append(std.heap.smp_allocator, .{ .kind = .trails, .tex = g.white, .first = 0, .count = p.count });
+    }
+
+    fn recordTrails(g: *Gfx, cmd: *c.SDL_GPUCommandBuffer) void {
+        const p = g.trail_pass;
+        const ring = g.trail_ring.?;
+        const binds = [1]c.SDL_GPUStorageBufferReadWriteBinding{.{ .buffer = ring, .cycle = false }};
+        const ro = [2]*c.SDL_GPUBuffer{ p.pos, p.meta };
+        const steps = [2]TC.RecParams{
+            .{ .count = TC.trail_cap, .slot = 0, .clear = 1 },
+            .{ .count = p.count, .slot = g.trail_slot, .clear = 0 },
+        };
+        for (steps, 0..) |rp, k| {
+            if (k == 0 and !g.trail_do_clear) continue;
+            if (k == 1 and !g.trail_do_record) continue;
+            c.SDL_PushGPUComputeUniformData(cmd, 0, &rp, @sizeOf(TC.RecParams));
+            const cp = c.SDL_BeginGPUComputePass(cmd, null, 0, &binds, 1);
+            c.SDL_BindGPUComputePipeline(cp, g.trail_rec_pipe.?);
+            c.SDL_BindGPUComputeStorageBuffers(cp, 0, &ro, 2);
+            c.SDL_DispatchGPUCompute(cp, (rp.count + L.group_size - 1) / L.group_size, 1, 1);
+            c.SDL_EndGPUComputePass(cp);
+        }
     }
 
     fn push(g: *Gfx, kind: Kind, tex: ?Texture, first: u32, count: u32) !void {
@@ -354,6 +460,7 @@ pub const Gfx = struct {
         try g.sprite_stage.upload(dev, copy.?, Sprite);
         try g.vert_stage.upload(dev, copy.?, Vertex);
         c.SDL_EndGPUCopyPass(copy);
+        if (g.trail_ring != null and g.trail_active) g.recordTrails(cmd);
 
         const view = View{ .width = @floatFromInt(g.width), .height = @floatFromInt(g.height) };
         c.SDL_PushGPUVertexUniformData(cmd, 0, &view, @sizeOf(View));
@@ -367,6 +474,30 @@ pub const Gfx = struct {
         const pass = c.SDL_BeginGPURenderPass(cmd, &target, 1, null) orelse return fail("SDL_BeginGPURenderPass");
         var bound: ?Kind = null;
         for (g.draws.items) |d| {
+            if (d.kind == .trails) {
+                const tp = g.trail_pass;
+                const u = TC.DrawParams{
+                    .view_w = @floatFromInt(g.width),
+                    .view_h = @floatFromInt(g.height),
+                    .alpha = tp.alpha,
+                    .scale = tp.cam.scale,
+                    .ox = tp.cam.ox,
+                    .oy = tp.cam.oy,
+                    .bx = tp.cam.bx,
+                    .by = tp.cam.by,
+                    .head = (g.trail_n +% TC.trail_len -% 1) % TC.trail_len,
+                    .max_level = cfg.max_level,
+                };
+                bound = .trails;
+                c.SDL_BindGPUGraphicsPipeline(pass, g.trail_pipe.?);
+                const sbufs = [5]*c.SDL_GPUBuffer{ g.trail_ring.?, tp.pos, tp.prev_pos, tp.body, tp.meta };
+                c.SDL_BindGPUVertexStorageBuffers(pass, 0, &sbufs, 5);
+                c.SDL_PushGPUVertexUniformData(cmd, 0, &u, @sizeOf(TC.DrawParams));
+                const bind = c.SDL_GPUTextureSamplerBinding{ .texture = g.white, .sampler = g.sampler };
+                c.SDL_BindGPUFragmentSamplers(pass, 0, &bind, 1);
+                c.SDL_DrawGPUPrimitives(pass, 6, d.count * TC.trail_len, 0, 0);
+                continue;
+            }
             if (d.kind == .balls) {
                 const bp = g.ball_passes.items[d.first];
                 const u = BallUniforms{
@@ -395,10 +526,10 @@ pub const Gfx = struct {
                 continue;
             }
             if (bound != d.kind) {
-                if (bound == .balls) c.SDL_PushGPUVertexUniformData(cmd, 0, &view, @sizeOf(View));
+                if (bound == .balls or bound == .trails) c.SDL_PushGPUVertexUniformData(cmd, 0, &view, @sizeOf(View));
                 bound = d.kind;
                 switch (d.kind) {
-                    .balls => unreachable,
+                    .balls, .trails => unreachable,
                     .sprites => {
                         c.SDL_BindGPUGraphicsPipeline(pass, g.sprite_pipe);
                         c.SDL_BindGPUVertexStorageBuffers(pass, 0, &g.sprite_stage.buf, 1);
@@ -416,7 +547,7 @@ pub const Gfx = struct {
             switch (d.kind) {
                 .sprites => c.SDL_DrawGPUPrimitives(pass, 6, d.count, 0, d.first),
                 .triangles => c.SDL_DrawGPUPrimitives(pass, d.count, 1, d.first, 0),
-                .balls => unreachable,
+                .balls, .trails => unreachable,
             }
         }
         c.SDL_EndGPURenderPass(pass);
@@ -496,15 +627,19 @@ fn shaderFrom(dev: *c.SDL_GPUDevice, code: []const u8, entry: [*:0]const u8, sta
 }
 
 fn pipeline(dev: *c.SDL_GPUDevice, vs: *c.SDL_GPUShader, fs: *c.SDL_GPUShader, format: c.SDL_GPUTextureFormat) !*c.SDL_GPUGraphicsPipeline {
+    return pipelineBlend(dev, vs, fs, format, false);
+}
+
+fn pipelineBlend(dev: *c.SDL_GPUDevice, vs: *c.SDL_GPUShader, fs: *c.SDL_GPUShader, format: c.SDL_GPUTextureFormat, additive: bool) !*c.SDL_GPUGraphicsPipeline {
     const color = c.SDL_GPUColorTargetDescription{
         .format = format,
         .blend_state = .{
             .enable_blend = true,
             .src_color_blendfactor = c.SDL_GPU_BLENDFACTOR_SRC_ALPHA,
-            .dst_color_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+            .dst_color_blendfactor = if (additive) c.SDL_GPU_BLENDFACTOR_ONE else c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
             .color_blend_op = c.SDL_GPU_BLENDOP_ADD,
             .src_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE,
-            .dst_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+            .dst_alpha_blendfactor = if (additive) c.SDL_GPU_BLENDFACTOR_ONE else c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
             .alpha_blend_op = c.SDL_GPU_BLENDOP_ADD,
         },
     };

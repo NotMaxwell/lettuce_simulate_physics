@@ -323,6 +323,10 @@ pub const Renderer = struct {
     tiles: *c.SDL_GPUBuffer,
     tris: Batch = .{},
     trail_buf: []Vertex = &.{},
+    /// GPU-ball trails (shown before the balls); toggled by the caller.
+    trails: bool = false,
+    trails_was_on: bool = false,
+    trail_last_tick: ?u64 = null,
     cam: Camera = .{},
     /// User view on top of the auto-fit camera: zoom 1 and zero pan is exactly the fit.
     zoom: f32 = 1,
@@ -455,6 +459,12 @@ pub const Renderer = struct {
         self.pan.y -= dy / s;
     }
 
+    /// Drops the GPU trail history, e.g. when a new scene loads.
+    pub fn clearTrails(self: *Renderer) void {
+        self.gfx.clearTrails();
+        self.trail_last_tick = null;
+    }
+
     fn nextSeed(self: *Renderer) u64 {
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 7;
@@ -495,7 +505,23 @@ pub const Renderer = struct {
 
         try self.drawBackground(bounds, cam);
         if (hud.gpu) |gb| {
-            // Trails need CPU positions, which GPU balls never send back; they are CPU-mode only.
+            if (self.trails) {
+                if (!self.trails_was_on) self.clearTrails();
+                const stride = gfx.trail_stride;
+                const record = self.trail_last_tick == null or self.trail_last_tick.? / stride != w.tick / stride;
+                self.trail_last_tick = w.tick;
+                try self.gfx.trailPass(.{
+                    .pos = gb.pos,
+                    .prev_pos = gb.prev_pos,
+                    .body = gb.body,
+                    .meta = gb.meta,
+                    .count = gb.count,
+                    .alpha = alpha,
+                    .cam = .{ .scale = cam.s, .ox = cam.ox, .oy = cam.oy, .bx = cam.bx, .by = cam.by },
+                    .record = record,
+                });
+            }
+            self.trails_was_on = self.trails;
             try self.gfx.ballPass(.{
                 .bufs = .{ .pos = gb.pos, .prev_pos = gb.prev_pos, .body = gb.body, .state = gb.state, .heat = gb.heat, .meta = gb.meta, .tiles = self.tiles },
                 .atlas = self.atlas,
