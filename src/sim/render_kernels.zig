@@ -3,17 +3,17 @@ const std = @import("std");
 const spirv = std.spirv;
 const L = @import("gpu_layout");
 const S = @import("shared.zig");
-
+const P = @import("render_params.zig");
 
 fn Rt(T: type) type {
     return extern struct { v: @SpirvType(.{ .runtime_array = T }) };
 }
-const pos = @extern(*addrspace(.storage_buffer) const Rt(L.Vec2), .{ .name = "pos", .decoration = .{ .descriptor = .{ .set = 0, .binding = 0 } } });
+const pos = @extern(*addrspace(.storage_buffer) const Rt(u32), .{ .name = "pos", .decoration = .{ .descriptor = .{ .set = 0, .binding = 0 } } });
 const mass = @extern(*addrspace(.storage_buffer) const Rt(f32), .{ .name = "mass", .decoration = .{ .descriptor = .{ .set = 0, .binding = 1 } } });
 const grid = @extern(*addrspace(.storage_buffer) Rt(u32), .{ .name = "grid", .decoration = .{ .descriptor = .{ .set = 1, .binding = 0 } } });
 const maxv = @extern(*addrspace(.storage_buffer) Rt(u32), .{ .name = "maxv", .decoration = .{ .descriptor = .{ .set = 1, .binding = 1 } } });
 const img = @extern(*addrspace(.storage_buffer) Rt(u32), .{ .name = "img", .decoration = .{ .descriptor = .{ .set = 1, .binding = 2 } } });
-const params = @extern(*addrspace(.uniform) const S.RenderParams, .{ .name = "params", .decoration = .{ .descriptor = .{ .set = 2, .binding = 0 } } });
+const params = @extern(*addrspace(.uniform) const P.RenderParams, .{ .name = "params", .decoration = .{ .descriptor = .{ .set = 2, .binding = 0 } } });
 
 const cc: std.builtin.CallingConvention = .{ .spirv_kernel = .{ .x = L.group_size, .y = 1, .z = 1 } };
 
@@ -27,7 +27,7 @@ inline fn atomicAdd(p: *addrspace(.storage_buffer) u32, v: u32) u32 {
         : [ret] "" (-> u32),
         : [u32] "t" (u32),
           [p] "" (p),
-          [scope] "" (@as(u32, @intFromEnum(spirv.Scope.device))),
+          [scope] "" (@as(u32, @backingInt(spirv.Scope.device))),
           [sem] "" (@as(u32, 0)),
           [v] "" (v),
     );
@@ -39,7 +39,7 @@ inline fn atomicUMax(p: *addrspace(.storage_buffer) u32, v: u32) u32 {
         : [ret] "" (-> u32),
         : [u32] "t" (u32),
           [p] "" (p),
-          [scope] "" (@as(u32, @intFromEnum(spirv.Scope.device))),
+          [scope] "" (@as(u32, @backingInt(spirv.Scope.device))),
           [sem] "" (@as(u32, 0)),
           [v] "" (v),
     );
@@ -57,11 +57,27 @@ export fn splat() callconv(cc) void {
     if (i >= params.count) return;
     const w: f32 = @floatFromInt(params.width);
     const h: f32 = @floatFromInt(params.height);
-    const fx = @floor((pos.v[i].x - params.cx) * params.scale + 0.5 * w);
-    const fy = @floor(0.5 * h - (pos.v[i].y - params.cy) * params.scale);
-    // Written so NaN fails the test and skips the body.
+    var dx: f32 = undefined;
+    var dy: f32 = undefined;
+    var dz: f32 = 0;
+    if (params.mode == P.mode_xyz_u32) {
+        // u32 fractions of the root cube, origin at its centre; the f32 rounding of a 32-bit value is far below a pixel.
+        dx = (@as(f32, @floatFromInt(pos.v[3 * i])) - 2147483648.0) * params.unit - params.cx;
+        dy = (@as(f32, @floatFromInt(pos.v[3 * i + 1])) - 2147483648.0) * params.unit - params.cy;
+        dz = (@as(f32, @floatFromInt(pos.v[3 * i + 2])) - 2147483648.0) * params.unit - params.cz;
+    } else {
+        dx = @as(f32, @bitCast(pos.v[2 * i])) - params.cx;
+        dy = @as(f32, @bitCast(pos.v[2 * i + 1])) - params.cy;
+    }
+    const sx = params.rx * dx + params.ry * dy + params.rz * dz;
+    const sy = params.ux * dx + params.uy * dy + params.uz * dz;
+    const depth = params.fx * dx + params.fy * dy + params.fz * dz;
+    // Written so NaN fails the tests and skips the body.
+    if (params.slab_half > 0 and !(@abs(depth) <= params.slab_half)) return;
+    const fx = @floor(sx * params.scale + 0.5 * w);
+    const fy = @floor(0.5 * h - sy * params.scale);
     if (!(fx >= 0 and fx < w and fy >= 0 and fy < h)) return;
-    const m = mass.v[i];
+    const m = if (params.uniform_mass > 0) params.uniform_mass else mass.v[i];
     if (!(m > 0)) return;
     // Floor of 1 so light bodies still show, cap so one heavy body cannot saturate a pixel alone.
     const wt: u32 = @intFromFloat(@min(@max(m * params.weight_scale + 0.5, 1.0), 4.0e6));

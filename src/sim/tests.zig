@@ -5,6 +5,7 @@ const sim = @import("sim.zig");
 const snap = @import("snapshot.zig");
 const snapper = @import("snapper.zig");
 const render = @import("render.zig");
+comptime { _ = @import("snap_tests.zig"); }
 
 fn device() !*c.SDL_GPUDevice {
     _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");

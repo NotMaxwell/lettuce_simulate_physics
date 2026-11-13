@@ -9,8 +9,22 @@ const galaxy = @import("galaxy");
 const sim = @import("sim.zig");
 const snap = @import("snapshot.zig");
 
-/// Download bytes per body: position, velocity (Vec2 each) and the BallBody that holds the mass.
-const bytes_per_body = 2 * @sizeOf(L.Vec2) + @sizeOf(L.BallBody);
+pub const max_sources = 4;
+
+/// One GPU buffer holding `stride` bytes per body (a multiple of 4), in body order.
+pub const Source = struct { buf: *c.SDL_GPUBuffer, stride: u32 };
+
+/// One file array: 4-byte word `word` of every element of source `source`; the file array index
+/// is the position in the field list (it must equal the header's field id).
+pub const FieldSpec = struct { source: u32, word: u32 };
+
+/// What the Snapper needs from its owner: submit anything pending (returns the command buffer to
+/// continue with), then describe the state. The header is made after the sync so tick/half-step are final.
+pub const Hooks = struct {
+    ctx: *anyopaque,
+    recordSync: *const fn (ctx: *anyopaque, cmd: *c.SDL_GPUCommandBuffer) *c.SDL_GPUCommandBuffer,
+    makeHeader: *const fn (ctx: *anyopaque, seed: u64, scenario: u32) snap.Header,
+};
 /// Largest transfer buffer; larger snapshots download in several chunks.
 pub const max_transfer_bytes: u64 = 256 << 20;
 const slot_count = 3;
@@ -43,7 +57,14 @@ pub const Stats = struct {
 };
 
 pub const Snapper = struct {
-    s: *sim.Sim,
+    dev: *c.SDL_GPUDevice,
+    n: u64,
+    hooks: Hooks,
+    sources: [max_sources]Source,
+    source_count: u32,
+    fields: [snap.max_fields]FieldSpec,
+    field_count: u32,
+    bytes_per_body: u32,
     chunk_bodies: u32,
     slots: [slot_count]Slot,
     slots_made: u32,
@@ -61,28 +82,62 @@ pub const Snapper = struct {
     tmp_path: [1100]u8 = undefined,
     final_path: [1100]u8 = undefined,
 
-    /// Heap-allocated because the writer thread holds a pointer to it.
+    /// 2D sim: positions, velocities and the mass inside `L.BallBody`.
     pub fn create(gpa: std.mem.Allocator, s: *sim.Sim) Error!*Snapper {
-        // SDL buffer regions use u32 offsets.
-        if (@as(u64, s.cfg.n) * @sizeOf(L.BallBody) > std.math.maxInt(u32)) return error.OutOfRange;
+        const mass_word = @offsetOf(L.BallBody, "mass") / 4;
+        const sources = [_]Source{
+            .{ .buf = s.pos, .stride = @sizeOf(L.Vec2) },
+            .{ .buf = s.vel, .stride = @sizeOf(L.Vec2) },
+            .{ .buf = s.body, .stride = @sizeOf(L.BallBody) },
+        };
+        const fields = [_]FieldSpec{ .{ .source = 0, .word = 0 }, .{ .source = 0, .word = 1 }, .{ .source = 1, .word = 0 }, .{ .source = 1, .word = 1 }, .{ .source = 2, .word = mass_word } };
+        const hooks: Hooks = .{ .ctx = s, .recordSync = syncSim, .makeHeader = headerSim };
+        return createGeneric(gpa, s.dev, s.cfg.n, &sources, &fields, hooks);
+    }
+
+    /// Generic form: `sources` are the GPU buffers to download, `fields` the file arrays in header
+    /// field order (e.g. 3D: pos xyz from a 12-byte source, vel xyz, then mass unless uniform).
+    /// Heap-allocated because the writer thread holds a pointer to it.
+    pub fn createGeneric(gpa: std.mem.Allocator, dev: *c.SDL_GPUDevice, n: u64, sources: []const Source, fields: []const FieldSpec, hooks: Hooks) Error!*Snapper {
+        if (n == 0 or n >= (1 << 40) or sources.len == 0 or sources.len > max_sources or fields.len == 0 or fields.len > snap.max_fields) return error.BadHeader;
+        var bpb: u32 = 0;
+        for (sources, 0..) |src, i| {
+            if (src.stride == 0 or src.stride % 4 != 0) return error.BadHeader;
+            // SDL buffer regions use u32 offsets.
+            if (n * src.stride > std.math.maxInt(u32)) {
+                std.debug.print("snapshot: source {d} is {d} B x {d} bodies = {d} B, over SDL_GPU's 4 GiB buffer-offset limit; cannot snapshot this many bodies\n", .{ i, src.stride, n, n * src.stride });
+                return error.OutOfRange;
+            }
+            bpb += src.stride;
+        }
+        for (fields) |f| if (f.source >= sources.len or (f.word + 1) * 4 > sources[f.source].stride) return error.BadHeader;
         const self = try gpa.create(Snapper);
         errdefer gpa.destroy(self);
         self.* = .{
-            .s = s,
-            .chunk_bodies = @intCast(@min(@as(u64, s.cfg.n), max_transfer_bytes / bytes_per_body)),
+            .dev = dev,
+            .n = n,
+            .hooks = hooks,
+            .sources = undefined,
+            .source_count = @intCast(sources.len),
+            .fields = undefined,
+            .field_count = @intCast(fields.len),
+            .bytes_per_body = bpb,
+            .chunk_bodies = @intCast(@min(n, max_transfer_bytes / bpb)),
             .slots = undefined,
             .slots_made = 0,
             .ready = c.SDL_CreateSemaphore(0) orelse return error.GpuBuffer,
             .free = c.SDL_CreateSemaphore(slot_count) orelse return error.GpuBuffer,
             .thread = undefined,
         };
-        const chunks = (s.cfg.n + self.chunk_bodies - 1) / self.chunk_bodies;
+        @memcpy(self.sources[0..sources.len], sources);
+        @memcpy(self.fields[0..fields.len], fields);
+        const chunks = (n + self.chunk_bodies - 1) / self.chunk_bodies;
         const need = @min(chunks, slot_count);
-        errdefer for (self.slots[0..self.slots_made]) |sl| c.SDL_ReleaseGPUTransferBuffer(s.dev, sl.tb);
+        errdefer for (self.slots[0..self.slots_made]) |sl| c.SDL_ReleaseGPUTransferBuffer(dev, sl.tb);
         while (self.slots_made < need) : (self.slots_made += 1) {
-            const tb = c.SDL_CreateGPUTransferBuffer(s.dev, &.{
+            const tb = c.SDL_CreateGPUTransferBuffer(dev, &.{
                 .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD,
-                .size = @intCast(@as(u64, self.chunk_bodies) * bytes_per_body),
+                .size = @intCast(@as(u64, self.chunk_bodies) * bpb),
             }) orelse return error.GpuBuffer;
             self.slots[self.slots_made] = .{ .tb = tb };
         }
@@ -97,8 +152,8 @@ pub const Snapper = struct {
         c.SDL_SignalSemaphore(self.ready);
         self.thread.join();
         for (self.slots[0..self.slots_made]) |*sl| {
-            if (sl.mapped != null) c.SDL_UnmapGPUTransferBuffer(self.s.dev, sl.tb);
-            c.SDL_ReleaseGPUTransferBuffer(self.s.dev, sl.tb);
+            if (sl.mapped != null) c.SDL_UnmapGPUTransferBuffer(self.dev, sl.tb);
+            c.SDL_ReleaseGPUTransferBuffer(self.dev, sl.tb);
         }
         c.SDL_DestroySemaphore(self.ready);
         c.SDL_DestroySemaphore(self.free);
@@ -128,17 +183,16 @@ pub const Snapper = struct {
     /// downloaded; file writing continues in the background. The data goes to `<path>.tmp` and is
     /// renamed to `path` only after the footer is written, so `path` never holds a partial file.
     pub fn write(self: *Snapper, path: [:0]const u8, seed: u64, scenario: u32) Error!void {
-        const s = self.s;
         const t0 = c.SDL_GetPerformanceCounter();
         self.flush();
         if (self.failed.load(.acquire)) return error.FileIo;
         self.t_start = t0;
-        const n: u64 = s.cfg.n;
-        var cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
-        cmd = s.recordSync(cmd);
+        var cmd = c.SDL_AcquireGPUCommandBuffer(self.dev) orelse return error.GpuSubmit;
         // The synchronised state must be on the GPU before the first download is recorded; it is
         // the same command buffer when the solver does not split submits.
-        const header = snap.Header.init(n, s.tick_no, s.cfg.dt, s.cfg.g, s.cfg.softening, s.half_pending, seed, scenario);
+        cmd = self.hooks.recordSync(self.hooks.ctx, cmd);
+        const header = self.hooks.makeHeader(self.hooks.ctx, seed, scenario);
+        if (header.n != self.n or header.fields_used != self.field_count) return error.BadHeader;
         const tmp = std.fmt.bufPrintSentinel(&self.tmp_path, "{s}.tmp", .{path}, 0) catch return error.FileOpen;
         _ = std.fmt.bufPrintSentinel(&self.final_path, "{s}", .{path}, 0) catch return error.FileOpen;
         const io = try snap.create(tmp, &header);
@@ -153,8 +207,8 @@ pub const Snapper = struct {
     }
 
     fn writeChunks(self: *Snapper, io: *c.SDL_IOStream, header: snap.Header, cmd: *(*c.SDL_GPUCommandBuffer), held: *bool) Error!void {
-        const s = self.s;
-        const n: u64 = s.cfg.n;
+        const dev = self.dev;
+        const n = self.n;
         var at: u64 = 0;
         var k: u64 = 0;
         var first = true;
@@ -165,30 +219,25 @@ pub const Snapper = struct {
             c.SDL_WaitSemaphore(self.free);
             held.* = true;
             if (slot.mapped != null) {
-                c.SDL_UnmapGPUTransferBuffer(s.dev, slot.tb);
+                c.SDL_UnmapGPUTransferBuffer(dev, slot.tb);
                 slot.mapped = null;
             }
-            if (!first) cmd.* = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
+            if (!first) cmd.* = c.SDL_AcquireGPUCommandBuffer(dev) orelse return error.GpuSubmit;
             first = false;
             const cp = c.SDL_BeginGPUCopyPass(cmd.*);
             var off: u32 = 0;
-            const parts = [_]struct { buf: *c.SDL_GPUBuffer, elem: u32 }{
-                .{ .buf = s.pos, .elem = @sizeOf(L.Vec2) },
-                .{ .buf = s.vel, .elem = @sizeOf(L.Vec2) },
-                .{ .buf = s.body, .elem = @sizeOf(L.BallBody) },
-            };
-            for (parts) |p| {
-                const bytes: u32 = count * p.elem;
-                // create() bounds n * sizeof(BallBody), so every offset fits SDL's u32.
-                c.SDL_DownloadFromGPUBuffer(cp, &.{ .buffer = p.buf, .offset = @intCast(at * p.elem), .size = bytes }, &.{ .transfer_buffer = slot.tb, .offset = off });
+            for (self.sources[0..self.source_count]) |p| {
+                const bytes: u32 = count * p.stride;
+                // createGeneric bounds n * stride, so every offset fits SDL's u32.
+                c.SDL_DownloadFromGPUBuffer(cp, &.{ .buffer = p.buf, .offset = @intCast(at * p.stride), .size = bytes }, &.{ .transfer_buffer = slot.tb, .offset = off });
                 off += bytes;
             }
             c.SDL_EndGPUCopyPass(cp);
             const f = c.SDL_SubmitGPUCommandBufferAndAcquireFence(cmd.*) orelse return error.GpuSubmit;
             var ff = f;
-            _ = c.SDL_WaitForGPUFences(s.dev, true, &ff, 1);
-            c.SDL_ReleaseGPUFence(s.dev, f);
-            slot.mapped = @ptrCast(c.SDL_MapGPUTransferBuffer(s.dev, slot.tb, false) orelse return error.GpuBuffer);
+            _ = c.SDL_WaitForGPUFences(dev, true, &ff, 1);
+            c.SDL_ReleaseGPUFence(dev, f);
+            slot.mapped = @ptrCast(c.SDL_MapGPUTransferBuffer(dev, slot.tb, false) orelse return error.GpuBuffer);
             self.jobs[self.head % slot_count] = .{ .io = io, .header = header, .start = at, .count = count, .slot = slot_i, .last = at + count == n };
             self.head += 1;
             held.* = false;
@@ -212,14 +261,14 @@ fn ticksToMs(t: u64) f64 {
 }
 
 fn writerMain(self: *Snapper) void {
-    var arrays: [snap.field_count][]f32 = undefined;
+    var arrays: [snap.max_fields][]u32 = undefined;
     const gpa = std.heap.smp_allocator;
-    const mem = gpa.alloc(f32, block * snap.field_count) catch {
+    const mem = gpa.alloc(u32, block * self.field_count) catch {
         self.failed.store(true, .release);
         return;
     };
     defer gpa.free(mem);
-    for (&arrays, 0..) |*a, i| a.* = mem[i * block ..][0..block];
+    for (arrays[0..self.field_count], 0..) |*a, i| a.* = mem[i * block ..][0..block];
     while (true) {
         c.SDL_WaitSemaphore(self.ready);
         const job = self.jobs[self.tail % slot_count];
@@ -249,29 +298,40 @@ fn finish(self: *Snapper, job: Job) void {
     }
 }
 
-fn writeChunk(self: *Snapper, job: Job, arrays: *[snap.field_count][]f32) snap.Error!void {
+fn writeChunk(self: *Snapper, job: Job, arrays: *[snap.max_fields][]u32) snap.Error!void {
     const base = self.slots[job.slot].mapped.?;
     const count: usize = job.count;
-    const pos: [*]const L.Vec2 = @ptrCast(@alignCast(base));
-    const vel: [*]const L.Vec2 = @ptrCast(@alignCast(base + count * @sizeOf(L.Vec2)));
-    const body: [*]const L.BallBody = @ptrCast(@alignCast(base + count * 2 * @sizeOf(L.Vec2)));
+    var src_base: [max_sources][*]const u32 = undefined;
+    var off: usize = 0;
+    for (self.sources[0..self.source_count], 0..) |p, i| {
+        src_base[i] = @ptrCast(@alignCast(base + off));
+        off += count * p.stride;
+    }
     var i: usize = 0;
     while (i < count) : (i += block) {
         const m = @min(block, count - i);
-        for (0..m) |j| {
-            arrays[0][j] = pos[i + j].x;
-            arrays[1][j] = pos[i + j].y;
-            arrays[2][j] = vel[i + j].x;
-            arrays[3][j] = vel[i + j].y;
-            arrays[4][j] = body[i + j].mass;
+        for (self.fields[0..self.field_count], 0..) |f, k| {
+            const words = self.sources[f.source].stride / 4;
+            const src = src_base[f.source];
+            for (arrays[k][0..m], 0..) |*o, j| o.* = src[(i + j) * words + f.word];
+            try snap.writeWords(job.io, &job.header, @intCast(k), job.start + i, arrays[k][0..m]);
         }
-        for (0..snap.field_count) |f| try snap.writeField(job.io, &job.header, @enumFromInt(f), job.start + i, arrays[f][0..m]);
     }
+}
+
+fn syncSim(ctx: *anyopaque, cmd: *c.SDL_GPUCommandBuffer) *c.SDL_GPUCommandBuffer {
+    const s: *sim.Sim = @ptrCast(@alignCast(ctx));
+    return s.recordSync(cmd);
+}
+
+fn headerSim(ctx: *anyopaque, seed: u64, scenario: u32) snap.Header {
+    const s: *sim.Sim = @ptrCast(@alignCast(ctx));
+    return snap.Header.init(s.cfg.n, s.tick_no, s.cfg.dt, s.cfg.g, s.cfg.softening, s.half_pending, seed, scenario);
 }
 
 /// Loads a snapshot into `s` (n and physics constants must already match the header) and sets the clock.
 pub fn restore(gpa: std.mem.Allocator, s: *sim.Sim, io: *c.SDL_IOStream, h: *const snap.Header) Error!void {
-    if (h.n != s.cfg.n) return error.BadHeader;
+    if (h.version != snap.version_2d or h.dim != 2 or h.n != s.cfg.n) return error.BadHeader;
     const chunk: usize = 1 << 20;
     const u = try s.uploaderInit(chunk);
     defer s.uploaderDeinit(u);
@@ -282,7 +342,7 @@ pub fn restore(gpa: std.mem.Allocator, s: *sim.Sim, io: *c.SDL_IOStream, h: *con
     var at: usize = 0;
     while (at < s.cfg.n) : (at += chunk) {
         const m = @min(chunk, s.cfg.n - at);
-        for (0..snap.field_count) |k| try snap.readField(io, h, @enumFromInt(k), at, f[k * chunk ..][0..m]);
+        for (0..snap.field_count) |k| try snap.readField(io, h, @fromBackingInt(@intCast(k)), at, f[k * chunk ..][0..m]);
         for (bodies[0..m], 0..) |*b, j| b.* = .{
             .x = f[j],
             .y = f[chunk + j],
