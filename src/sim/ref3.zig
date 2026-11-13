@@ -223,9 +223,9 @@ pub const Tree = struct {
             st.visits += 1;
             const r = [3]f64{ tp[0] - phys(n.com.x, t.box), tp[1] - phys(n.com.y, t.box), tp[2] - phys(n.com.z, t.box) };
             const r2 = r[0] * r[0] + r[1] * r[1] + r[2] * r[2];
-            // Leaves are always summed directly (softened, exact); a cell is never used inside 40 softening
+            // A node (leaf or cell) is never accepted inside 40 softening
             // lengths, where its unsoftened field would differ from the softened pair sum by more than 1e-3.
-            if (!isLeaf(n) and r2 > n.open_r2 and r2 > 1600 * eps2) {
+            if (r2 > n.open_r2 and r2 > 1600 * eps2) {
                 st.cells += 1;
                 cellAccel(&acc, r, r2, n.mass, t.quads[idx]);
                 idx = n.skip;
