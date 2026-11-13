@@ -2,16 +2,15 @@
 //! (physics.zig applyBounds, including its ceiling and floor-energy deviations from Python).
 //! Runs in ball-id order (reading each ball's sorted slot, written by k_scatter) so the
 //! id-order buffers are read and written linearly and only the sorted reads are random.
-//! Contact tests are inclusive because k_collide already clamps positions onto the walls.
+//! Contact tests are inclusive because the colored solver already clamps positions onto the walls.
 const c = @import("common.zig");
 const L = c.L;
 
-// Solved positions as floats: x, y at k * pos_stride (PosRad records or plain Vec2s).
-const s_pos = c.ro(f32, 0, "s_pos");
+const s_prm = c.ro(c.PosRad, 0, "s_prm");
 const s_vel = c.ro(L.Vec2, 1, "s_vel");
 const sorted_slot = c.ro(u32, 2, "sorted_slot");
 const body = c.ro(L.BallBody, 3, "body");
-// Spin the colored solvers accumulated per sorted slot (applied here so the solver never
+// Spin the solver accumulated per sorted slot (applied here so the solver never
 // touches the ball-id-order state buffer, whose accesses from sorted order are random).
 const s_spin = c.ro(f32, 4, "s_spin");
 const meta = c.ro(L.BallMeta, 5, "meta");
@@ -19,16 +18,14 @@ const pos = c.rw(L.Vec2, 0, "pos");
 const vel = c.rw(L.Vec2, 1, "vel");
 const state = c.rw(L.BallState, 2, "state");
 
-const SP = c.uniform(c.SortParams, 1, "sp");
-
 export fn main() callconv(.{ .spirv_kernel = .{ .x = L.group_size, .y = 1, .z = 1 } }) void {
     const P = c.params;
     const i = c.gid();
     if (i >= P.ball_count or meta.v[i] & L.flag_alive == 0) return;
     const k = sorted_slot.v[i];
     const b = body.v[i];
-    const o = k * SP.pos_stride;
-    var p = L.Vec2{ .x = s_pos.v[o], .y = s_pos.v[o + 1] };
+    const q = s_prm.v[k];
+    var p = L.Vec2{ .x = q.x, .y = q.y };
     var v = s_vel.v[k];
     var s = state.v[i];
     s.ang_vel += s_spin.v[k];

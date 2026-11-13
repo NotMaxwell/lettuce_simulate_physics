@@ -81,7 +81,6 @@ pub const scan_per_thread: u32 = 4;
 pub const scan_block: u32 = L.group_size * scan_per_thread;
 
 /// Uniform for the collide kernel (on top of SimParams in slot 0).
-pub const CollideParams = extern struct { iteration: u32, pos_relax: f32, rest_speed: f32, push_to_vel: f32 };
 
 /// Event buffer layout: element 0 is a header (kind = append count, a = records dropped for
 /// lack of space), records follow from element 1.
@@ -122,6 +121,3 @@ pub inline fn clampToWalls(p: Vec2, r: f32) Vec2 {
 /// and mass in one 16-byte load.
 pub const PosRad = extern struct { x: f32, y: f32, r: f32, m: f32 };
 
-/// Uniform slot 1 of k_gather and k_finish: `colored` selects the PosRad layout (colored solver)
-/// over separate s_pos/s_body (Jacobi); `pos_stride` is the float stride of the solved positions.
-pub const SortParams = extern struct { colored: u32, pos_stride: u32, _pad0: u32 = 0, _pad1: u32 = 0 };

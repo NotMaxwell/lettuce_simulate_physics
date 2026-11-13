@@ -5,7 +5,7 @@
 
 const std = @import("std");
 
-pub const kernels = [_][]const u8{ "integrate", "clear", "scan", "scan_add", "scatter", "contacts", "collide", "colored", "gather", "finish" };
+pub const kernels = [_][]const u8{ "integrate", "clear", "scan", "scan_add", "scatter", "colored", "gather", "finish" };
 
 pub const Options = struct {
     target: std.Build.ResolvedTarget,

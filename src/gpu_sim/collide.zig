@@ -3,8 +3,8 @@
 //! into a caller-supplied command buffer.
 //!
 //! Per tick: clear cells -> integrate + bin -> scan (3 levels + 2 adds) -> scatter ids ->
-//! gather sorted copies -> [jacobi: contacts] -> collide x iterations (colored Gauss-Seidel in
-//! place, or Jacobi ping-pong; see `Solver`) -> finish (gather back in id order + walls).
+//! gather sorted copies -> collide x iterations (colored Gauss-Seidel in place) -> finish
+//! (gather back in id order + walls).
 //! Every kernel is its own compute pass because SDL only places barriers between passes.
 
 const std = @import("std");
@@ -13,11 +13,11 @@ const L = @import("gpu_layout");
 
 pub const Error = error{GpuSetupFailed};
 
-pub const Kernel = enum { integrate, clear, scan, scan_add, scatter, gather, contacts, collide, colored, finish };
+pub const Kernel = enum { integrate, clear, scan, scan_add, scatter, gather, colored, finish };
 
-/// Stages of one tick, in order; `integrate` includes clearing and binning (`bin` records
-/// nothing now), `scan` is the multi-level prefix sum, `scatter` includes the gather.
-pub const Part = enum { integrate, bin, scan, scatter, contacts, collide, finish };
+/// Stages of one tick, in order; `integrate` includes clearing and binning, `scan` is the
+/// multi-level prefix sum, `scatter` includes the gather.
+pub const Part = enum { integrate, scan, scatter, collide, finish };
 
 const spv = std.enums.EnumArray(Kernel, []const u8).init(.{
     .integrate = @embedFile("gpu_sim_integrate.spv"),
@@ -26,8 +26,6 @@ const spv = std.enums.EnumArray(Kernel, []const u8).init(.{
     .scan_add = @embedFile("gpu_sim_scan_add.spv"),
     .scatter = @embedFile("gpu_sim_scatter.spv"),
     .gather = @embedFile("gpu_sim_gather.spv"),
-    .contacts = @embedFile("gpu_sim_contacts.spv"),
-    .collide = @embedFile("gpu_sim_collide.spv"),
     .colored = @embedFile("gpu_sim_colored.spv"),
     .finish = @embedFile("gpu_sim_finish.spv"),
 });
@@ -40,25 +38,14 @@ const layouts = std.enums.EnumArray(Kernel, Layout).init(.{
     .scan = .{ .ro = 0, .rw = 2, .uni = 1 },
     .scan_add = .{ .ro = 1, .rw = 1, .uni = 1 },
     .scatter = .{ .ro = 2, .rw = 2, .uni = 1 },
-    .gather = .{ .ro = 5, .rw = 5, .uni = 2 },
-    .contacts = .{ .ro = 5, .rw = 1, .uni = 1 },
-    .collide = .{ .ro = 7, .rw = 5, .uni = 2 },
+    .gather = .{ .ro = 5, .rw = 3, .uni = 1 },
     .colored = .{ .ro = 4, .rw = 4, .uni = 2 },
-    .finish = .{ .ro = 6, .rw = 3, .uni = 2 },
+    .finish = .{ .ro = 6, .rw = 3, .uni = 1 },
 });
 
 const scan_block: u32 = L.group_size * 4; // matches common.scan_block
 const ScanParams = extern struct { n: u32, _pad0: u32 = 0, _pad1: u32 = 0, _pad2: u32 = 0 };
-const CollideParams = extern struct { iteration: u32, pos_relax: f32, rest_speed: f32, push_to_vel: f32 };
-
-const SortParams = extern struct { colored: u32, pos_stride: u32, _pad0: u32 = 0, _pad1: u32 = 0 };
 const ColorParams = extern struct { color_x: u32, color_y: u32, iteration: u32, rest_speed: f32, elastic: u32, _pad0: u32 = 0, _pad1: u32 = 0, _pad2: u32 = 0 };
-
-/// Narrow-phase solver. `colored`: Gauss-Seidel over a 3x2 grid coloring, the CPU resolvePair
-/// applied pair by pair (6 dispatches per sweep); holds stacks like the CPU. `jacobi`: every
-/// ball solves against all neighbours at once and writes only itself (one dispatch per
-/// iteration, plus a contact count); faster but piles compress, see k_collide.zig.
-pub const Solver = enum { colored, jacobi };
 
 const Buffer = *c.SDL_GPUBuffer;
 
@@ -67,20 +54,14 @@ pub const Sim = struct {
     capacity: u32,
     /// Most grid cells the cell buffers hold; `prepare` grows the cell size to stay within it.
     cell_capacity: u32,
-    solver: Solver = .colored,
     /// true: ball-ball impulses perfectly elastic like the CPU/Python; false: restitution is the
-    /// pair's mean retention (colored solver only).
+    /// pair's mean retention.
     elastic: bool = true,
-    /// Solver sweeps per tick (colored: 1 matches the CPU; jacobi: 2-4).
+    /// Solver sweeps per tick (1 matches the CPU).
     iterations: u32 = 1,
-    /// Approach speeds (px/tick) at or below this resolve as resting contacts: inelastic (colored,
-    /// only when elastic = false) or with overlap fed back into speed (jacobi).
+    /// Approach speeds (px/tick) at or below this resolve as resting contacts (inelastic, only
+    /// when elastic = false).
     rest_speed: f32 = 2,
-    // Jacobi-only tuning (values from the harness sweep).
-    /// Over-relaxation of the per-ball averaged separation (1 = plain average; <2 for stability).
-    pos_relax: f32 = 1.5,
-    /// Fraction of a resting contact's (symmetric share of) overlap added as separating speed.
-    push_to_vel: f32 = 0.3,
 
     // Ball buffers, ball-id order (gpu_layout contract). Renderers may bind these read-only.
     pos: Buffer,
@@ -100,12 +81,9 @@ pub const Sim = struct {
     ball_cell: Buffer,
     ball_slot: Buffer,
     sorted_id: Buffer,
-    s_pos: [2]Buffer,
-    s_vel: [2]Buffer,
-    s_body: Buffer,
-    s_prm: Buffer, // colored solver: c.PosRad per sorted slot
-    s_spin: Buffer, // spin accumulated per sorted slot by the colored solvers, applied in finish
-    s_cnt: [2]Buffer, // contacts per sorted slot, ping-pong with s_pos/s_vel
+    s_vel: Buffer,
+    s_prm: Buffer, // c.PosRad per sorted slot
+    s_spin: Buffer, // spin accumulated per sorted slot by the solver, applied in finish
 
     pipes: std.enums.EnumArray(Kernel, *c.SDL_GPUComputePipeline),
 
@@ -115,12 +93,9 @@ pub const Sim = struct {
         s.dev = dev;
         s.capacity = capacity;
         s.cell_capacity = cell_capacity;
-        s.solver = .colored;
         s.elastic = true;
         s.iterations = 1;
-        s.pos_relax = 1.5;
         s.rest_speed = 2;
-        s.push_to_vel = 0.3;
         const n = capacity;
         // +2: the dead-ball cell and the end sentinel of the last real cell's row range.
         const ncount = cell_capacity + 2;
@@ -141,12 +116,7 @@ pub const Sim = struct {
         s.ball_cell = try buffer(dev, n * 4);
         s.ball_slot = try buffer(dev, n * 4);
         s.sorted_id = try buffer(dev, n * 4);
-        for (&s.s_pos, &s.s_vel, &s.s_cnt) |*p, *v, *ct| {
-            ct.* = try buffer(dev, n * 4);
-            p.* = try buffer(dev, n * @sizeOf(L.Vec2));
-            v.* = try buffer(dev, n * @sizeOf(L.Vec2));
-        }
-        s.s_body = try buffer(dev, n * @sizeOf(L.BallBody));
+        s.s_vel = try buffer(dev, n * @sizeOf(L.Vec2));
         s.s_spin = try buffer(dev, n * 4);
         s.s_prm = try buffer(dev, n * 16);
 
@@ -176,13 +146,8 @@ pub const Sim = struct {
 
     pub fn deinit(s: *Sim) void {
         for (std.enums.values(Kernel)) |k| c.SDL_ReleaseGPUComputePipeline(s.dev, s.pipes.get(k));
-        inline for (.{ "pos", "prev_pos", "vel", "body", "state", "meta", "events", "counts", "sums1", "sums2", "sums3", "ball_cell", "ball_slot", "sorted_id", "s_body", "s_spin", "s_prm" }) |f|
+        inline for (.{ "pos", "prev_pos", "vel", "body", "state", "meta", "events", "counts", "sums1", "sums2", "sums3", "ball_cell", "ball_slot", "sorted_id", "s_vel", "s_spin", "s_prm" }) |f|
             c.SDL_ReleaseGPUBuffer(s.dev, @field(s, f));
-        for (s.s_pos, s.s_vel, s.s_cnt) |p, v, ct| {
-            c.SDL_ReleaseGPUBuffer(s.dev, ct);
-            c.SDL_ReleaseGPUBuffer(s.dev, p);
-            c.SDL_ReleaseGPUBuffer(s.dev, v);
-        }
         s.* = undefined;
     }
 
@@ -222,20 +187,12 @@ pub const Sim = struct {
     /// to its solver push outside its cell at the end of the tick; with cell_size >= 2 * max
     /// radius, a 3x3 cell query still finds every pair overlapping at binning time.
     /// Bind them as read-only storage buffers; per-ball data is in the id-order buffers.
-    pub const GridView = struct { cell_start: Buffer, sorted_id: Buffer, ball_slot: Buffer };
-
-    pub fn gridView(s: *const Sim) GridView {
-        return .{ .cell_start = s.counts, .sorted_id = s.sorted_id, .ball_slot = s.ball_slot };
-    }
-
     /// Record one tick. `p` must have gone through `prepare`.
     pub fn step(s: *Sim, cmd: *c.SDL_GPUCommandBuffer, p: L.SimParams) void {
         if (p.ball_count == 0) return;
         s.record(cmd, p, .integrate);
-        s.record(cmd, p, .bin);
         s.record(cmd, p, .scan);
         s.record(cmd, p, .scatter);
-        if (s.solver == .jacobi) s.record(cmd, p, .contacts);
         var it: u32 = 0;
         while (it < s.iterations) : (it += 1) s.recordCollide(cmd, p, it);
         s.record(cmd, p, .finish);
@@ -254,9 +211,6 @@ pub const Sim = struct {
                 s.push(cmd, 0, &p);
                 s.pass(cmd, .integrate, &.{ s.body, s.meta }, &.{ s.pos, s.prev_pos, s.vel, s.state, s.events, s.counts, s.ball_cell, s.ball_slot }, groups);
             },
-            // Binning is fused into the integrate pass (k_integrate); kept so profilers can
-            // still name the stage.
-            .bin => {},
             .scan => {
                 const n1 = divCeil(ncount, scan_block);
                 const n2 = divCeil(n1, scan_block);
@@ -278,41 +232,25 @@ pub const Sim = struct {
             .scatter => {
                 s.push(cmd, 0, &p);
                 s.pass(cmd, .scatter, &.{ s.ball_cell, s.counts }, &.{ s.sorted_id, s.ball_slot }, groups);
-                s.push(cmd, 1, &SortParams{ .colored = @intFromBool(s.solver == .colored), .pos_stride = 0 });
-                s.pass(cmd, .gather, &.{ s.pos, s.vel, s.body, s.counts, s.sorted_id }, &.{ s.s_prm, s.s_pos[0], s.s_vel[0], s.s_body, s.s_spin }, groups);
-            },
-            .contacts => {
-                s.push(cmd, 0, &p);
-                s.pass(cmd, .contacts, &.{ s.s_pos[0], s.s_body, s.counts, s.sorted_id, s.meta }, &.{s.s_cnt[0]}, groups);
+                s.pass(cmd, .gather, &.{ s.pos, s.vel, s.body, s.counts, s.sorted_id }, &.{ s.s_prm, s.s_vel, s.s_spin }, groups);
             },
             .collide => s.recordCollide(cmd, p, 0),
             .finish => {
-                const res = if (s.solver == .jacobi) s.iterations & 1 else 0;
                 s.push(cmd, 0, &p);
-                const colored = s.solver == .colored;
-                s.push(cmd, 1, &SortParams{ .colored = @intFromBool(colored), .pos_stride = if (colored) 4 else 2 });
-                s.pass(cmd, .finish, &.{ if (colored) s.s_prm else s.s_pos[res], s.s_vel[res], s.ball_slot, s.body, s.s_spin, s.meta }, &.{ s.pos, s.vel, s.state }, groups);
+                s.pass(cmd, .finish, &.{ s.s_prm, s.s_vel, s.ball_slot, s.body, s.s_spin, s.meta }, &.{ s.pos, s.vel, s.state }, groups);
             },
         }
     }
 
-
     fn recordCollide(s: *Sim, cmd: *c.SDL_GPUCommandBuffer, p: L.SimParams, it: u32) void {
-        if (s.solver == .colored) {
-            for (0..2) |cy| for (0..2) |cx| {
-                const per_row = (p.grid_cells_x -| @as(u32, @intCast(cx)) + 1) / 2;
-                const per_col = (p.grid_cells_y -| @as(u32, @intCast(cy)) + 1) / 2;
-                if (per_row == 0 or per_col == 0) continue;
-                s.push(cmd, 0, &p);
-                s.push(cmd, 1, &ColorParams{ .color_x = @intCast(cx), .color_y = @intCast(cy), .iteration = it, .rest_speed = s.rest_speed, .elastic = @intFromBool(s.elastic) });
-                s.pass(cmd, .colored, &.{ s.body, s.counts, s.sorted_id, s.meta }, &.{ s.s_prm, s.s_vel[0], s.s_spin, s.events }, divCeil(per_row * per_col, L.group_size));
-            };
-            return;
-        }
-        const src = it & 1;
-        s.push(cmd, 0, &p);
-        s.push(cmd, 1, &CollideParams{ .iteration = it, .pos_relax = s.pos_relax, .rest_speed = s.rest_speed, .push_to_vel = s.push_to_vel });
-        s.pass(cmd, .collide, &.{ s.s_pos[src], s.s_vel[src], s.s_body, s.counts, s.sorted_id, s.meta, s.s_cnt[src] }, &.{ s.s_pos[src ^ 1], s.s_vel[src ^ 1], s.state, s.events, s.s_cnt[src ^ 1] }, divCeil(p.ball_count, L.group_size));
+        for (0..2) |cy| for (0..2) |cx| {
+            const per_row = (p.grid_cells_x -| @as(u32, @intCast(cx)) + 1) / 2;
+            const per_col = (p.grid_cells_y -| @as(u32, @intCast(cy)) + 1) / 2;
+            if (per_row == 0 or per_col == 0) continue;
+            s.push(cmd, 0, &p);
+            s.push(cmd, 1, &ColorParams{ .color_x = @intCast(cx), .color_y = @intCast(cy), .iteration = it, .rest_speed = s.rest_speed, .elastic = @intFromBool(s.elastic) });
+            s.pass(cmd, .colored, &.{ s.body, s.counts, s.sorted_id, s.meta }, &.{ s.s_prm, s.s_vel, s.s_spin, s.events }, divCeil(per_row * per_col, L.group_size));
+        };
     }
 
     fn push(_: *Sim, cmd: *c.SDL_GPUCommandBuffer, slot: u32, data: anytype) void {

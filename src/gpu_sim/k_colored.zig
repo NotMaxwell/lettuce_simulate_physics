@@ -1,5 +1,4 @@
-//! Narrow phase as parallel Gauss-Seidel over a 2x2 coloring of the grid (used instead of the
-//! Jacobi kernel by default, see collide.zig `Solver`). One dispatch handles every cell of one
+//! Narrow phase as parallel Gauss-Seidel over a 2x2 coloring of the grid. One dispatch handles every cell of one
 //! color; each thread owns cell (x, y) and resolves, in order, every pair of a ball of its cell
 //! with the same cell or the "forward" neighbours (+1,0), (0,+1), (+1,+1), plus the pairs
 //! between cells (+1,0) and (0,+1) (the -1,+1 offset), updating both balls in place exactly
