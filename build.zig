@@ -72,7 +72,7 @@ pub fn build(b: *std.Build) void {
         mod.addCSourceFile(.{ .file = b.path("vendor/impl.c"), .flags = &.{"-O2"} });
         mod.linkLibrary(sdl_lib);
         if (std.mem.eql(u8, tool.step, "render-demo") or std.mem.eql(u8, tool.step, "bench")) addShaders(b, mod, layout_mod);
-        if (std.mem.eql(u8, tool.step, "bench")) gpu.attach(mod);
+        if (std.mem.eql(u8, tool.step, "bench") or std.mem.eql(u8, tool.step, "render-demo")) gpu.attach(mod);
         const tool_exe = b.addExecutable(.{ .name = tool.step, .root_module = mod });
         const tool_run = b.addRunArtifact(tool_exe);
         tool_run.setCwd(b.path("."));

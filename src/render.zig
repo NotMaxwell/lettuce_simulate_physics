@@ -99,7 +99,6 @@ const tile_count = cfg.max_level + 1;
 const basketball_tile = cfg.max_level;
 const expl_frames = 12;
 const expl_frame_ticks = 6;
-const ash_life_ticks = 180;
 const hud_w: f32 = cfg.base_w;
 const hud_h: f32 = cfg.base_h;
 
@@ -327,7 +326,6 @@ pub const Renderer = struct {
     /// tile_uv as a GPU storage buffer, the tile table of gfx.ballPass.
     tiles: *c.SDL_GPUBuffer,
     tris: Batch = .{},
-    trail_buf: []Vertex = &.{},
     /// GPU-ball trails (shown before the balls); toggled by the caller.
     trails: bool = false,
     trails_was_on: bool = false,
@@ -343,7 +341,6 @@ pub const Renderer = struct {
     fit_scale: f32 = 1,
     out_w: f32 = hud_w,
     out_h: f32 = hud_h,
-    rng: u64 = 0x9E3779B97F4A7C15,
 
     pub fn init(gpa: std.mem.Allocator, g: *gfx.Gfx) !Renderer {
         const atlas_px = try gpa.alloc(u8, atlas_w * atlas_h * 4);
@@ -414,7 +411,6 @@ pub const Renderer = struct {
         c.SDL_ReleaseGPUBuffer(self.gfx.dev, self.tiles);
         self.font_atlas.deinit(self.gpa);
         self.tris.deinit(self.gpa);
-        self.gpa.free(self.trail_buf);
     }
 
     /// Takes window pixel coordinates (not window points on high-DPI displays).
@@ -470,12 +466,6 @@ pub const Renderer = struct {
         self.trail_last_tick = null;
     }
 
-    fn nextSeed(self: *Renderer) u64 {
-        self.rng ^= self.rng << 13;
-        self.rng ^= self.rng >> 7;
-        self.rng ^= self.rng << 17;
-        return self.rng | 1;
-    }
 
     /// Records the frame; `present` submits it.
     pub fn draw(self: *Renderer, w: *const world.World, alpha: f32, hud: *const Hud) void {
@@ -534,9 +524,6 @@ pub const Renderer = struct {
                 .alpha = alpha,
                 .cam = .{ .scale = cam.s, .ox = cam.ox, .oy = cam.oy, .bx = cam.bx, .by = cam.by },
             });
-        } else {
-            try self.drawTrails(w, cam);
-            try self.drawBalls(w, alpha, cam);
         }
         if (hud.gpu) |gb| {
             if (gb.pool_tiles) |tiles| for ([_]?GpuPool{ gb.fire, gb.ash }) |maybe| if (maybe) |pool| {
@@ -548,7 +535,7 @@ pub const Renderer = struct {
                     .cam = .{ .scale = cam.s, .ox = cam.ox, .oy = cam.oy, .bx = cam.bx, .by = cam.by },
                 });
             };
-        } else try self.drawParticles(w, alpha, cam);
+        }
         try self.drawHud(w, hud);
         try self.drawExplosions(w, cam);
         self.drawText(w, hud);
@@ -572,228 +559,6 @@ pub const Renderer = struct {
         t.rect(l, tp + bh - th, bw, th, wc);
         t.rect(l, tp + th, th, bh - 2 * th, wc);
         t.rect(l + bw - th, tp + th, th, bh - 2 * th, wc);
-        try t.flush(self.gfx, null);
-    }
-
-    const trail_threads = 4;
-    const trail_vpb = (cfg.max_trail - 1) * 6;
-
-    const TrailJob = struct {
-        sl: std.MultiArrayList(world.Ball).Slice,
-        lo: usize,
-        hi: usize,
-        cam: Camera,
-        stride: usize,
-        rng: u64,
-        verts: []Vertex,
-        nv: usize = 0,
-
-        fn rand01(job: *@This()) f32 {
-            job.rng ^= job.rng << 13;
-            job.rng ^= job.rng >> 7;
-            job.rng ^= job.rng << 17;
-            return @as(f32, @floatFromInt(@as(u32, @truncate(job.rng >> 32)) >> 8)) / 16777216.0;
-        }
-
-        /// Writes ribbons for balls lo..hi into this job's own vertex slice.
-        fn run(job: *@This()) void {
-            const trails = job.sl.items(.trail);
-            const lens = job.sl.items(.trail_len);
-            const heads = job.sl.items(.trail_head);
-            const flags = job.sl.items(.flags);
-            const cam = job.cam;
-            for (job.lo..job.hi) |i| {
-                if (!flags[i].alive) continue;
-                const len: usize = lens[i];
-                if (len < 2) continue;
-                const start: usize = (@as(usize, heads[i]) + cfg.max_trail - len) % cfg.max_trail;
-                const ring = &trails[i];
-                const first = ring[start];
-                const last = ring[(start + len - 1) % cfg.max_trail];
-                const ddx = last.x - first.x;
-                const ddy = last.y - first.y;
-                if (ddx * ddx + ddy * ddy < 0.01) continue;
-
-                const col = fcolor(.{ .r = job.rand01(), .g = job.rand01(), .b = job.rand01() });
-                // Oldest-to-newest screen-space points, taking every `stride`-th one when zoomed out
-                // (segments are then sub-pixel anyway) but always keeping the newest.
-                var sxs: [cfg.max_trail]f32 = undefined;
-                var sys: [cfg.max_trail]f32 = undefined;
-                var m: usize = 0;
-                var k: usize = len - 1;
-                while (true) {
-                    const p = ring[(start + k) % cfg.max_trail];
-                    sxs[m] = cam.sx(p.x);
-                    sys[m] = cam.sy(p.y);
-                    m += 1;
-                    if (k < job.stride) break;
-                    k -= job.stride;
-                }
-                if (m < 2) continue;
-                std.mem.reverse(f32, sxs[0..m]);
-                std.mem.reverse(f32, sys[0..m]);
-
-                var pts: [2 * cfg.max_trail]Vertex = undefined;
-                var nx: f32 = 0;
-                var ny: f32 = 1;
-                const inv_m1 = 1.0 / @as(f32, @floatFromInt(m - 1));
-                for (0..m) |q| {
-                    const dx = sxs[@min(q + 1, m - 1)] - sxs[q -| 1];
-                    const dy = sys[@min(q + 1, m - 1)] - sys[q -| 1];
-                    const l2 = dx * dx + dy * dy;
-                    if (l2 > 1e-8) {
-                        const inv = 1.0 / @sqrt(l2);
-                        nx = -dy * inv;
-                        ny = dx * inv;
-                    }
-                    const wpx = @floor(2 + @as(f32, @floatFromInt(q)) * inv_m1 * 4);
-                    const hw = @max(wpx * cam.s, 1) * 0.5;
-                    pts[2 * q] = vtx(sxs[q] + nx * hw, sys[q] + ny * hw, col, 0, 0);
-                    pts[2 * q + 1] = vtx(sxs[q] - nx * hw, sys[q] - ny * hw, col, 0, 0);
-                }
-                const out = job.verts[job.nv..][0 .. 6 * (m - 1)];
-                for (0..m - 1) |sg| {
-                    const a = 2 * sg;
-                    out[6 * sg ..][0..6].* = .{ pts[a], pts[a + 1], pts[a + 2], pts[a + 1], pts[a + 3], pts[a + 2] };
-                }
-                job.nv += 6 * (m - 1);
-            }
-        }
-    };
-
-    /// Ribbon generation is the heaviest CPU stage, so balls are split over a few threads;
-    /// each writes its own slice of the scratch buffer.
-    fn drawTrails(self: *Renderer, w: *const world.World, cam: Camera) !void {
-        const sl = w.balls.slice();
-        const n_balls = sl.len;
-        if (self.trail_buf.len < n_balls * trail_vpb) {
-            self.gpa.free(self.trail_buf);
-            self.trail_buf = &.{};
-            self.trail_buf = try self.gpa.alloc(Vertex, n_balls * trail_vpb);
-        }
-        const stride: usize = if (cam.s < 0.6) 2 else 1;
-        const n_jobs: usize = if (n_balls >= 600) trail_threads else 1;
-        const per = (n_balls + n_jobs - 1) / n_jobs;
-        var jobs: [trail_threads]TrailJob = undefined;
-        var threads: [trail_threads]?std.Thread = @splat(null);
-        for (0..n_jobs) |j| {
-            const lo = @min(j * per, n_balls);
-            const hi = @min(lo + per, n_balls);
-            jobs[j] = .{
-                .sl = sl,
-                .lo = lo,
-                .hi = hi,
-                .cam = cam,
-                .stride = stride,
-                .rng = self.nextSeed(),
-                .verts = self.trail_buf[lo * trail_vpb .. hi * trail_vpb],
-            };
-        }
-        for (1..n_jobs) |j| threads[j] = std.Thread.spawn(.{}, TrailJob.run, .{&jobs[j]}) catch null;
-        jobs[0].run();
-        for (1..n_jobs) |j| {
-            if (threads[j]) |th| th.join() else jobs[j].run();
-        }
-        for (jobs[0..n_jobs]) |*job| try self.gfx.triangles(null, job.verts[0..job.nv]);
-    }
-
-    const BallJob = struct {
-        sl: std.MultiArrayList(world.Ball).Slice,
-        out: []Sprite,
-        lo: usize,
-        hi: usize,
-        alpha: f32,
-        cam: Camera,
-        tile_uv: *const [tile_count][4]f32,
-
-        /// Dead balls become zero-size sprites so slots stay aligned with ball indices.
-        fn run(job: *@This()) void {
-            const sl = job.sl;
-            const xs = sl.items(.x);
-            const ys = sl.items(.y);
-            const pxs = sl.items(.prev_x);
-            const pys = sl.items(.prev_y);
-            const angs = sl.items(.angle);
-            const pangs = sl.items(.prev_angle);
-            const rads = sl.items(.radius);
-            const temps = sl.items(.temp);
-            const burns = sl.items(.burn);
-            const levels = sl.items(.level);
-            const flags = sl.items(.flags);
-            const cam = job.cam;
-            const alpha = job.alpha;
-            const rad_per_deg = std.math.pi / 180.0;
-            for (job.lo..job.hi) |i| {
-                const f = flags[i];
-                const o = &job.out[i];
-                if (!f.alive) {
-                    o.* = std.mem.zeroes(Sprite);
-                    continue;
-                }
-                const heat = std.math.clamp((temps[i] - cfg.room_temp) / (cfg.ignition_temp - cfg.room_temp), 0, 1);
-                const char = 1.0 - std.math.clamp(burns[i] / cfg.max_burn, 0, 1);
-                const gb = (1.0 - heat * 0.5) * char;
-                const tile = if (f.scored) basketball_tile else std.math.clamp(@as(usize, levels[i]), 1, cfg.max_level) - 1;
-                const uv = job.tile_uv[tile];
-                const r = rads[i] * cam.s;
-                o.* = .{
-                    .center = .{ .x = cam.sx(lerp(pxs[i], xs[i], alpha)), .y = cam.sy(lerp(pys[i], ys[i], alpha)) },
-                    .half = .{ .x = r, .y = r },
-                    .uv_min = .{ .x = uv[0], .y = uv[1] },
-                    .uv_max = .{ .x = uv[2], .y = uv[3] },
-                    .color = .{ char, gb, gb, 1 },
-                    .angle = lerp(pangs[i], angs[i], alpha) * rad_per_deg,
-                };
-            }
-        }
-    };
-
-    fn drawBalls(self: *Renderer, w: *const world.World, alpha: f32, cam: Camera) !void {
-        const sl = w.balls.slice();
-        if (sl.len == 0) return;
-        const out = try self.gfx.allocSprites(self.atlas, @intCast(sl.len));
-        const n_jobs: usize = if (sl.len >= 4096) 4 else 1;
-        const per = (sl.len + n_jobs - 1) / n_jobs;
-        var jobs: [4]BallJob = undefined;
-        var threads: [4]?std.Thread = @splat(null);
-        for (0..n_jobs) |j| {
-            const lo = @min(j * per, sl.len);
-            jobs[j] = .{ .sl = sl, .out = out, .lo = lo, .hi = @min(lo + per, sl.len), .alpha = alpha, .cam = cam, .tile_uv = &self.tile_uv };
-        }
-        for (1..n_jobs) |j| threads[j] = std.Thread.spawn(.{}, BallJob.run, .{&jobs[j]}) catch null;
-        jobs[0].run();
-        for (1..n_jobs) |j| {
-            if (threads[j]) |th| th.join() else jobs[j].run();
-        }
-    }
-
-    fn drawParticles(self: *Renderer, w: *const world.World, alpha: f32, cam: Camera) !void {
-        const t = &self.tris;
-        const ps = w.particles.slice();
-        const ash = w.ashes.slice();
-        try t.reserve(self.gpa, (ps.len + ash.len) * 6);
-        const px = ps.items(.x);
-        const py = ps.items(.y);
-        const psz = ps.items(.size);
-        const pr = ps.items(.r);
-        const pg = ps.items(.g);
-        const pb = ps.items(.b);
-        for (0..ps.len) |i| {
-            const sz = @max(psz[i] * cam.s, 1);
-            t.rect(cam.sx(px[i]), cam.sy(py[i]), sz, sz, rgb8(pr[i], pg[i], pb[i]));
-        }
-        const ax = ash.items(.x);
-        const ay = ash.items(.y);
-        const apx = ash.items(.prev_x);
-        const apy = ash.items(.prev_y);
-        const age = ash.items(.age);
-        const red = ash.items(.start_red);
-        const d = @max(4 * cam.s, 1.5);
-        for (0..ash.len) |i| {
-            const fade = 1.0 - @min(@as(f32, @floatFromInt(age[i])) / ash_life_ticks, 1.0);
-            const rr: u8 = @intFromFloat(@as(f32, @floatFromInt(red[i])) * fade);
-            t.rect(cam.sx(lerp(apx[i], ax[i], alpha)) - d / 2, cam.sy(lerp(apy[i], ay[i], alpha)) - d / 2, d, d, rgb8(rr, 0, 0));
-        }
         try t.flush(self.gfx, null);
     }
 
