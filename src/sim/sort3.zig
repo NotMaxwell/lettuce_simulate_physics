@@ -8,7 +8,9 @@ const L = @import("gpu_layout");
 
 const sort_spv = @embedFile("k3_sort.spv");
 
-pub const Error = error{ GpuPipeline, GpuBuffer, GpuSubmit, OutOfRange };
+/// GpuSubmit and GpuAcquire come from the internal submit of a split `record`: by then the caller's
+/// command buffer has been submitted, so it must not be used again.
+pub const Error = error{ GpuPipeline, GpuBuffer, GpuSubmit, GpuAcquire, OutOfRange };
 const Buffer = *c.SDL_GPUBuffer;
 const Cmd = *c.SDL_GPUCommandBuffer;
 
@@ -116,6 +118,8 @@ pub const Sort3 = struct {
     /// Records keys, sort and permutation of the first `n` bodies. Large n is split into several
     /// submits (see `split_n`), so the returned command buffer, which the caller submits, may not
     /// be `cmd0`.
+    /// On error.GpuSubmit or error.GpuAcquire `cmd0` is already submitted and must not be touched;
+    /// on error.OutOfRange nothing was recorded.
     pub fn record(s: *Sort3, cmd0: Cmd, bufs: Bufs, n: u32) Error!Cmd {
         if (n < 1 or n > s.capacity) return error.OutOfRange;
         var cmd = cmd0;
@@ -143,7 +147,7 @@ pub const Sort3 = struct {
             s.pass(cmd, .scatter, prm, &.{ src, s.hist }, &.{dst}, nb);
             if (n > split_n and p + 1 < passes) {
                 if (!c.SDL_SubmitGPUCommandBuffer(cmd)) return error.GpuSubmit;
-                cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
+                cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuAcquire;
             }
         }
         return cmd;
@@ -161,6 +165,7 @@ pub const Sort3 = struct {
         for (arrays) |a| if (a.buf) |buf| {
             s.pass(cmd, a.k, prm, &.{ s.recs[0], buf }, &.{tmp}, groupsFor(n));
             const cp = c.SDL_BeginGPUCopyPass(cmd);
+            // n * 12 < 2^32 because n <= capacity <= maxCapacity() = 2^32 / 12 - 1.
             c.SDL_CopyGPUBufferToBuffer(cp, &.{ .buffer = tmp, .offset = 0 }, &.{ .buffer = buf, .offset = 0 }, n * a.size, false);
             c.SDL_EndGPUCopyPass(cp);
         };

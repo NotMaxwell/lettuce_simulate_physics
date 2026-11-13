@@ -193,6 +193,12 @@ test "sort3: keys, sorted records, tie order and permuted bodies match ref3" {
         defer gpa.free(pos);
         try checkCase(gpa, dev, pos);
     }
+    // Over 1024 radix blocks (2.1M bodies), so scanRows carries across chunks of its row.
+    for ([_]?u32{ null, 5000 }, 0..) |distinct, k| {
+        const pos = try randomPos(gpa, 2_500_000, 20 + k, distinct);
+        defer gpa.free(pos);
+        try checkCase(gpa, dev, pos);
+    }
     {
         const cut = 20.0;
         const pp = try ref3.plummer.positions(gpa, 1 << 20, 4, cut);
