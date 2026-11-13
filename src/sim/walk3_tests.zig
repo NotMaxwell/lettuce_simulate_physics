@@ -1,6 +1,6 @@
 //! Tests of the 3D tree kick (k3/walk.zig) on trees built by ref3.build, plus two measurements
 //! that only run when asked, because they take minutes:
-//!   WALK3_BENCH=100000,1000000,4000000,16000000  walk times per size and workgroup size
+//!   WALK3_BENCH=100000,1000000,4000000,16000000  walk times per size and workgroup size (WALK3_EPS)
 //!   WALK3_ENERGY=1                               100k Plummer, 200 ticks, tree rebuilt every tick
 const std = @import("std");
 const c = @import("c");
@@ -213,7 +213,8 @@ test "walk3: timing table (WALK3_BENCH=sizes)" {
     const dev = try device();
     defer c.SDL_DestroyGPUDevice(dev);
     const gpa = std.heap.smp_allocator;
-    const eps: f32 = 1e-4;
+    // The design table's softening (scale radius 1); WALK3_EPS overrides it to show the 40-eps guard's cost.
+    const eps: f32 = if (envSet("WALK3_EPS")) |s| try std.fmt.parseFloat(f32, s) else 1e-4;
     var it = std.mem.tokenizeScalar(u8, list, ',');
     while (it.next()) |tok| {
         const n = try std.fmt.parseInt(u32, tok, 10);
@@ -251,6 +252,17 @@ test "walk3: timing table (WALK3_BENCH=sizes)" {
             std.debug.print("  group {d:>3}: {d:>9.2} ms (min of 5)  {d:.2} G node visits/s  {d:.2} G interactions/s\n", .{
                 gs, ms, nf * visits / ms * 1e-6, nf * inter / ms * 1e-6,
             });
+        }
+        // One unchunked dispatch of more than 32768 groups exercises the 2D group index.
+        if (n > 32768 * 64) {
+            rig.w.group_size = 64;
+            rig.w.chunk = n;
+            const whole = try rig.forces(gpa, eps);
+            defer whole.deinit(gpa);
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(out.acc), std.mem.sliceAsBytes(whole.acc));
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(out.pot), std.mem.sliceAsBytes(whole.pot));
+            std.debug.print("  2D dispatch ({d} groups of 64, one submit): bit-identical to the chunked run\n", .{(n + 63) / 64});
+            rig.w.chunk = walk3.chunk_bodies;
         }
     }
 }

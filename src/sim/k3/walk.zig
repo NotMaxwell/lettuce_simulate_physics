@@ -139,3 +139,9 @@ export fn walk128() callconv(cc(128)) void {
 export fn walk256() callconv(cc(256)) void {
     walkBody(256);
 }
+export fn walk512() callconv(cc(512)) void {
+    walkBody(512);
+}
+export fn walk1024() callconv(cc(1024)) void {
+    walkBody(1024);
+}

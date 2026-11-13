@@ -41,11 +41,17 @@ comptime {
 }
 
 /// Workgroup sizes with an entry point in k3/walk.zig (`walk<size>`).
-pub const group_sizes = [_]u32{ 64, 128, 256 };
-pub const default_group_size: u32 = 64;
+pub const group_sizes = [_]u32{ 64, 128, 256, 512, 1024 };
 
-/// Bodies per submitted command buffer. At 16M Plummer bodies one body costs about 80 ns of GPU
-/// time, so a chunk is ~85 ms: far under the driver's job watchdog even on a slower or shared GPU.
+/// Measured on an RX 7800 XT (walk3_tests timing table): 1024 is 12% faster than 256 from 1M bodies
+/// up, presumably because a workgroup's Morton-adjacent bodies share one CU's cache; at 100k the
+/// big groups leave CUs idle and 256 wins.
+pub fn autoGroupSize(n: u32) u32 {
+    return if (n >= 1 << 19) 1024 else 256;
+}
+
+/// Bodies per submitted command buffer. At 16M Plummer bodies one body costs about 55 ns of GPU
+/// time, so a chunk is ~60 ms: far under the driver's job watchdog even on a slower or shared GPU.
 pub const chunk_bodies: u32 = 1 << 20;
 
 pub const Kick = struct {
@@ -64,7 +70,8 @@ pub const Bindings = struct { pos: Buffer, mass: Buffer, nodes: Buffer, quads: B
 pub const Walk3 = struct {
     dev: *c.SDL_GPUDevice,
     pipes: [group_sizes.len]*c.SDL_GPUComputePipeline,
-    group_size: u32 = default_group_size,
+    /// 0 picks autoGroupSize(n).
+    group_size: u32 = 0,
     chunk: u32 = chunk_bodies,
 
     pub fn init(dev: *c.SDL_GPUDevice) Error!Walk3 {
@@ -100,8 +107,9 @@ pub const Walk3 = struct {
     /// ranges and later passes are ordered after them by SDL_GPU's pass barriers); the returned
     /// command buffer holds the last chunk and is the caller's to submit.
     pub fn record(w: *Walk3, cmd0: *c.SDL_GPUCommandBuffer, b: Bindings, k: Kick) Error!*c.SDL_GPUCommandBuffer {
-        const pi = for (group_sizes, 0..) |gs, i| {
-            if (gs == w.group_size) break i;
+        const gs = if (w.group_size == 0) autoGroupSize(k.n) else w.group_size;
+        const pi = for (group_sizes, 0..) |s, i| {
+            if (s == gs) break i;
         } else return error.OutOfRange;
         var cmd = cmd0;
         var first: u32 = 0;
@@ -124,7 +132,7 @@ pub const Walk3 = struct {
             c.SDL_BindGPUComputePipeline(cp, w.pipes[pi]);
             const ro = [4]?*c.SDL_GPUBuffer{ b.pos, b.mass, b.nodes, b.quads };
             c.SDL_BindGPUComputeStorageBuffers(cp, 0, &ro, ro.len);
-            const groups = (count + w.group_size - 1) / w.group_size;
+            const groups = (count + gs - 1) / gs;
             c.SDL_DispatchGPUCompute(cp, @min(groups, dispatch_x), (groups + dispatch_x - 1) / dispatch_x, 1);
             c.SDL_EndGPUComputePass(cp);
             first += count;
