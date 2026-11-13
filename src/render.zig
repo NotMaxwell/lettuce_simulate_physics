@@ -314,6 +314,14 @@ pub const Renderer = struct {
     tris: Batch = .{},
     trail_buf: []Vertex = &.{},
     cam: Camera = .{},
+    /// User view on top of the auto-fit camera: zoom 1 and zero pan is exactly the fit.
+    zoom: f32 = 1,
+    /// World-space offset of the view focus from the base focus (follow point or play-area centre).
+    pan: world.Vec2 = .{ .x = 0, .y = 0 },
+    follow_pt: ?world.Vec2 = null,
+    /// Focus and fit scale actually used by the last drawn frame, for zooming about the cursor.
+    view_focus: world.Vec2 = .{ .x = 0, .y = 0 },
+    fit_scale: f32 = 1,
     out_w: f32 = hud_w,
     out_h: f32 = hud_h,
     rng: u64 = 0x9E3779B97F4A7C15,
@@ -397,6 +405,46 @@ pub const Renderer = struct {
         return .{ .x = (sx - cam.ox) / cam.s + cam.bx, .y = (sy - cam.oy) / cam.s + cam.by };
     }
 
+    pub const zoom_min: f32 = 0.05;
+    pub const zoom_max: f32 = 20;
+
+    /// Makes `p` the base of the view focus (call every frame to track it). Pan is kept as an offset.
+    pub fn follow(self: *Renderer, p: world.Vec2) void {
+        self.follow_pt = p;
+    }
+
+    pub fn unfollow(self: *Renderer) void {
+        self.follow_pt = null;
+    }
+
+    /// Back to the auto-fit view.
+    pub fn resetView(self: *Renderer) void {
+        self.zoom = 1;
+        self.pan = .{ .x = 0, .y = 0 };
+        self.follow_pt = null;
+    }
+
+    /// Multiplies the zoom by `factor`, keeping the world point under window pixel (sx, sy) fixed.
+    pub fn zoomAt(self: *Renderer, sx: f32, sy: f32, factor: f32) void {
+        const nz = std.math.clamp(self.zoom * factor, zoom_min, zoom_max);
+        if (nz == self.zoom) return;
+        const old_s = self.fit_scale * self.zoom;
+        const new_s = self.fit_scale * nz;
+        const dx = sx - self.out_w / 2;
+        const dy = sy - self.out_h / 2;
+        // p = f + d/old_s must equal f' + d/new_s.
+        self.pan.x += dx / old_s - dx / new_s;
+        self.pan.y += dy / old_s - dy / new_s;
+        self.zoom = nz;
+    }
+
+    /// Drags the view by a window-pixel delta (the world follows the cursor).
+    pub fn panByPixels(self: *Renderer, dx: f32, dy: f32) void {
+        const s = self.fit_scale * self.zoom;
+        self.pan.x -= dx / s;
+        self.pan.y -= dy / s;
+    }
+
     fn nextSeed(self: *Renderer) u64 {
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 7;
@@ -426,7 +474,13 @@ pub const Renderer = struct {
             .w = lerp(pb.w, nb.w, alpha),
             .h = lerp(pb.h, nb.h, alpha),
         };
-        const cam = Camera.fit(bounds, self.out_w, self.out_h);
+        const fit = Camera.fit(bounds, self.out_w, self.out_h);
+        const base: world.Vec2 = self.follow_pt orelse .{ .x = bounds.x + bounds.w / 2, .y = bounds.y + bounds.h / 2 };
+        const focus: world.Vec2 = .{ .x = base.x + self.pan.x, .y = base.y + self.pan.y };
+        self.fit_scale = fit.s;
+        self.view_focus = focus;
+        const identity = self.zoom == 1 and self.pan.x == 0 and self.pan.y == 0 and self.follow_pt == null;
+        const cam: Camera = if (identity) fit else .{ .s = fit.s * self.zoom, .ox = self.out_w / 2, .oy = self.out_h / 2, .bx = focus.x, .by = focus.y };
         self.cam = cam;
 
         try self.drawBackground(bounds, cam);

@@ -27,6 +27,8 @@ const Options = struct {
     /// Random clicks, grabs, ignites, lassos and key presses every few frames, for hunting
     /// crashes in interactive paths headlessly.
     autoplay: bool = false,
+    /// Initial view zoom, for zoomed screenshots.
+    zoom: f32 = 1,
 };
 
 const Game = struct {
@@ -53,6 +55,8 @@ const Game = struct {
     second_accum: f64 = 0,
 
     lasso_active: bool = false,
+    panning: bool = false,
+    follow_centre: bool = false,
     lasso: std.ArrayList(Vec2) = .empty,
     lasso_fade_left_ms: f32 = 0,
 
@@ -72,6 +76,25 @@ const Game = struct {
         const sx: f32 = if (ww > 0) @as(f32, @floatFromInt(pw)) / @as(f32, @floatFromInt(ww)) else 1;
         const sy: f32 = if (wh > 0) @as(f32, @floatFromInt(ph)) / @as(f32, @floatFromInt(wh)) else 1;
         return g.renderer.screenToWorld(&g.w, x * sx, y * sy);
+    }
+
+    /// Window points to window pixels (they differ on high-DPI displays).
+    fn pixelScale(g: *const Game) Vec2 {
+        var pw: c_int = 0;
+        var ph: c_int = 0;
+        var ww: c_int = 0;
+        var wh: c_int = 0;
+        _ = c.SDL_GetWindowSizeInPixels(g.window, &pw, &ph);
+        _ = c.SDL_GetWindowSize(g.window, &ww, &wh);
+        return .{
+            .x = if (ww > 0) @as(f32, @floatFromInt(pw)) / @as(f32, @floatFromInt(ww)) else 1,
+            .y = if (wh > 0) @as(f32, @floatFromInt(ph)) / @as(f32, @floatFromInt(wh)) else 1,
+        };
+    }
+
+    fn onWheel(g: *Game, x: f32, y: f32, dy: f32) void {
+        const k = g.pixelScale();
+        g.renderer.zoomAt(x * k.x, y * k.y, std.math.pow(f32, 1.15, dy));
     }
 
     fn mouseWorld(g: *const Game) Vec2 {
@@ -106,6 +129,14 @@ const Game = struct {
                 g.sound.setMusicMuted(g.muted);
             },
             c.SDLK_F => g.mutual_gravity = !g.mutual_gravity,
+            c.SDLK_HOME => {
+                g.renderer.resetView();
+                g.follow_centre = false;
+            },
+            c.SDLK_C => {
+                g.follow_centre = !g.follow_centre;
+                if (!g.follow_centre) g.renderer.unfollow();
+            },
             c.SDLK_N => g.merging = !g.merging,
             c.SDLK_P => g.show_perf = !g.show_perf,
             c.SDLK_T => g.stress(stress_count),
@@ -246,6 +277,8 @@ fn parseOptions(args: []const [:0]const u8) Options {
             o.stress = std.fmt.parseInt(u32, value, 10) catch 0;
         } else if (std.mem.eql(u8, flag, "--screenshot")) {
             o.screenshot = value;
+        } else if (std.mem.eql(u8, flag, "--zoom")) {
+            o.zoom = std.fmt.parseFloat(f32, value) catch 1;
         } else if (std.mem.eql(u8, flag, "--ignite")) {
             o.ignite = std.fmt.parseInt(u32, value, 10) catch 0;
         } else if (std.mem.eql(u8, flag, "--fire")) {
@@ -308,6 +341,7 @@ pub fn main(init: std.process.Init) !void {
     gw.fire_enabled = opts.fire;
     if (opts.stress > 0) g.stress(opts.stress);
     if (opts.merge) g.merging = true;
+    g.renderer.zoom = std.math.clamp(opts.zoom, render.Renderer.zoom_min, render.Renderer.zoom_max);
 
     var last = c.SDL_GetPerformanceCounter();
     var accumulator: f64 = 0;
@@ -320,10 +354,19 @@ pub fn main(init: std.process.Init) !void {
             switch (event.type) {
                 c.SDL_EVENT_QUIT => running = false,
                 c.SDL_EVENT_KEY_DOWN => g.onKey(event.key.key, event.key.mod),
-                c.SDL_EVENT_MOUSE_BUTTON_DOWN => g.onMouseDown(event.button.button, g.windowToWorld(event.button.x, event.button.y)),
-                c.SDL_EVENT_MOUSE_BUTTON_UP => g.onMouseUp(event.button.button),
-                c.SDL_EVENT_MOUSE_MOTION => if (g.lasso_active) {
-                    g.lasso.append(gpa, g.windowToWorld(event.motion.x, event.motion.y)) catch {};
+                c.SDL_EVENT_MOUSE_WHEEL => g.onWheel(event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y),
+                c.SDL_EVENT_MOUSE_BUTTON_DOWN => if (event.button.button == c.SDL_BUTTON_MIDDLE) {
+                    g.panning = true;
+                } else g.onMouseDown(event.button.button, g.windowToWorld(event.button.x, event.button.y)),
+                c.SDL_EVENT_MOUSE_BUTTON_UP => if (event.button.button == c.SDL_BUTTON_MIDDLE) {
+                    g.panning = false;
+                } else g.onMouseUp(event.button.button),
+                c.SDL_EVENT_MOUSE_MOTION => {
+                    if (g.panning) {
+                        const k = g.pixelScale();
+                        g.renderer.panByPixels(event.motion.xrel * k.x, event.motion.yrel * k.y);
+                    }
+                    if (g.lasso_active) g.lasso.append(gpa, g.windowToWorld(event.motion.x, event.motion.y)) catch {};
                 },
                 else => {},
             }
@@ -368,6 +411,7 @@ pub fn main(init: std.process.Init) !void {
             .gpu = gpuBalls(&gw, g.w.current_level),
         };
         const r0 = c.SDL_GetPerformanceCounter();
+        if (g.follow_centre) g.renderer.follow(.{ .x = g.w.bounds.x + g.w.bounds.w / 2, .y = g.w.bounds.y + g.w.bounds.h / 2 });
         g.renderer.draw(&g.w, @floatCast(accumulator / tick_seconds), &hud);
         g.perf.render_ms = smooth(g.perf.render_ms, @floatCast(seconds(c.SDL_GetPerformanceCounter() - r0) * 1000));
 
@@ -383,6 +427,7 @@ pub fn main(init: std.process.Init) !void {
 test {
     _ = gpu_world;
     _ = world;
+    _ = @import("galaxy.zig");
 }
 
 fn autoplay(g: *Game, frame: u32) void {
