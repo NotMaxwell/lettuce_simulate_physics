@@ -6,6 +6,7 @@ const galaxy = @import("galaxy");
 const sim = @import("sim.zig");
 const snapshot = @import("snapshot.zig");
 const snapper = @import("snapper.zig");
+const sim3 = @import("sim3.zig");
 
 test {
     _ = @import("tests.zig");
@@ -30,6 +31,7 @@ const usage =
     \\usage: sim [--scenario disk|collision|cloud|systems] [--n N] [--ticks K] [--dt F] [--every K]
     \\           [--seed U64] [--soft EPS2] [--pe-samples K] [--bench]
     \\           [--out DIR --every-snap K] [--restart FILE]   (restart: n, g, softening, dt come from the file; --ticks = further ticks)
+    \\       sim --dim 3 ...  (3D sim; see src/sim/sim3.zig)
     \\       sim render-snap ...  (see `zig build render-snap`)
     \\
 ;
@@ -78,6 +80,9 @@ pub fn main(init: std.process.Init) !void {
     const gpa = std.heap.smp_allocator;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len > 1 and std.mem.eql(u8, args[1], "render-snap")) return @import("render_cli.zig").run(gpa, args[2..]);
+    for (args[1..], 1..) |a, i| {
+        if (std.mem.eql(u8, a, "--dim") and i + 1 < args.len and std.mem.eql(u8, args[i + 1], "3")) return sim3.main(gpa, args);
+    }
     const o = parse(args) catch |err| {
         std.debug.print("sim: {s}\n{s}", .{ @errorName(err), usage });
         return err;

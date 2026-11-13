@@ -266,3 +266,4 @@ test "snapshot: truncated or unfinished files are rejected, and no temp file is 
         try std.testing.expectError(error.Truncated, snap.readHeader(io));
     }
 }
+test { _ = @import("tests3.zig"); }
