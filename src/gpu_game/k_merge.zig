@@ -1,4 +1,4 @@
-//! Merge apply, hoop scoring and the per-tick reset of the game event list.
+//! Merge apply, hoop scoring, the live max-level reduction and the per-tick reset of the game event list.
 //! Bindings: ro 0 candidates (gpu_sim event buffer), 1 prev_pos;
 //!           rw 0 pos, 1 vel, 2 body, 3 meta, 4 claim, 5 out.
 //! `out` uses the gpu_sim event layout: element 0 is the header (kind = count, a = dropped).
@@ -18,6 +18,22 @@ export fn reset() callconv(c.kernel_cc) void {
     if (c.gid() != 0) return;
     out.v[0].kind = 0;
     out.v[0].a = 0;
+    out.v[0].b = 0;
+}
+
+/// Highest level among live balls, as level + 1 into the header's `b` (0 = not computed this
+/// tick). Runs after the merges, so the CPU's HUD level follows balls that merged away or died.
+export fn maxLevel() callconv(c.kernel_cc) void {
+    const i = c.gid();
+    var lvl: u32 = 0;
+    if (i < c.params.ball_count) {
+        const m = meta.v[i];
+        if (m & L.flag_alive != 0) lvl = (m & 0xff) + 1;
+    }
+    const top = c.blockMax(lvl);
+    // Thread 0 always reports, so an empty world reads as level 0 rather than "not computed".
+    const report = if (i == 0) @max(top, 1) else top;
+    if (c.lid() == 0 and report != 0) _ = c.atomicUMax(&out.v[0].b, report);
 }
 
 /// Reserves an output record; null when full (the caller then skips its state change, so the

@@ -138,15 +138,18 @@ const diag_offset: u32 = out_bytes + 16 + fx_bytes;
 const download_bytes: u32 = diag_offset + 16;
 /// Galaxy energy diagnostics run every this many ticks (a few ms of GPU time per second at most).
 const diag_every_ticks: u32 = 20;
+/// The HUD's max level is a GPU reduction over every ball, recorded on every this-many-th tick.
+const max_level_every: u32 = 4;
 /// Pair terms of the sampled potential sum: 0.2 ms or less at 100k bodies.
 const diag_pair_budget: u32 = 1 << 26;
 
-const Kernel = enum { spawn, reset, merge, hoop, clearPick, pick, grab, release, lasso, explode, conduct, fxReset, igniteGrab, burn, emitFire, emitAsh, fireUpdate, ashUpdate };
+const Kernel = enum { spawn, reset, merge, maxLevel, hoop, clearPick, pick, grab, release, lasso, explode, conduct, fxReset, igniteGrab, burn, emitFire, emitAsh, fireUpdate, ashUpdate };
 const Module = enum { spawn, merge, act, conduct, burn, emit, particles };
 const module_of = std.enums.EnumArray(Kernel, Module).init(.{
     .spawn = .spawn,
     .reset = .merge,
     .merge = .merge,
+    .maxLevel = .merge,
     .hoop = .merge,
     .clearPick = .act,
     .pick = .act,
@@ -709,6 +712,9 @@ pub const GpuWorld = struct {
             },
             else => {},
         };
+        // Reduction done after this tick's merges and deaths: it replaces the running maximum, so the
+        // level falls when the top balls merge away or die (level + 1; 0 = not recorded this tick).
+        if (ev[0].b != 0) w.current_level = @intCast(ev[0].b - 1);
         const fxw: [*]const u32 = @ptrCast(@alignCast(m + out_bytes + 16));
         gw.stats = .{
             .burning = fxw[0],
@@ -953,6 +959,7 @@ pub const GpuWorld = struct {
             slot.diag_g = gw.galaxyG();
             slot.diag_weight = @as(f64, @floatFromInt(@min(gw.count, gw.grav.capacity))) / @as(f64, @floatFromInt(gw.grav.last_samples));
         }
+        if (gw.tick_no % max_level_every == 0) gw.dispatch(cmd, .maxLevel, &gp, groups);
         const cp = c.SDL_BeginGPUCopyPass(cmd);
         if (want_diag) gw.grav.downloadDiag(cp.?, slot.tb, diag_offset);
         c.SDL_DownloadFromGPUBuffer(cp, &.{ .buffer = gw.out, .size = out_bytes }, &.{ .transfer_buffer = slot.tb, .offset = 0 });
@@ -1552,4 +1559,39 @@ test "gpu world: more merge candidates than one tick can hold carry over without
     try std.testing.expect(capped.max_per_tick <= 1500);
     try std.testing.expect(capped.ticks >= 4);
     try std.testing.expect(capped.mass_ok);
+}
+
+test "gpu world: HUD max level follows the balls down as well as up" {
+    _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SkipZigTest;
+    defer c.SDL_Quit();
+    const gfx = @import("gfx.zig");
+    var gpu = gfx.Gfx.init(.{ .window = null }) catch return error.SkipZigTest;
+    defer gpu.deinit();
+    const gpa = std.testing.allocator;
+    var gw = try GpuWorld.init(gpa, gpu.dev);
+    defer gw.deinit();
+    gw.profile_every = 0;
+    var w = world.World.init(gpa, 41);
+    defer w.deinit();
+    const in: Input = .{ .mutual_gravity = false, .merging = false, .random_explosions = false };
+
+    for ([_]f32{ 400, 800 }) |x| try gw.queueBall(&w, x, 300);
+    for (gw.pending.items, [_]u8{ 12, 7 }) |*nb, lvl| {
+        nb.vx = 0;
+        nb.vy = 0;
+        nb.gravity = 0;
+        nb.level = lvl;
+    }
+    for (0..8) |_| gw.tick(&w, in);
+    gw.drain(&w);
+    try std.testing.expectEqual(@as(u8, 12), w.current_level);
+
+    // Lasso the level-12 ball: the HUD level drops to the remaining ball's.
+    const poly = [_]Vec2{ .{ .x = 380, .y = 280 }, .{ .x = 420, .y = 280 }, .{ .x = 420, .y = 320 }, .{ .x = 380, .y = 320 } };
+    try gw.requestLasso(&poly);
+    for (0..10) |_| gw.tick(&w, in);
+    gw.drain(&w);
+    try std.testing.expectEqual(@as(u32, 1), gw.alive);
+    try std.testing.expectEqual(@as(u8, 7), w.current_level);
 }

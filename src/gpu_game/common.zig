@@ -169,6 +169,21 @@ pub inline fn blockSum(v: u32) u32 {
     return total;
 }
 
+/// Maximum of `v` over the workgroup, on every thread (same hazards and calling rule as blockSum).
+pub inline fn blockMax(v: u32) u32 {
+    const l = lid();
+    red[l] = v;
+    spirv.workgroupBarrier();
+    var s: u32 = L.group_size / 2;
+    while (s > 0) : (s >>= 1) {
+        if (l < s) red[l] = @max(red[l], red[l + s]);
+        spirv.workgroupBarrier();
+    }
+    const top = red[l - l];
+    spirv.workgroupBarrier();
+    return top;
+}
+
 pub inline fn hash(seed: u32) u32 {
     var x = seed;
     x ^= x >> 16;
