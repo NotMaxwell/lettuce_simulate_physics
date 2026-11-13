@@ -750,8 +750,8 @@ test "ref3: prefix-cell criterion also meets the error targets" {
     try testing.expect(e.rms <= 1e-3);
 }
 
-test "ref3: two tight clumps 1 to 40 softening lengths apart match direct sum" {
-    for ([_]f64{ 1, 2, 3, 4, 6, 10, 40 }) |sep| try clumps(sep);
+test "ref3: two tight clumps 0.5 to 40 softening lengths apart match direct sum" {
+    for ([_]f64{ 0.5, 1, 2, 3, 4, 6, 10, 40 }) |sep| try clumps(sep);
 }
 
 /// Two 400-body clumps of size 0.2 eps, `sep` eps apart: nodes accepted near and inside eps.
