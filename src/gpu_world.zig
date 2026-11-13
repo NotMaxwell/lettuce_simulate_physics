@@ -257,6 +257,8 @@ pub const GpuWorld = struct {
     poly_buf: Buffer,
     blast_buf: Buffer,
     upload_tb: *c.SDL_GPUTransferBuffer,
+    /// Readback of `pick_buf` for pickNow.
+    pick_tb: *c.SDL_GPUTransferBuffer,
     pipes: std.enums.EnumArray(Kernel, *c.SDL_GPUComputePipeline),
     slots: [ring]Slot,
     /// Index of the oldest submitted slot whose results are not yet processed.
@@ -340,6 +342,7 @@ pub const GpuWorld = struct {
             .poly_buf = try buffer(dev, max_poly * @sizeOf(L.Vec2), false),
             .blast_buf = try buffer(dev, max_blasts * @sizeOf(Blast), false),
             .upload_tb = c.SDL_CreateGPUTransferBuffer(dev, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = uploadBytes() }) orelse return error.GpuSetupFailed,
+            .pick_tb = c.SDL_CreateGPUTransferBuffer(dev, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD, .size = 16 }) orelse return error.GpuSetupFailed,
             .pipes = undefined,
             .slots = undefined,
             .radius = try gpa.alloc(f32, cap),
@@ -387,6 +390,7 @@ pub const GpuWorld = struct {
         for ([_]Buffer{ gw.heat, gw.tmp, gw.fx, gw.pool_tiles, gw.claim, gw.out, gw.pick_buf, gw.spawn_buf, gw.poly_buf, gw.blast_buf }) |b| c.SDL_ReleaseGPUBuffer(gw.dev, b);
         for ([_]*const Pool{ &gw.fire, &gw.ash }) |p| for (p.all()) |b| c.SDL_ReleaseGPUBuffer(gw.dev, b);
         c.SDL_ReleaseGPUTransferBuffer(gw.dev, gw.upload_tb);
+        c.SDL_ReleaseGPUTransferBuffer(gw.dev, gw.pick_tb);
         gw.grav.deinit();
         gw.sim.deinit();
         gw.gpa.free(gw.radius);
@@ -578,6 +582,28 @@ pub const GpuWorld = struct {
     pub fn requestPick(gw: *GpuWorld) void {
         gw.pick_req = true;
         gw.pick_result = null;
+    }
+
+    /// Picks and grabs the ball under `mouse` immediately, in its own submit that waits for the GPU,
+    /// and returns whether one was grabbed (null: the GPU call failed). The result is known before
+    /// this tick is recorded, so a miss can start a spawn that lands in the same tick, where
+    /// requestPick's answer comes back through the readback ring one to three ticks later. It
+    /// stalls the CPU for the pick pass plus whatever earlier ticks still have queued, on click
+    /// ticks only.
+    pub fn pickNow(gw: *GpuWorld, mouse: Vec2) ?bool {
+        const cmd = c.SDL_AcquireGPUCommandBuffer(gw.dev) orelse return null;
+        const gp: GameParams = .{ .ball_count = gw.count, .stamp = gw.tick_no + 1, .items = 0, .out_cap = out_cap, .mouse_x = mouse.x, .mouse_y = mouse.y };
+        const groups = divCeil(@max(gw.count, 1), L.group_size);
+        gw.dispatch(cmd, .clearPick, &gp, 1);
+        gw.dispatch(cmd, .pick, &gp, groups);
+        gw.dispatch(cmd, .grab, &gp, 1);
+        const cp = c.SDL_BeginGPUCopyPass(cmd);
+        c.SDL_DownloadFromGPUBuffer(cp, &.{ .buffer = gw.pick_buf, .size = 16 }, &.{ .transfer_buffer = gw.pick_tb, .offset = 0 });
+        c.SDL_EndGPUCopyPass(cp);
+        gs.submitWait(gw.dev, cmd) catch return null;
+        const m: [*]const u8 = @ptrCast(c.SDL_MapGPUTransferBuffer(gw.dev, gw.pick_tb, false) orelse return null);
+        defer c.SDL_UnmapGPUTransferBuffer(gw.dev, gw.pick_tb);
+        return std.mem.readInt(u32, m[0..4], .little) != 0;
     }
 
     /// Right-click: set the ball under the mouse alight (main.onRightClick).
@@ -1594,4 +1620,58 @@ test "gpu world: HUD max level follows the balls down as well as up" {
     gw.drain(&w);
     try std.testing.expectEqual(@as(u32, 1), gw.alive);
     try std.testing.expectEqual(@as(u8, 7), w.current_level);
+}
+
+/// Ticks between a click on empty space and the tick that records the spawned ball, with main.zig's
+/// logic: `ring_path` is the old requestPick + readback answer, otherwise pickNow. 0 = same tick.
+fn clickToSpawnTicks(gpa: std.mem.Allocator, dev: *c.SDL_GPUDevice, ring_path: bool, frame_ms: u32) !u32 {
+    var gw = try GpuWorld.init(gpa, dev);
+    defer gw.deinit();
+    gw.profile_every = 0;
+    var w = world.World.init(gpa, 51);
+    defer w.deinit();
+    const in: Input = .{ .mutual_gravity = false, .merging = false, .random_explosions = false, .mouse = .{ .x = 600, .y = 200 } };
+    for ([_]f32{ 300, 400 }) |x| try gw.queueBall(&w, x, 300);
+    for (0..6) |_| gw.tick(&w, in);
+    gw.drain(&w);
+    const before = gw.alive;
+    var click_pending = true;
+    var spawn_next = false;
+    if (ring_path) gw.requestPick();
+    var t: u32 = 0;
+    while (t < 12) : (t += 1) {
+        if (!ring_path and click_pending) {
+            click_pending = false;
+            if (gw.pickNow(in.mouse) == false) try gw.queueBall(&w, in.mouse.x, in.mouse.y);
+        }
+        if (spawn_next) {
+            spawn_next = false;
+            try gw.queueBall(&w, in.mouse.x, in.mouse.y);
+        }
+        gw.tick(&w, in);
+        if (gw.alive > before) return t;
+        if (ring_path and click_pending) if (gw.pick_result) |hit| {
+            click_pending = false;
+            spawn_next = !hit;
+        };
+        if (frame_ms > 0) c.SDL_Delay(frame_ms);
+    }
+    return error.NeverSpawned;
+}
+
+test "gpu world: a click on empty space spawns in the same tick" {
+    _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SkipZigTest;
+    defer c.SDL_Quit();
+    const gfx = @import("gfx.zig");
+    var gpu = gfx.Gfx.init(.{ .window = null }) catch return error.SkipZigTest;
+    defer gpu.deinit();
+    const gpa = std.testing.allocator;
+    const old_fast = try clickToSpawnTicks(gpa, gpu.dev, true, 0);
+    const old_paced = try clickToSpawnTicks(gpa, gpu.dev, true, 16);
+    const new_fast = try clickToSpawnTicks(gpa, gpu.dev, false, 0);
+    const new_paced = try clickToSpawnTicks(gpa, gpu.dev, false, 16);
+    std.debug.print("click to spawn, ticks: readback ring {d} (unpaced) / {d} (16 ms frames); pickNow {d} / {d}\n", .{ old_fast, old_paced, new_fast, new_paced });
+    try std.testing.expectEqual(@as(u32, 0), new_fast);
+    try std.testing.expectEqual(@as(u32, 0), new_paced);
 }

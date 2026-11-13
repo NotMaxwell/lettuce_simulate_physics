@@ -257,9 +257,8 @@ const Game = struct {
                 g.lasso.clearRetainingCapacity();
                 g.lasso.append(g.gpa, p) catch {};
             } else {
-                // The pick runs on the GPU and its result arrives a few ticks later: a hit has
-                // already been grabbed there, a miss starts the spawn (see `tick`).
-                g.gw.requestPick();
+                // Resolved at the start of the next tick (see `tick`): a hit is grabbed, a miss
+                // starts the spawn.
                 g.pick_pending = true;
             }
         }
@@ -285,6 +284,17 @@ const Game = struct {
     }
 
     fn tick(g: *Game) void {
+        // Before anything is queued, so a miss spawns in this very tick.
+        if (g.pick_pending) {
+            g.pick_pending = false;
+            if (g.gw.pickNow(g.mouse)) |hit| {
+                if (!hit and !(g.gw.galaxy_on and g.attracting())) {
+                    if (g.gw.galaxy_on) {
+                        g.gw.spawnSystemAt(&g.w, g.mouse.x, g.mouse.y) catch {};
+                    } else g.startSpawn();
+                }
+            }
+        }
         if (g.spawn_ticks_left > 0) {
             const extra = if (g.spawn_ticks_left == 1) g.spawn_remainder else 0;
             g.gw.queueBurst(&g.w, g.mouse.x, g.mouse.y, g.spawn_per_tick + extra) catch {};
@@ -300,15 +310,6 @@ const Game = struct {
             .merging = g.merging,
             .collide = g.collide,
         });
-
-        if (g.pick_pending) if (g.gw.pick_result) |hit| {
-            g.pick_pending = false;
-            if (!hit and !(g.gw.galaxy_on and g.attracting())) {
-                if (g.gw.galaxy_on) {
-                    g.gw.spawnSystemAt(&g.w, g.mouse.x, g.mouse.y) catch {};
-                } else g.startSpawn();
-            }
-        };
 
         const ev = g.w.events;
         g.merges_total += ev.merges;
