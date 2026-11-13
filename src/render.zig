@@ -466,7 +466,6 @@ pub const Renderer = struct {
         self.trail_last_tick = null;
     }
 
-
     /// Records the frame; `present` submits it.
     pub fn draw(self: *Renderer, w: *const world.World, alpha: f32, hud: *const Hud) void {
         self.drawInner(w, alpha, hud) catch |e| std.log.err("draw failed: {s}", .{@errorName(e)});
