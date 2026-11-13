@@ -267,3 +267,4 @@ test "snapshot: truncated or unfinished files are rejected, and no temp file is 
     }
 }
 test { _ = @import("tests3.zig"); }
+test { _ = @import("tree3_tests.zig"); }
