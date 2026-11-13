@@ -47,8 +47,9 @@ as the behavioural reference; do not edit it.
 ## Dev container
 Optional. Gives a pinned Zig 0.17, Mesa Vulkan (RADV/ANV with `/dev/dri`, lavapipe CPU
 fallback without it) and Claude Code, isolated from the host. Use it for builds, tests, bench
-and sandboxed agent sessions; play the game windowed on the host. Not built or tested yet as of
-2026-11-12; if a step fails, fix `.devcontainer/` and remove this sentence.
+and sandboxed agent sessions; play the game windowed on the host.
+Verified 2026-11-12 (Arch base, Mesa 26.2.7): tests, autoplay and bench match the host. The first bench
+run in a fresh cache can be far slower; repeat it.
 
 One-time host setup: `sudo usermod -aG docker $USER`, then log out and back in.
 
@@ -90,3 +91,5 @@ Repo-specific ownership:
 - Kernel modules cannot import outside their own directory, so `gpu_sim/common.zig` and
   `gpu_game/common.zig` are duplicated on purpose; keep them in step when one changes.
 - Perf work goes to `optimizer` and is verified with `zig build bench` on the real GPU, before and after.
+- `isolation: "worktree"` branches from `main`, not the current branch. For parallel agents on a feature
+  branch, create the worktree yourself (`git worktree add -b <name> ../lettuce-<name> HEAD`) and give its path.
