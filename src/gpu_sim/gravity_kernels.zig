@@ -118,6 +118,8 @@ fn leafCellOf(x: f32, y: f32) u32 {
     return cy * dim + cx;
 }
 
+const dead_cell: u32 = 0xFFFF_FFFF;
+
 fn cellStart(cell: u32) u32 {
     const nleaf = leafDim() * leafDim();
     return cells.v[scanOffset(nleaf) + cell] + cells.v[blockOffset(nleaf) + cell / scan_block];
@@ -140,6 +142,13 @@ export fn clearCounts() callconv(kernel_cc) void {
 export fn binBalls() callconv(kernel_cc) void {
     const i = gid();
     if (i >= params.n) return;
+    // Dead balls (mass 0) are left out entirely: they keep their last position, which after the
+    // play area shrinks is outside the bounds, and clamping hundreds of thousands of them into the
+    // edge cells made the exact near-field sums quadratic.
+    if (body.v[i].mass == 0) {
+        keys.v[i].cell = dead_cell;
+        return;
+    }
     const p = &pos.v[i];
     const cell = leafCellOf(p.x, p.y);
     const rank = atomicAdd(&cells.v[countsOffset() + cell], 1);
@@ -204,6 +213,7 @@ export fn scatterBalls() callconv(kernel_cc) void {
     const i = gid();
     if (i >= params.n) return;
     const k = &keys.v[i];
+    if (k.cell == dead_cell) return;
     const p = &pos.v[i];
     // Field-wise: whole-struct loads/stores of buffer structs make Zig emit OpCopyLogical (SPIR-V 1.4) in a 1.0 module.
     const dst = &sorted.v[cellStart(k.cell) + k.rank];
@@ -338,6 +348,9 @@ export fn downwardPass() callconv(kernel_cc) void {
 export fn evaluate() callconv(kernel_cc) void {
     const s = gid();
     if (s >= params.n) return;
+    // Only live balls were sorted; slots past the last cell hold stale data.
+    const last = leafDim() * leafDim() - 1;
+    if (s >= cellStart(last) + cells.v[countsOffset() + last]) return;
     const b = &sorted.v[s];
     const lvl = params.leaf_level;
     const dim = leafDim();

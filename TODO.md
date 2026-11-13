@@ -16,8 +16,6 @@
   if not, strip it down to the helpers.
 
 ## Bugs
-- After every ball has died (e.g. all 1M burnt out), the gravity stage sampled ~100 ms and the tick
-  stalled for hundreds of ms. Suspect the FMM with all masses zero (`src/gpu_sim/gravity.zig`).
 - Merges are capped at ~16k per tick by the event buffer (`max_events`).
 
 ## Not yet ported to the GPU
