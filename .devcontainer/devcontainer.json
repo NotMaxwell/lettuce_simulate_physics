@@ -1,0 +1,14 @@
+{
+  "name": "lettuce (Zig 0.17 + Vulkan)",
+  "build": { "dockerfile": "Dockerfile", "context": "." },
+  "remoteUser": "dev",
+  "runArgs": ["--device=/dev/dri"],
+  "mounts": [
+    "source=lettuce-zig-cache,target=/home/dev/.cache/zig,type=volume",
+    "source=lettuce-claude-config,target=/home/dev/.claude,type=volume"
+  ],
+  "postCreateCommand": "zig build --fetch",
+  "customizations": {
+    "vscode": { "extensions": ["ziglang.vscode-zig"] }
+  }
+}
