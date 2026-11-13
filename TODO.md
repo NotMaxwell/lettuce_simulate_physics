@@ -1,27 +1,19 @@
 # TODO
 
 ## Dead-code cleanup (left over from the CPU → GPU move)
-- `src/gpu_sim`: remove the Jacobi solver (`Solver.jacobi`, `k_contacts.zig`, `k_collide.zig`, the
-  Jacobi branches in `collide.zig`/`k_finish.zig` and its tuning fields). It is not the default and
-  fails the settling check (piles collapse).
-- `src/gpu_sim/collide.zig`: `Sim.gridView()` has no callers; the fire kernels read `counts`,
-  `sorted_id` and `ball_cell` directly. Switch them to `gridView()` (or delete it) so the grid
-  layout lives in one place.
-- `src/gpu_sim/collide.zig`: the `.bin` timing part records nothing since binning moved into integrate.
 - `src/render.zig`: the CPU ball path (`drawTrails`, `drawBalls`, `drawParticles`) is unreachable from
   the game now that main always draws GPU balls. Keep only what `render_demo.zig` still needs, or move
   the demo to GPU balls and delete it.
-- `src/world.zig` / `src/physics.zig` / `src/effects.zig`: CPU ball simulation is now only used by
-  `zig build bench` (CPU baseline) and for bounds helpers. Decide whether the CPU baseline stays;
-  if not, strip it down to the helpers.
+- The CPU ball simulation (`world.zig` / `physics.zig` / `effects.zig`) stays as the `zig build bench`
+  baseline for comparison (decided 2026-11-12).
 
 ## Bugs
-- Reported: the window closes instantly during merging (user, windowed, release build). Not
-  reproduced: 42k frames of `--autoplay on` (random clicks, grabs, ignites, lassos) in release and
-  debug builds, and 1k-1M `--stress N --merge on` runs, all exit cleanly. Two windowed autoplay runs
-  exited with code 0 on their own (looks like a quit, not a crash); a third ran until killed. Next
-  step: capture a debug-build run of the failing session (`zig build -Doptimize=debug run`).
+- Reported: the window closes instantly during merging (user, windowed, release build). On the RX 7800 XT
+  (RADV) every start crashed in `vkCreateComputePipelines` until fa8009a (invalid SPIR-V from
+  `blockSum`), which may have been this. Needs a windowed retest on that machine.
 - Merges are capped at ~16k per tick by the event buffer (`max_events`).
+- Zig's SPIR-V backend emits one validation error in every kernel (VUID-StandaloneSpirv-OpTypeRuntimeArray-04680,
+  missing `Block` decoration). RADV accepts it today; a stricter driver may not.
 
 ## Not yet ported to the GPU
 - Impact heat (the solver does not expose approach speed); ash-ash collisions.
@@ -32,3 +24,13 @@
 ## Unverified
 - Windowed play with vsync, resize, high-DPI mouse scaling, and audio (all runs so far are headless).
 - `Sim.elastic = false` (retention-based ball restitution) at scale.
+
+## Galaxy mode (feature chain)
+Balls orbiting each other in open space and forming little systems. Gravity stays 2D (log potential:
+pull g·m/r), so circular speed is sqrt(g·M_enclosed) at any radius; disks have flat rotation curves.
+1. [x] Zoom/pan/follow camera (wheel, middle-drag, Home, C).
+2. [x] Scenario builders, `src/galaxy.zig`: disk, colliding disks, cold cloud, cluster of star systems.
+3. [ ] Galaxy mode in the GPU world: explicit g and softening, fixed open bounds, collision modes
+       solid / accrete / ghost, keys G, 1-4, X, [ ], click spawns a star system; `--galaxy`, `--collide`.
+4. [ ] GPU trails so orbits are visible (key R).
+5. [ ] Diagnostics on the HUD: energy and angular-momentum drift.
