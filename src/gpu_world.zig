@@ -179,7 +179,7 @@ const Layout = struct { ro: u32, rw: u32 };
 const module_layout = std.enums.EnumArray(Module, Layout).init(.{
     .spawn = .{ .ro = 1, .rw = 7 },
     .merge = .{ .ro = 2, .rw = 6 },
-    .act = .{ .ro = 3, .rw = 6 },
+    .act = .{ .ro = 3, .rw = 7 },
     .conduct = .{ .ro = 8, .rw = 1 },
     .burn = .{ .ro = 1, .rw = 6 },
     .emit = .{ .ro = 3, .rw = 8 },
@@ -1066,8 +1066,8 @@ pub const GpuWorld = struct {
                 ro_buf[0..3].* = .{ s.pos, gw.poly_buf, gw.blast_buf };
                 break :blk ro_buf[0..3];
             }, blk: {
-                rw_buf[0..6].* = .{ s.vel, s.body, s.meta, gw.pick_buf, gw.out, gw.heat };
-                break :blk rw_buf[0..6];
+                rw_buf[0..7].* = .{ s.vel, s.body, s.meta, gw.pick_buf, gw.out, gw.heat, s.events };
+                break :blk rw_buf[0..7];
             } },
             .conduct => .{ blk: {
                 ro_buf[0..8].* = .{ s.pos, s.body, s.ball_cell, s.counts, s.sorted_id, s.meta, gw.heat, gw.fx };
@@ -1674,4 +1674,40 @@ test "gpu world: a click on empty space spawns in the same tick" {
     std.debug.print("click to spawn, ticks: readback ring {d} (unpaced) / {d} (16 ms frames); pickNow {d} / {d}\n", .{ old_fast, old_paced, new_fast, new_paced });
     try std.testing.expectEqual(@as(u32, 0), new_fast);
     try std.testing.expectEqual(@as(u32, 0), new_paced);
+}
+
+test "gpu world: releasing a grab adds the last follow step to the throw" {
+    _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SkipZigTest;
+    defer c.SDL_Quit();
+    const gfx = @import("gfx.zig");
+    var gpu = gfx.Gfx.init(.{ .window = null }) catch return error.SkipZigTest;
+    defer gpu.deinit();
+    const gpa = std.testing.allocator;
+    var gw = try GpuWorld.init(gpa, gpu.dev);
+    defer gw.deinit();
+    gw.profile_every = 0;
+    var w = world.World.init(gpa, 61);
+    defer w.deinit();
+
+    try gw.queueBall(&w, 400, 300);
+    gw.pending.items[0].vx = 0;
+    gw.pending.items[0].vy = 0;
+    gw.pending.items[0].gravity = 0;
+    gw.tick(&w, .{ .random_explosions = false });
+    try std.testing.expectEqual(@as(?bool, true), gw.pickNow(.{ .x = 400, .y = 300 }));
+
+    // Mouse x = 400 + 2k^2: the follow step adds 4 each tick from the second on, so after four
+    // ticks v = 14 and the last follow step is 4. A release adds it: 18, not 14.
+    for (1..5) |k| {
+        const kf: f32 = @floatFromInt(k);
+        gw.tick(&w, .{ .mouse = .{ .x = 400 + 2 * kf * kf, .y = 300 }, .random_explosions = false });
+    }
+    gw.requestRelease();
+    gw.tick(&w, .{ .mouse = .{ .x = 432, .y = 300 }, .random_explosions = false });
+    gw.drain(&w);
+    var pos: [1]L.Vec2 = undefined;
+    try gw.sim.download(0, .{ .pos = &pos });
+    std.debug.print("release throw: x after the release tick {d:.3} (432 + 18 = 450 with the impulse, 446 without)\n", .{pos[0].x});
+    try std.testing.expectApproxEqAbs(@as(f32, 450), pos[0].x, 0.05);
 }

@@ -54,9 +54,15 @@ inline fn integrate(i: u32, m: u32) L.Vec2 {
     s.ang_vel *= 0.98;
 
     if (m & L.flag_grabbed != 0) {
-        v.x += P.mouse_x - p.x;
-        v.y += P.mouse_y - p.y;
+        const dx = P.mouse_x - p.x;
+        const dy = P.mouse_y - p.y;
+        v.x += dx;
+        v.y += dy;
         p = .{ .x = P.mouse_x, .y = P.mouse_y };
+        // The last follow step, for gpu_game k_act release (Ball.releaseGrab adds it to the throw).
+        // Only one ball is held at a time; the header's b/value are free (the solver only counts).
+        events.v[0].b = @bitCast(dx);
+        events.v[0].value = dy;
     }
 
     if (P.flags & c.flag_mutual_gravity == 0) {
