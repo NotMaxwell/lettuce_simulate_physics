@@ -470,8 +470,12 @@ export fn boundsPartial() callconv(kernel_cc) void {
     var k: u32 = 0;
     while (k < S.bounds_per_thread) : (k += 1) {
         if (i < params.n and body.v[i].mass != 0) {
-            const x = pos.v[i].x;
-            const y = pos.v[i].y;
+            var x = pos.v[i].x;
+            var y = pos.v[i].y;
+            if (params.clamp_window != 0) {
+                x = @min(@max(x, params.origin_x), params.origin_x + params.root_size);
+                y = @min(@max(y, params.origin_y), params.origin_y + params.root_size);
+            }
             if (x < mnx) mnx = x;
             if (x > mxx) mxx = x;
             if (y < mny) mny = y;
@@ -525,4 +529,156 @@ export fn boundsFinal() callconv(kernel_cc) void {
         cells.v[params.box_word + 1] = @bitCast(cy - 0.5 * size);
         cells.v[params.box_word + 2] = @bitCast(size);
     }
+}
+
+fn diagGroups() u32 {
+    const threads = (params.n + S.diag_per_thread - 1) / S.diag_per_thread;
+    return (threads + L.group_size - 1) / L.group_size;
+}
+
+/// Diagnostics, step 1: per workgroup sums of 1/2 m v^2, m (x vy - y vx) and m over the live
+/// bodies go to `local`, three floats per group in slots (2g, 2g+1) as (ke, lz), (m, unused).
+export fn diagPartial() callconv(kernel_cc) void {
+    const l = spirv.local_invocation_id[0];
+    const stride = diagGroups() * L.group_size;
+    var ke: f32 = 0;
+    var lz: f32 = 0;
+    var ms: f32 = 0;
+    var i = gid();
+    var k: u32 = 0;
+    while (k < S.diag_per_thread) : (k += 1) {
+        if (i < params.n) {
+            const m = body.v[i].mass;
+            if (m != 0) {
+                const vx = vel.v[i].x;
+                const vy = vel.v[i].y;
+                ke += 0.5 * m * (vx * vx + vy * vy);
+                lz += m * (pos.v[i].x * vy - pos.v[i].y * vx);
+                ms += m;
+            }
+        }
+        i += stride;
+    }
+    sh_minx[l] = ke;
+    sh_miny[l] = lz;
+    sh_maxx[l] = ms;
+    var off: u32 = L.group_size / 2;
+    while (off > 0) : (off >>= 1) {
+        spirv.workgroupBarrier();
+        if (l < off) {
+            sh_minx[l] += sh_minx[l + off];
+            sh_miny[l] += sh_miny[l + off];
+            sh_maxx[l] += sh_maxx[l + off];
+        }
+    }
+    spirv.workgroupBarrier();
+    if (l == 0) {
+        const g = spirv.workgroup_id[0] + spirv.workgroup_id[1] * S.dispatch_x;
+        local.v[2 * g].x = sh_minx[l];
+        local.v[2 * g].y = sh_miny[l];
+        local.v[2 * g + 1].x = sh_maxx[l];
+    }
+}
+
+/// Diagnostics, step 2: softened log-potential sum for sampled bodies (see gpu_world's energy
+/// readout). Thread t takes sample t % samples and slice t / samples of the other bodies and adds
+/// m_i * sum_j m_j ln((r^2 + eps) * g_scale) / 2 (g_scale holds 1 / reference length^2, which only
+/// shifts the potential's zero); one partial per workgroup goes after diagPartial's slots.
+/// The pull g m d / (d^2 + eps) is the gradient of g m ln(d^2 + eps) / 2.
+export fn potentialPartial() callconv(kernel_cc) void {
+    const l = spirv.local_invocation_id[0];
+    const t = gid();
+    var acc: f32 = 0;
+    if (t < params.samples * params.chunks) {
+        const si = t % params.samples;
+        const i = if (params.samples == params.n) si else hashU32(si ^ params.seed) % params.n;
+        const j0 = (t / params.samples) * params.chunk_len;
+        const j1 = @min(j0 + params.chunk_len, params.n);
+        const xi = pos.v[i].x;
+        const yi = pos.v[i].y;
+        const mi = body.v[i].mass;
+        if (mi != 0) {
+            // Slices of 64 terms, then the slices: keeps f32 rounding small over many terms.
+            var sum: f32 = 0;
+            var j = j0;
+            while (j < j1) {
+                var part: f32 = 0;
+                const end = @min(j + 64, j1);
+                while (j < end) : (j += 1) {
+                    if (j == i) continue;
+                    const dx = pos.v[j].x - xi;
+                    const dy = pos.v[j].y - yi;
+                    part += body.v[j].mass * @log((dx * dx + dy * dy + params.softening) * params.g_scale);
+                }
+                sum += part;
+            }
+            acc = 0.5 * mi * sum;
+        }
+    }
+    sh_minx[l] = acc;
+    var off: u32 = L.group_size / 2;
+    while (off > 0) : (off >>= 1) {
+        spirv.workgroupBarrier();
+        if (l < off) sh_minx[l] += sh_minx[l + off];
+    }
+    spirv.workgroupBarrier();
+    if (l == 0) {
+        const g = spirv.workgroup_id[0] + spirv.workgroup_id[1] * S.dispatch_x;
+        local.v[2 * diagGroups() + g].x = sh_minx[l];
+    }
+}
+
+fn hashU32(x0: u32) u32 {
+    var x = x0;
+    x ^= x >> 16;
+    x *%= 0x7feb352d;
+    x ^= x >> 15;
+    x *%= 0x846ca68b;
+    x ^= x >> 16;
+    return x;
+}
+
+/// Diagnostics, step 3 (one workgroup): sums the partials into cells[box_word + diag_result_offset ..].
+export fn diagFinal() callconv(kernel_cc) void {
+    const l = spirv.local_invocation_id[0];
+    const dg = diagGroups();
+    const pg = (params.samples * params.chunks + L.group_size - 1) / L.group_size;
+    var ke: f32 = 0;
+    var lz: f32 = 0;
+    var ms: f32 = 0;
+    var pe: f32 = 0;
+    var g = l;
+    while (g < dg) : (g += L.group_size) {
+        ke += local.v[2 * g].x;
+        lz += local.v[2 * g].y;
+        ms += local.v[2 * g + 1].x;
+    }
+    g = l;
+    while (g < pg) : (g += L.group_size) pe += local.v[2 * dg + g].x;
+    sh_minx[l] = ke;
+    sh_miny[l] = lz;
+    sh_maxx[l] = ms;
+    sh_maxy[l] = pe;
+    reduceBounds2(l);
+    if (l == 0) {
+        const o = params.box_word + S.diag_result_offset;
+        cells.v[o] = @bitCast(sh_minx[l]);
+        cells.v[o + 1] = @bitCast(sh_miny[l]);
+        cells.v[o + 2] = @bitCast(sh_maxx[l]);
+        cells.v[o + 3] = @bitCast(sh_maxy[l]);
+    }
+}
+
+fn reduceBounds2(l: u32) void {
+    var off: u32 = L.group_size / 2;
+    while (off > 0) : (off >>= 1) {
+        spirv.workgroupBarrier();
+        if (l < off) {
+            sh_minx[l] += sh_minx[l + off];
+            sh_miny[l] += sh_miny[l + off];
+            sh_maxx[l] += sh_maxx[l + off];
+            sh_maxy[l] += sh_maxy[l + off];
+        }
+    }
+    spirv.workgroupBarrier();
 }

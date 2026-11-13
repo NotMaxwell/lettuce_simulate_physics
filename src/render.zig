@@ -60,7 +60,13 @@ pub const GalaxyHud = struct {
     collide: []const u8,
     /// Gravity relative to the scenario's own (1 = as built).
     g_mult: f32,
+    /// Kinetic, (sampled) potential and angular momentum now and at scenario load; null until the
+    /// first readout of the scenario arrives.
+    energy: ?Energy = null,
+    energy0: Energy = .{},
 };
+
+pub const Energy = struct { ke: f64 = 0, pe: f64 = 0, lz: f64 = 0 };
 
 pub const Hud = struct {
     balls_per_click: u32 = 1,
@@ -869,6 +875,10 @@ pub const Renderer = struct {
         return font.textWidth(len, scale * self.hudScale());
     }
 
+    fn relDrift(now: f64, base: f64) f64 {
+        return if (base == 0) 0 else 100 * (now - base) / @abs(base);
+    }
+
     fn drawText(self: *Renderer, w: *const world.World, hud: *const Hud) void {
         const hs = self.hudScale();
         const white = rgb8(255, 255, 255);
@@ -886,6 +896,16 @@ pub const Renderer = struct {
         if (hud.galaxy) |gh| {
             self.text(x, y, 2, rgb8(160, 200, 255), "GALAXY: {s}  bodies {d}  collide {s}  g x{d:.2}", .{ gh.scenario, gh.bodies, gh.collide, gh.g_mult });
             y += lh * 1.4;
+            if (gh.energy) |e| {
+                const e0 = gh.energy0;
+                const grey = rgb8(190, 255, 190);
+                const tot = e.ke + e.pe;
+                const tot0 = e0.ke + e0.pe;
+                self.text(x, y, 1.5, grey, "KE {e:.3} ({d:.2}%)  Lz {e:.3} ({d:.3}%)", .{ e.ke, relDrift(e.ke, e0.ke), e.lz, relDrift(e.lz, e0.lz) });
+                y += lh;
+                self.text(x, y, 1.5, grey, "PE {e:.3} (sampled)  E {e:.3} ({d:.2}%)  drift since load", .{ e.pe, tot, relDrift(tot, tot0) });
+                y += lh * 1.4;
+            }
         }
         const help = [_][:0]const u8{
             "Press [LEFT CLICK] to spawn ball.",

@@ -26,10 +26,27 @@ pub const Params = extern struct {
     /// Word index in `cells` of a GPU-computed tree box [origin_x, origin_y, root_size] (f32 bits),
     /// or no_box to use origin_x/origin_y/root_size above.
     box_word: u32 = no_box,
-    _pad0: u32 = 0,
+    /// 1: boundsPartial clamps positions into the window [origin, origin + root_size]^2 before
+    /// taking the box, so the GPU box is tight but never larger than the window.
+    clamp_window: u32 = 0,
     _pad1: u32 = 0,
     _pad2: u32 = 0,
+    /// Potential pass: sampled bodies (== n when exact), each pair sum split into `chunks` slices
+    /// of `chunk_len` bodies, sample choice hashed with `seed`.
+    samples: u32 = 0,
+    chunks: u32 = 0,
+    chunk_len: u32 = 0,
+    seed: u32 = 0,
 };
+
+/// Bodies one thread covers in diagPartial.
+pub const diag_per_thread: u32 = 16;
+/// Threads the potential pass aims for.
+pub const potential_threads: u32 = 131072;
+/// Words of the `cells` buffer after the tree box where diagFinal leaves its result:
+/// kinetic energy, angular momentum, mass, potential sum (f32 bits).
+pub const diag_result_words: u32 = 4;
+pub const diag_result_offset: u32 = 4;
 
 pub const no_box: u32 = 0xFFFF_FFFF;
 /// Bodies one thread covers in boundsPartial.

@@ -179,13 +179,22 @@ const Game = struct {
             c.SDLK_2 => g.enterGalaxy(.collision),
             c.SDLK_3 => g.enterGalaxy(.cloud),
             c.SDLK_4 => g.enterGalaxy(.systems),
-            c.SDLK_X => g.collide = switch (g.collide) {
-                .solid => .accrete,
-                .accrete => .ghost,
-                .ghost => .solid,
+            c.SDLK_X => {
+                g.collide = switch (g.collide) {
+                    .solid => .accrete,
+                    .accrete => .ghost,
+                    .ghost => .solid,
+                };
+                g.gw.resetEnergyBaseline();
             },
-            c.SDLK_LEFTBRACKET => g.gw.galaxy_g_mult = @max(g.gw.galaxy_g_mult * 0.8, 0.02),
-            c.SDLK_RIGHTBRACKET => g.gw.galaxy_g_mult = @min(g.gw.galaxy_g_mult * 1.25, 50),
+            c.SDLK_LEFTBRACKET => {
+                g.gw.galaxy_g_mult = @max(g.gw.galaxy_g_mult * 0.8, 0.02);
+                g.gw.resetEnergyBaseline();
+            },
+            c.SDLK_RIGHTBRACKET => {
+                g.gw.galaxy_g_mult = @min(g.gw.galaxy_g_mult * 1.25, 50);
+                g.gw.resetEnergyBaseline();
+            },
             else => {},
         }
     }
@@ -514,7 +523,7 @@ pub fn main(init: std.process.Init) !void {
             .show_perf = g.show_perf,
             .perf = g.perf,
             .gpu = gpuBalls(&gw, g.w.current_level),
-            .galaxy = if (gw.galaxy_on) .{ .scenario = @tagName(gw.galaxy_scenario), .bodies = gw.alive, .collide = @tagName(g.collide), .g_mult = gw.galaxy_g_mult } else null,
+            .galaxy = if (gw.galaxy_on) .{ .scenario = @tagName(gw.galaxy_scenario), .bodies = gw.alive, .collide = @tagName(g.collide), .g_mult = gw.galaxy_g_mult, .energy = if (gw.energy) |e| .{ .ke = e.ke, .pe = e.pe, .lz = e.lz } else null, .energy0 = if (gw.energy_base) |e| .{ .ke = e.ke, .pe = e.pe, .lz = e.lz } else .{} } else null,
         };
         if (gw.scene_epoch != g.trail_epoch) {
             g.trail_epoch = gw.scene_epoch;
