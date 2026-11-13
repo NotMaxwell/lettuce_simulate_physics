@@ -19,6 +19,8 @@ const sm = C.Shared(f32, tile, "sm");
 
 /// Threads outside [0, n) still walk the tiles: the barriers must be reached by the whole group.
 export fn kick() callconv(C.cc) void {
+    // Group-uniform, so it precedes the barriers safely (see diag in step.zig).
+    if (params.first + C.groupId() * C.group_size >= params.n) return;
     const l = C.lid();
     const i = params.first + C.gid();
     const active = i < params.n;
@@ -58,7 +60,8 @@ export fn kick() callconv(C.cc) void {
             ax += w * dx;
             ay += w * dy;
             az += w * dz;
-            inv_sum += sm[k] * inv;
+            // The body's own softened term is excluded here, not subtracted afterwards (that loses precision).
+            inv_sum += if (t * tile + k == i) 0 else sm[k] * inv;
         }
         C.barrier();
     }
@@ -75,7 +78,6 @@ export fn kick() callconv(C.cc) void {
     }
     C.store(amag, i, @sqrt(gx * gx + gy * gy + gz * gz));
     if (params.flags & L.sim3_flag_potential != 0) {
-        // The sum includes the body's own softened term m_i / eps (dx = 0); drop it.
-        C.store(pot, i, -params.g * (inv_sum - C.load(mass, i) / params.eps));
+        C.store(pot, i, -params.g * inv_sum);
     }
 }

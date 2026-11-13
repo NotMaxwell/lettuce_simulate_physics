@@ -16,6 +16,8 @@ const c = @import("c");
 const L = @import("gpu_layout");
 const ic3 = @import("ic3");
 const sim = @import("sim.zig");
+const snap = @import("snapshot.zig");
+const snapper = @import("snapper.zig");
 
 const direct_spv = @embedFile("k3_direct.spv");
 const step_spv = @embedFile("k3_step.spv");
@@ -93,7 +95,7 @@ pub const Sim3 = struct {
     half_pending: bool = true,
 
     pub fn init(dev: *c.SDL_GPUDevice, cfg: Config) Error!Sim3 {
-        if (cfg.n < 1 or cfg.n > 1 << 28) return error.OutOfRange;
+        if (cfg.n < 1 or cfg.n > 1 << 28 or !(cfg.eps > 0) or !(cfg.box.size > 0)) return error.OutOfRange;
         var s: Sim3 = undefined;
         s.dev = dev;
         s.cfg = cfg;
@@ -162,8 +164,8 @@ pub const Sim3 = struct {
     }
 
     /// Quantum count of a world coordinate; clamped into the open domain, wrapped when periodic.
-    pub fn toQuanta(s: *const Sim3, x: f64, axis: usize) u32 {
-        const f = (x - s.cfg.box.centre[axis]) / s.cfg.box.size;
+    pub fn toQuanta(s: *const Sim3, x: f64) u32 {
+        const f = x / s.cfg.box.size;
         const q = std.math.ldexp(f, 32) + 0x1p31;
         if (s.cfg.boundary == .periodic) {
             const w = @mod(@round(q), 0x1p32);
@@ -172,9 +174,9 @@ pub const Sim3 = struct {
         return @intFromFloat(std.math.clamp(@round(q), 0x1p30, 3 * 0x1p30 - 1));
     }
 
-    pub fn toWorld(s: *const Sim3, q: u32, axis: usize) f64 {
+    pub fn toWorld(s: *const Sim3, q: u32) f64 {
         const signed: i32 = @bitCast(q -% (1 << 31));
-        return s.cfg.box.centre[axis] + @as(f64, @floatFromInt(signed)) / 0x1p32 * s.cfg.box.size;
+        return @as(f64, @floatFromInt(signed)) / 0x1p32 * s.cfg.box.size;
     }
 
     /// Blocking upload of the initial conditions (synchronous velocities); resets the clock.
@@ -191,7 +193,7 @@ pub const Sim3 = struct {
                 const size: usize = if (which == 2) 4 else 12;
                 switch (which) {
                     0 => for (@as([*]L.Pos3, @ptrCast(@alignCast(m)))[0..part.len], part) |*o, b| {
-                        o.* = .{ .x = s.toQuanta(b.x, 0), .y = s.toQuanta(b.y, 1), .z = s.toQuanta(b.z, 2) };
+                        o.* = .{ .x = s.toQuanta(b.x), .y = s.toQuanta(b.y), .z = s.toQuanta(b.z) };
                     },
                     1 => for (@as([*]L.Vel3, @ptrCast(@alignCast(m)))[0..part.len], part) |*o, b| {
                         o.* = .{ .x = @floatCast(b.vx), .y = @floatCast(b.vy), .z = @floatCast(b.vz) };
@@ -212,6 +214,51 @@ pub const Sim3 = struct {
         }
         s.tick_no = 0;
         s.half_pending = true;
+    }
+
+    /// Snapshotter over this sim (snapshot v2: pos xyz as u32 words, vel xyz, mass).
+    pub fn snapshotter(s: *Sim3, gpa: std.mem.Allocator) snapper.Error!*snapper.Snapper {
+        const sources = [_]snapper.Source{
+            .{ .buf = s.pos, .stride = @sizeOf(L.Pos3) },
+            .{ .buf = s.vel, .stride = @sizeOf(L.Vel3) },
+            .{ .buf = s.mass, .stride = 4 },
+        };
+        const fields = [_]snapper.FieldSpec{
+            .{ .source = 0, .word = 0 }, .{ .source = 0, .word = 1 }, .{ .source = 0, .word = 2 },
+            .{ .source = 1, .word = 0 }, .{ .source = 1, .word = 1 }, .{ .source = 1, .word = 2 },
+            .{ .source = 2, .word = 0 },
+        };
+        return snapper.Snapper.createGeneric(gpa, s.dev, s.cfg.n, &sources, &fields, .{ .ctx = s, .recordSync = syncHook, .makeHeader = headerHook });
+    }
+
+    /// Loads a 3D snapshot (n and box must match) and sets the clock.
+    pub fn restore(s: *Sim3, gpa: std.mem.Allocator, io: *c.SDL_IOStream, h: *const snap.Header) (Error || snap.Error || error{OutOfMemory})!void {
+        if (h.version != snap.version_3d or h.dim != 3 or h.n != s.cfg.n or h.box_size != s.cfg.box.size or h.hasUniformMass()) return error.BadHeader;
+        const chunk: usize = 1 << 18;
+        const tb = c.SDL_CreateGPUTransferBuffer(s.dev, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = @intCast(chunk * 12) }) orelse return error.GpuBuffer;
+        defer c.SDL_ReleaseGPUTransferBuffer(s.dev, tb);
+        const words = try gpa.alloc(u32, chunk * snap.field_count3);
+        defer gpa.free(words);
+        var at: usize = 0;
+        while (at < s.cfg.n) : (at += chunk) {
+            const m = @min(chunk, s.cfg.n - at);
+            for (0..snap.field_count3) |k| try snap.readWords(io, h, @intCast(k), at, words[k * chunk ..][0..m]);
+            const dsts = [3]Buffer{ s.pos, s.vel, s.mass };
+            for (dsts, [3]usize{ 3, 3, 1 }, [3]usize{ 0, 3, 6 }) |dst, per, first| {
+                const out: [*]u32 = @ptrCast(@alignCast(c.SDL_MapGPUTransferBuffer(s.dev, tb, false) orelse return error.GpuBuffer));
+                for (0..m) |j| for (0..per) |d| {
+                    out[j * per + d] = words[(first + d) * chunk + j];
+                };
+                c.SDL_UnmapGPUTransferBuffer(s.dev, tb);
+                const cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
+                const cp = c.SDL_BeginGPUCopyPass(cmd);
+                c.SDL_UploadToGPUBuffer(cp, &.{ .transfer_buffer = tb }, &.{ .buffer = dst, .offset = @intCast(at * per * 4), .size = @intCast(m * per * 4) }, false);
+                c.SDL_EndGPUCopyPass(cp);
+                try submitWait(s.dev, cmd);
+            }
+        }
+        s.tick_no = h.tick;
+        s.half_pending = h.half_pending != 0;
     }
 
     fn params(s: *const Sim3, first: u32, kick: f32, flags: u32) L.Params3 {
@@ -380,6 +427,29 @@ pub const Sim3 = struct {
     }
 };
 
+fn syncHook(ctx: *anyopaque, cmd: *c.SDL_GPUCommandBuffer) *c.SDL_GPUCommandBuffer {
+    const s: *Sim3 = @ptrCast(@alignCast(ctx));
+    if (s.half_pending) return cmd;
+    s.half_pending = true;
+    return s.recordKick(cmd, 0.5, 0) catch @panic("sim3: half kick before snapshot failed");
+}
+
+fn headerHook(ctx: *anyopaque, seed: u64, scenario: u32) snap.Header {
+    const s: *Sim3 = @ptrCast(@alignCast(ctx));
+    return snap.Header.init3(.{
+        .n = s.cfg.n,
+        .tick = s.tick_no,
+        .dt = s.cfg.dt,
+        .g = s.cfg.g,
+        .softening = s.cfg.eps,
+        .half_pending = s.half_pending,
+        .seed = seed,
+        .scenario = scenario,
+        .box_size = s.cfg.box.size,
+        .boundary = @fromBackingInt(@intCast(@backingInt(s.cfg.boundary))),
+    });
+}
+
 fn waitRelease(dev: *c.SDL_GPUDevice, fence: *c.SDL_GPUFence) void {
     var f = fence;
     _ = c.SDL_WaitForGPUFences(dev, true, &f, 1);
@@ -413,12 +483,16 @@ pub const Options = struct {
     bench: bool = false,
     /// Accepted for the tree solver; direct summation ignores it.
     theta: f32 = 0.6,
+    out: ?[:0]const u8 = null,
+    every_snap: u64 = 0,
+    restart: ?[:0]const u8 = null,
 };
 
 const usage =
     \\usage: sim --dim 3 [--ic plummer|kepler|uniform] [--n N] [--ticks K] [--dt F] [--every K] [--seed U64]
     \\               [--eps LEN] [--ecc E] [--margin M] [--boundary open|periodic] [--method direct]
     \\               [--theta F (ignored)] [--bench]
+    \\               [--out DIR --every-snap K] [--restart FILE]   (restart: n, g, eps, dt, box, boundary come from the file; --ticks = further ticks)
     \\
 ;
 
@@ -451,6 +525,7 @@ fn parse(args: []const [:0]const u8) !Options {
             o.seed = try std.fmt.parseInt(u64, v, 10);
         } else if (std.mem.eql(u8, a, "--eps")) {
             o.eps = try std.fmt.parseFloat(f32, v);
+            if (!(o.eps > 0)) return error.BadEps;
         } else if (std.mem.eql(u8, a, "--ecc")) {
             o.ecc = try std.fmt.parseFloat(f64, v);
         } else if (std.mem.eql(u8, a, "--margin")) {
@@ -459,6 +534,12 @@ fn parse(args: []const [:0]const u8) !Options {
             o.boundary = std.meta.stringToEnum(Boundary, v) orelse return error.BadBoundary;
         } else if (std.mem.eql(u8, a, "--method")) {
             if (!std.mem.eql(u8, v, "direct")) return error.BadMethod;
+        } else if (std.mem.eql(u8, a, "--out")) {
+            o.out = v;
+        } else if (std.mem.eql(u8, a, "--every-snap")) {
+            o.every_snap = try std.fmt.parseInt(u64, v, 10);
+        } else if (std.mem.eql(u8, a, "--restart")) {
+            o.restart = v;
         } else if (std.mem.eql(u8, a, "--theta")) {
             o.theta = try std.fmt.parseFloat(f32, v);
         } else return error.UnknownOption;
@@ -478,38 +559,64 @@ pub fn main(gpa: std.mem.Allocator, args: []const [:0]const u8) !void {
     const dev = try sim.createDevice();
     defer c.SDL_DestroyGPUDevice(dev);
 
-    var prng = std.Random.DefaultPrng.init(o.seed);
-    var dt = o.dt;
-    const bodies: []ic3.Body3 = switch (o.ic) {
-        .plummer => try ic3.plummer(gpa, prng.random(), o.n, .{}),
-        .uniform => try ic3.uniform(gpa, prng.random(), o.n, .{ .sigma = 0.3 }),
-        .kepler => blk: {
-            const k: ic3.Kepler = .{ .e = o.ecc };
-            dt = @floatCast(ic3.keplerPeriod(k) / 2000.0);
-            const pair = ic3.kepler(k);
-            break :blk try gpa.dupe(ic3.Body3, &pair);
-        },
+    if (o.every_snap > 0 and o.out == null) return error.MissingValue;
+
+    var restart_io: ?*c.SDL_IOStream = null;
+    defer if (restart_io) |io| {
+        _ = c.SDL_CloseIO(io);
     };
+    var header: snap.Header = undefined;
+    var bodies: []ic3.Body3 = &.{};
     defer gpa.free(bodies);
-    const n: u32 = @intCast(bodies.len);
-    const box = ic3.fitBox(bodies, o.margin);
-    var s = Sim3.init(dev, .{ .n = n, .eps = o.eps, .dt = dt, .box = box, .boundary = o.boundary }) catch |err| {
+    var cfg: Config = undefined;
+    var dt = o.dt;
+    if (o.restart) |path| {
+        const io = try snap.open(path);
+        restart_io = io;
+        header = try snap.readHeader(io);
+        if (header.dim != 3) return error.BadHeader;
+        const b: Boundary = @fromBackingInt(@intCast(@backingInt(@as(snap.Boundary, @fromBackingInt(@intCast(header.boundary))))));
+        cfg = .{ .n = @intCast(header.n), .g = header.g, .eps = header.softening, .dt = header.dt, .box = .{ .size = header.box_size }, .boundary = b };
+        std.debug.print("restart from {s}: {d} bodies at tick {d}\n", .{ path, header.n, header.tick });
+    } else {
+        var prng = std.Random.DefaultPrng.init(o.seed);
+        bodies = switch (o.ic) {
+            .plummer => try ic3.plummer(gpa, prng.random(), o.n, .{}),
+            .uniform => try ic3.uniform(gpa, prng.random(), o.n, .{ .sigma = 0.3 }),
+            .kepler => blk: {
+                const k: ic3.Kepler = .{ .e = o.ecc };
+                dt = @floatCast(ic3.keplerPeriod(k) / 2000.0);
+                const pair = ic3.kepler(k);
+                break :blk try gpa.dupe(ic3.Body3, &pair);
+            },
+        };
+        cfg = .{ .n = @intCast(bodies.len), .eps = o.eps, .dt = dt, .box = ic3.fitBox(bodies, o.margin), .boundary = o.boundary };
+    }
+    const n = cfg.n;
+    var s = Sim3.init(dev, cfg) catch |err| {
         std.debug.print("sim3 init failed for n={d}: {s} ({s})\n", .{ n, @errorName(err), c.SDL_GetError() });
         return err;
     };
     defer s.deinit();
-    try s.upload(bodies);
-    std.debug.print("{s}: {d} bodies, box {d:.4} (quantum {e:.2}), eps {d}, dt {d}, {d} B/body\n", .{ @tagName(o.ic), n, box.size, box.size / 0x1p32, o.eps, dt, Sim3.bytesPerBody() });
+    if (restart_io) |io| try s.restore(gpa, io, &header) else try s.upload(bodies);
+    std.debug.print("{s}: {d} bodies, box {d:.4} (quantum {e:.2}), eps {d}, dt {d}, {d} B/body\n", .{ @tagName(o.ic), n, cfg.box.size, cfg.box.size / 0x1p32, cfg.eps, cfg.dt, Sim3.bytesPerBody() });
     if (o.bench) return bench(&s, o);
 
+    var sn: ?*snapper.Snapper = null;
+    if (o.every_snap > 0) {
+        _ = c.SDL_CreateDirectory(o.out.?.ptr);
+        sn = try s.snapshotter(gpa);
+    }
+    defer if (sn) |p| p.destroy(gpa);
     const d0 = try s.measure();
     std.debug.print("{s:>8} {s:>14} {s:>10} {s:>8} {s:>10} {s:>10} {s:>10} {s:>9}\n", .{ "tick", "E", "dE/E0", "2K/|W|", "|P|", "|L|", "dL/L0", "ms/tick" });
-    report(0, d0, d0, 0);
-    const end = o.ticks;
+    report(s.tick_no, d0, d0, 0);
+    const end = s.tick_no + o.ticks;
     var ms_acc: f64 = 0;
     var ticks_acc: u64 = 0;
     while (s.tick_no < end) {
-        const step = @min((s.tick_no / o.every + 1) * o.every, end) - s.tick_no;
+        const next_snap = if (o.every_snap == 0) std.math.maxInt(u64) else (s.tick_no / o.every_snap + 1) * o.every_snap;
+        const step = @min(@min((s.tick_no / o.every + 1) * o.every, next_snap), end) - s.tick_no;
         const t = c.SDL_GetPerformanceCounter();
         try s.run(step);
         ms_acc += sim.msSince(t);
@@ -519,6 +626,15 @@ pub fn main(gpa: std.mem.Allocator, args: []const [:0]const u8) !void {
             ms_acc = 0;
             ticks_acc = 0;
         }
+        if (sn) |p| if (s.tick_no % o.every_snap == 0) {
+            var buf: [1024]u8 = undefined;
+            try p.write(snap.pathZ(&buf, "{s}/snap_{d:0>8}.snap", .{ o.out.?, s.tick_no }), o.seed, @backingInt(o.ic));
+            if (p.writeFailed()) return error.SnapshotWrite;
+        };
+    }
+    if (sn) |p| {
+        p.flush();
+        if (p.writeFailed()) return error.SnapshotWrite;
     }
 }
 

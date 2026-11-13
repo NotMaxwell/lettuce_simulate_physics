@@ -12,7 +12,7 @@ pub const Plummer = struct {
     /// Scale radius and total mass, used when `henon` is false (G = 1).
     a: f64 = 1,
     mass: f64 = 1,
-    /// Radius cut in scale radii; the DF tail beyond holds ~1e-4 of the mass at 20.
+    /// Radius cut in scale radii; the mass beyond r = 20a is 3.7e-3.
     cut: f64 = 20,
 };
 
@@ -122,14 +122,14 @@ pub fn uniform(gpa: std.mem.Allocator, rng: std.Random, n: usize, o: Uniform) ![
     return out;
 }
 
-/// The u32 position frame: positions are fractions of a cube of side `size` centred (for an
-/// open boundary) on `centre`. An open domain is the middle half of that cube, so `size` is
-/// twice the domain side; see sim3.zig.
-pub const Box = struct { centre: [3]f64, size: f64 };
+/// The u32 position frame: world = (u / 2^32 - 0.5) * size, centred on the origin (the renderer's
+/// convention). An open domain is the middle half of that cube, so `size` is twice the domain side;
+/// see sim3.zig.
+pub const Box = struct { size: f64 };
 
-/// Open-boundary box around the bodies: the domain is the bounding cube grown by `margin`
-/// (>= 1), so bodies can spread before they reach the wall and are clamped.
-pub fn fitBox(bodies: []const Body3, margin: f64) Box {
+/// Open-boundary box around the bodies. Shifts them in place so the bounding cube is centred on
+/// the origin, then grows it by `margin` (>= 1) so bodies can spread before reaching the wall.
+pub fn fitBox(bodies: []Body3, margin: f64) Box {
     var lo: [3]f64 = @splat(std.math.inf(f64));
     var hi: [3]f64 = @splat(-std.math.inf(f64));
     for (bodies) |b| {
@@ -139,11 +139,13 @@ pub fn fitBox(bodies: []const Body3, margin: f64) Box {
             hi[k] = @max(hi[k], p[k]);
         }
     }
-    var centre: [3]f64 = undefined;
     var side: f64 = 0;
-    for (0..3) |k| {
-        centre[k] = 0.5 * (lo[k] + hi[k]);
-        side = @max(side, hi[k] - lo[k]);
+    for (0..3) |k| side = @max(side, hi[k] - lo[k]);
+    const mid = [3]f64{ 0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]), 0.5 * (lo[2] + hi[2]) };
+    for (bodies) |*b| {
+        b.x -= mid[0];
+        b.y -= mid[1];
+        b.z -= mid[2];
     }
-    return .{ .centre = centre, .size = 2 * side * margin };
+    return .{ .size = 2 * side * margin };
 }

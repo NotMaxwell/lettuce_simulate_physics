@@ -8,7 +8,7 @@
 - Reported: the window closes instantly during merging (user, windowed, release build). On the RX 7800 XT
   (RADV) every start crashed in `vkCreateComputePipelines` until fa8009a (invalid SPIR-V from
   `blockSum`), which may have been this. Needs a windowed retest on that machine.
-- Merges are capped at ~16k per tick by the event buffer (`max_events`).
+- Merge events: 32k per tick; pairs that don't fit merge next tick (game-fixes, 2026-11-13).
 - Zig's SPIR-V backend omits the `Block` decoration (VUID-04680); `src/tools/spirv_fixup.zig` patches
   it at build time (9d83558). Every shader passes `spirv-val --target-env vulkan1.2`
   (gravity_kernels fixed on the sim branch).
@@ -16,13 +16,21 @@
   line but exits 0: stderr from tests that print, not a failure. Check the exit code, not the text.
 
 ## Not yet ported to the GPU
-- Impact heat (the solver does not expose approach speed); ash-ash collisions.
-- Extra impulse on release after a grab; click pick/spawn arrives 2–3 ticks late.
-- HUD max level never decreases.
+- Done 2026-11-13: impact heat (estimate |dv|·7.5/mass in `finish`, both balls heated; Python heats only
+  the colder one, which differs only when one ball is already warm), ash-ash contacts, release
+  impulse after a grab, click pick/spawn in the same tick (`pickNow`, a waited submit on click),
+  HUD max level from a GPU reduction.
+- Ash neighbour cap (32) is order-dependent and the Jacobi push reads positions being written:
+  nondeterministic in dense ash piles, cosmetic.
+- `pickNow` stalls the GPU on the click frame (up to ~20 ms in 1M galaxy mode); not measured.
 
 ## Unverified
 - Windowed play with vsync, resize, high-DPI mouse scaling, and audio (all runs so far are headless).
-- `Sim.elastic = false` (retention-based ball restitution) at scale.
+- `Sim.elastic = false` (`--elastic off`) is stable but slow in settled piles: collide 103 ms at 100k
+  (0.30 with elastic on), 806 ms at 1M. Cause unconfirmed (crowded cells in deep piles?).
+- Kernels index buffer array fields with comptime 0 (`cand.v[0]`, `events.v[0]`, `out.v[0]`): the
+  pattern that crashed RADV for a shared array. spirv-val passes and it runs; convert to `x[l - l]` if
+  a driver ever complains.
 
 ## Galaxy mode (feature chain)
 Balls orbiting each other in open space and forming little systems. Gravity stays 2D (log potential:
