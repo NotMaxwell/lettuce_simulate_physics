@@ -83,6 +83,35 @@ pub fn build(b: *std.Build) void {
         b.step(b.fmt("test-{s}", .{tool.step}), b.fmt("Tests reachable from {s}", .{tool.root})).dependOn(&b.addRunArtifact(tool_tests).step);
     }
 
+    // Headless matter simulation (src/sim/): shares the gravity solver, none of the game state.
+    const galaxy_mod = b.createModule(.{ .root_source_file = b.path("src/galaxy.zig"), .target = target, .optimize = optimize });
+    const sim_mod = b.createModule(.{
+        .root_source_file = b.path("src/sim/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "c", .module = c_mod },
+            .{ .name = "gpu_layout", .module = layout_mod },
+            .{ .name = "galaxy", .module = galaxy_mod },
+            .{ .name = "gpu_sim", .module = gpu.sim },
+            .{ .name = "gravity", .module = gpu.gravity },
+        },
+    });
+    sim_mod.linkLibrary(sdl_lib);
+    const sim_layout = b.createModule(.{ .root_source_file = b.path("src/gpu_layout.zig") });
+    sim_mod.addAnonymousImport("sim_kernels.spv", .{ .root_source_file = spirvObject(b, "sim_kernels", b.path("src/sim/kernels.zig"), sim_layout, null) });
+    const sim_exe = b.addExecutable(.{ .name = "sim", .root_module = sim_mod });
+    b.installArtifact(sim_exe);
+    const sim_run = b.addRunArtifact(sim_exe);
+    sim_run.setCwd(b.path("."));
+    sim_run.addPassthruArgs();
+    setGpuEnv(b, sim_run);
+    b.step("sim", "Headless matter simulation (see src/sim/main.zig for flags)").dependOn(&sim_run.step);
+    const sim_test_run = b.addRunArtifact(b.addTest(.{ .root_module = sim_mod }));
+    setGpuEnv(b, sim_test_run);
+    test_step.dependOn(&sim_test_run.step);
+
     // SDL_GPU demo: shaders are Zig compiled to SPIR-V and embedded with @embedFile.
     const demo_mod = b.createModule(.{
         .root_source_file = b.path("src/gfx_demo.zig"),

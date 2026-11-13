@@ -1,0 +1,29 @@
+//! Constants and layouts shared by the sim kernels (kernels.zig) and host (sim.zig).
+//! Kernel modules see only their own directory, so this file sits next to them.
+const L = @import("gpu_layout");
+
+/// Bodies one thread covers in diagPartial.
+pub const diag_per_thread: u32 = 16;
+/// Floats per workgroup in the diagnostics partials: kinetic energy, px, py, angular momentum, mass, 3 spare.
+pub const diag_stride: u32 = 8;
+/// Workgroups per row of a 2D dispatch (see gpu_sim/gravity_shared.zig dispatch_x).
+pub const dispatch_x: u32 = 32768;
+/// Threads the potential pass aims for, so a few thousand sampled bodies still fill the GPU.
+pub const potential_threads: u32 = 131072;
+
+pub const Params = extern struct {
+    n: u32,
+    /// Potential pass: sampled bodies are offset + s * stride for s < samples.
+    samples: u32,
+    stride: u32,
+    offset: u32,
+    /// Potential pass: each sampled body's pair sum over all n is split into `chunks` slices of this length.
+    chunks: u32,
+    chunk_len: u32,
+    dt: f32,
+    softening: f32,
+};
+
+/// Lean body layout the sim needs: position, velocity, mass (in `L.BallBody.mass` for now, because
+/// the shared gravity kernels read the mass from there).
+pub const bytes_per_body_state = @sizeOf(L.Vec2) * 2 + @sizeOf(L.BallBody);

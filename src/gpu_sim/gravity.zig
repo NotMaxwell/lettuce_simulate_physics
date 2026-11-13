@@ -21,7 +21,7 @@ pub const Balls = struct {
     vel: *c.SDL_GPUBuffer,
 };
 
-const Kernel = enum { clearCounts, binBalls, scanBlocks, scanTotals, scatterBalls, leafMultipoles, upwardPass, downwardPass, evaluate };
+const Kernel = enum { boundsPartial, boundsFinal, clearCounts, binBalls, scanBlocks, scanTotals, scatterBalls, leafMultipoles, upwardPass, downwardPass, evaluate };
 const n_kernels = @typeInfo(Kernel).@"enum".field_names.len;
 
 /// Average balls per occupied leaf cell the leaf level aims for. Lower means more M2L work,
@@ -31,9 +31,17 @@ pub const target_per_leaf: f32 = 8;
 /// Default softening eps^2 (world units^2) for `apply`; the game uses it outside galaxy mode.
 pub const default_softening: f32 = K.softening;
 
+/// Largest body count: the `sorted` buffer (16 B per body) must stay under SDL_GPU's 4 GiB buffer size.
+pub const max_capacity: u32 = 0x0FFF_FFFF;
+
+/// Solver scratch per body (keys + cell-sorted copy), on top of the caller's pos/body/vel.
+pub const scratch_bytes_per_body: u32 = @sizeOf(K.Key) + @sizeOf(K.Sorted);
+
 pub const Gravity = struct {
     device: *c.SDL_GPUDevice,
     capacity: u32,
+    /// Word index of the GPU-computed tree box in `cells` (the last three words, plus one spare).
+    box_word: u32,
     max_leaf_level: u32,
     pipes: [n_kernels]*c.SDL_GPUComputePipeline,
     cells: *c.SDL_GPUBuffer,
@@ -47,7 +55,7 @@ pub const Gravity = struct {
     pub fn init(device: *c.SDL_GPUDevice, capacity: u32) Error!Gravity {
         var g: Gravity = undefined;
         g.device = device;
-        g.capacity = @min(capacity, L.max_balls);
+        g.capacity = @min(capacity, max_capacity);
         g.max_leaf_level = @min(K.max_level, leafLevelFor(g.capacity, 1.0, K.max_level) + 1);
         g.last_leaf_level = 0;
         const names = @typeInfo(Kernel).@"enum".field_names;
@@ -72,7 +80,8 @@ pub const Gravity = struct {
         for (&g.pipes, made) |*p, m| p.* = m.?;
         const leaf_cells = @as(u32, 1) << @intCast(2 * g.max_leaf_level);
         const pyramid = K.levelOffset(g.max_leaf_level + 1);
-        g.cells = try makeBuffer(device, K.cellsWords(leaf_cells) * 4);
+        g.box_word = K.cellsWords(leaf_cells);
+        g.cells = try makeBuffer(device, (g.box_word + 4) * 4);
         errdefer c.SDL_ReleaseGPUBuffer(device, g.cells);
         g.keys = try makeBuffer(device, g.capacity * @sizeOf(K.Key));
         errdefer c.SDL_ReleaseGPUBuffer(device, g.keys);
@@ -92,24 +101,41 @@ pub const Gravity = struct {
     /// Records the gravity passes into `cmd`: vel += g_scale * a for the first params.ball_count
     /// balls. `softening` is eps^2 in world units^2 (see gravity_shared.softening for the default).
     pub fn apply(g: *Gravity, cmd: *c.SDL_GPUCommandBuffer, params: L.SimParams, balls: Balls, g_scale: f32, softening: f32) void {
-        const n = @min(params.ball_count, g.capacity);
-        if (n < 2) return;
         const w = params.bounds_max_x - params.bounds_min_x;
         const h = params.bounds_max_y - params.bounds_min_y;
         const size = @max(w, h, 1.0);
         // The tree is square over the bounds; only the w*h part of it holds balls.
         const fill = @max(w, 1.0) * @max(h, 1.0) / (size * size);
+        g.record(cmd, params.ball_count, fill, .{ params.bounds_min_x, params.bounds_min_y, size }, K.no_box, balls, g_scale, softening, false);
+    }
+
+    /// Like `apply`, but the tree box is recomputed on the GPU from the bodies' bounding box (two
+    /// small reduction passes, no readback), so bodies may roam anywhere. Assumes the bodies fill
+    /// the box (fill = 1) when picking the leaf level.
+    pub fn applyAutoBox(g: *Gravity, cmd: *c.SDL_GPUCommandBuffer, n: u32, balls: Balls, g_scale: f32, softening: f32) void {
+        g.record(cmd, n, 1.0, .{ 0, 0, 1 }, g.box_word, balls, g_scale, softening, false);
+    }
+
+    /// Records only the box reduction of `applyAutoBox` (for timing it).
+    pub fn recordBoxOnly(g: *Gravity, cmd: *c.SDL_GPUCommandBuffer, n: u32, balls: Balls) void {
+        g.record(cmd, n, 1.0, .{ 0, 0, 1 }, g.box_word, balls, 0, 0, true);
+    }
+
+    fn record(g: *Gravity, cmd: *c.SDL_GPUCommandBuffer, count: u32, fill: f32, box: [3]f32, box_word: u32, balls: Balls, g_scale: f32, softening: f32, box_only: bool) void {
+        const n = @min(count, g.capacity);
+        if (n < 2) return;
         const leaf = leafLevelFor(n, fill, g.max_leaf_level);
         g.last_leaf_level = leaf;
         var kp: K.Params = .{
             .n = n,
             .leaf_level = leaf,
             .level = 0,
-            .origin_x = params.bounds_min_x,
-            .origin_y = params.bounds_min_y,
-            .root_size = size,
+            .origin_x = box[0],
+            .origin_y = box[1],
+            .root_size = box[2],
             .g_scale = g_scale,
             .softening = softening,
+            .box_word = box_word,
         };
         const leaf_cells = @as(u32, 1) << @intCast(2 * leaf);
         const ro = [_]*c.SDL_GPUBuffer{ balls.pos, balls.body };
@@ -127,10 +153,16 @@ pub const Gravity = struct {
                 const cp = c.SDL_BeginGPUComputePass(cb, null, 0, b.ptr, @intCast(b.len));
                 c.SDL_BindGPUComputePipeline(cp, gg.pipes[@backingInt(k)]);
                 c.SDL_BindGPUComputeStorageBuffers(cp, 0, @ptrCast(r.ptr), @intCast(r.len));
-                c.SDL_DispatchGPUCompute(cp, (threads + L.group_size - 1) / L.group_size, 1, 1);
+                const groups = (threads + L.group_size - 1) / L.group_size;
+                c.SDL_DispatchGPUCompute(cp, @min(groups, K.dispatch_x), (groups + K.dispatch_x - 1) / K.dispatch_x, 1);
                 c.SDL_EndGPUComputePass(cp);
             }
         }.run;
+        if (box_word != K.no_box) {
+            pass(g, cmd, .boundsPartial, &kp, &ro, &rw, (n + K.bounds_per_thread - 1) / K.bounds_per_thread);
+            pass(g, cmd, .boundsFinal, &kp, &ro, &rw, L.group_size);
+        }
+        if (box_only) return;
         pass(g, cmd, .clearCounts, &kp, &ro, &rw, leaf_cells);
         pass(g, cmd, .binBalls, &kp, &ro, &rw, n);
         pass(g, cmd, .scanBlocks, &kp, &ro, &rw, (leaf_cells + K.scan_block - 1) / K.scan_block * L.group_size);

@@ -8,7 +8,7 @@ pub const scan_block: u32 = 1024; // cells per workgroup in scanBlocks (4 per th
 /// Default eps^2 (physics.zig GravityJob eps); the caller passes the real value in Params.softening.
 pub const softening: f32 = 0.001;
 pub const min_level: u32 = 2;
-pub const max_level: u32 = 10;
+pub const max_level: u32 = 12;
 
 pub const Params = extern struct {
     n: u32,
@@ -23,7 +23,20 @@ pub const Params = extern struct {
     origin_y: f32,
     root_size: f32,
     g_scale: f32,
+    /// Word index in `cells` of a GPU-computed tree box [origin_x, origin_y, root_size] (f32 bits),
+    /// or no_box to use origin_x/origin_y/root_size above.
+    box_word: u32 = no_box,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
 };
+
+pub const no_box: u32 = 0xFFFF_FFFF;
+/// Bodies one thread covers in boundsPartial.
+pub const bounds_per_thread: u32 = 16;
+/// Workgroups per row of a 2D dispatch: x is capped (65535 on some drivers), so passes over more
+/// than dispatch_x * group_size threads spill into y. Kernels recover the flat id from both.
+pub const dispatch_x: u32 = 32768;
 
 pub const Key = extern struct { cell: u32, rank: u32 };
 pub const Sorted = extern struct { x: f32, y: f32, m: f32, id: u32 };
