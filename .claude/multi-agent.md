@@ -10,9 +10,8 @@ commands, the file-ownership map and anything repo-specific. Agent definitions l
   commits. The lead writes no code (user rule, 2026-11-12): code changes, including small fixes
   and changes to lead-owned contract files, are specified by the lead and written by an agent;
   review is a separate agent. The lead edits only docs (CLAUDE.md, TODO.md, .claude/).
-- **Container agents** are the default workers: headless `claude -p` sessions, one per git
-  worktree, each in its own dev container (recipe in CLAUDE.md). In-session subagents are for
-  read-only work (Explore, verifier) or when containers are unavailable.
+- **Subagents run on the host** (user rule, 2026-11-13: not inside the dev container). Writing
+  agents get their own manually created git worktree; reviewers read the branch diff.
 - **Subagents** each own one file set and get a way to verify alone. No two agents edit the same
   file at the same time.
 
