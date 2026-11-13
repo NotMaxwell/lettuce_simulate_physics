@@ -142,8 +142,9 @@ pub const Gravity = struct {
     /// about `pair_budget / n` sampled bodies, with the zero of the potential at distance `ref_len` (all of them when that covers n).
     pub fn recordDiagnostics(g: *Gravity, cmd: *c.SDL_GPUCommandBuffer, n_in: u32, balls: Balls, softening: f32, ref_len: f32, pair_budget: u32) void {
         const n = @min(n_in, g.capacity);
+        g.last_samples = 1;
         if (n < 2) return;
-        const samples = @min(n, @max(256, pair_budget / n));
+        const samples = @min(n, @max(64, pair_budget / n));
         // The partials live in `local`, which must be big enough for them.
         const diag_groups = (n + K.diag_per_thread * L.group_size - 1) / (K.diag_per_thread * L.group_size);
         const room = (g.local_slots - 2 * diag_groups) * L.group_size;

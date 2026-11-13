@@ -472,7 +472,9 @@ export fn boundsPartial() callconv(kernel_cc) void {
         if (i < params.n and body.v[i].mass != 0) {
             var x = pos.v[i].x;
             var y = pos.v[i].y;
-            if (params.clamp_window != 0) {
+            // NaN fails both comparisons below and must not reach the box, so the window clamp
+            // (which would map it to an edge) is skipped for it.
+            if (params.clamp_window != 0 and x == x and y == y) {
                 x = @min(@max(x, params.origin_x), params.origin_x + params.root_size);
                 y = @min(@max(y, params.origin_y), params.origin_y + params.root_size);
             }

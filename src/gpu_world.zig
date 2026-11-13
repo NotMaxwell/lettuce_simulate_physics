@@ -795,7 +795,7 @@ pub const GpuWorld = struct {
         std.debug.assert(slot.fence == null);
 
         // Stage uploads: spawns (into free slots first, then the tail), lasso polygon, blasts.
-        const up: [*]u8 = @ptrCast(c.SDL_MapGPUTransferBuffer(gw.dev, gw.upload_tb, true) orelse return error.GpuSetupFailed);
+        const up: [*]u8 = @ptrCast(c.SDL_MapGPUTransferBuffer(gw.dev, gw.upload_tb, true) orelse return gpuFail("SDL_MapGPUTransferBuffer (upload)"));
         const recs: [*]SpawnRec = @ptrCast(@alignCast(up));
         var n_spawn: u32 = 0;
         while (n_spawn < spawn_batch and gw.pending_head < gw.pending.items.len) {
@@ -849,7 +849,7 @@ pub const GpuWorld = struct {
 
         var timer = Timer{ .on = sample, .dev = gw.dev };
         if (sample) _ = c.SDL_WaitForGPUIdle(gw.dev);
-        var cmd = c.SDL_AcquireGPUCommandBuffer(gw.dev) orelse return error.GpuSetupFailed;
+        var cmd = c.SDL_AcquireGPUCommandBuffer(gw.dev) orelse return gpuFail("SDL_AcquireGPUCommandBuffer");
         timer.start();
 
         if (n_spawn > 0 or n_poly > 0 or n_blast > 0) {
@@ -941,13 +941,13 @@ pub const GpuWorld = struct {
             gw.recordFire(cmd, &gp, b, sp, groups);
             if (gw.fire_wake > 0) gw.fire_wake -= 1;
         }
-        const want_diag = gw.galaxy_on and in.mutual_gravity and gw.pending_head >= gw.pending.items.len and (gw.diag_now or gw.tick_no % diag_every_ticks == 0);
+        const want_diag = gw.galaxy_on and in.mutual_gravity and gw.count >= 2 and gw.pending_head >= gw.pending.items.len and (gw.diag_now or gw.tick_no % diag_every_ticks == 0);
         if (want_diag) {
             gw.diag_now = false;
             gw.grav.recordDiagnostics(cmd, gw.count, .{ .pos = gw.sim.pos, .body = gw.sim.body, .vel = gw.sim.vel }, galaxy_softening, gw.galaxy_extent, diag_pair_budget);
             slot.diag_epoch = gw.energy_epoch;
             slot.diag_g = gw.galaxyG();
-            slot.diag_weight = @as(f64, @floatFromInt(gw.count)) / @as(f64, @floatFromInt(gw.grav.last_samples));
+            slot.diag_weight = @as(f64, @floatFromInt(@min(gw.count, gw.grav.capacity))) / @as(f64, @floatFromInt(gw.grav.last_samples));
         }
         const cp = c.SDL_BeginGPUCopyPass(cmd);
         if (want_diag) gw.grav.downloadDiag(cp.?, slot.tb, diag_offset);
@@ -955,7 +955,7 @@ pub const GpuWorld = struct {
         c.SDL_DownloadFromGPUBuffer(cp, &.{ .buffer = gw.pick_buf, .size = 16 }, &.{ .transfer_buffer = slot.tb, .offset = out_bytes });
         c.SDL_DownloadFromGPUBuffer(cp, &.{ .buffer = gw.fx, .size = fx_bytes }, &.{ .transfer_buffer = slot.tb, .offset = out_bytes + 16 });
         c.SDL_EndGPUCopyPass(cp);
-        slot.fence = c.SDL_SubmitGPUCommandBufferAndAcquireFence(cmd) orelse return error.GpuSetupFailed;
+        slot.fence = c.SDL_SubmitGPUCommandBufferAndAcquireFence(cmd) orelse return gpuFail("SDL_SubmitGPUCommandBufferAndAcquireFence");
         if (sample) {
             _ = c.SDL_WaitForGPUFences(gw.dev, true, &slot.fence.?, 1);
             gw.profile.game_ms = timer.since();
@@ -1085,17 +1085,22 @@ const Timer = struct {
 
     fn lap(tm: *Timer, cmd: *c.SDL_GPUCommandBuffer, out: *f32) !*c.SDL_GPUCommandBuffer {
         if (!tm.on) return cmd;
-        gs.submitWait(tm.dev, cmd) catch return error.GpuSetupFailed;
+        gs.submitWait(tm.dev, cmd) catch return gpuFail("submitWait (timing lap)");
         const now = c.SDL_GetPerformanceCounter();
         out.* = msBetween(tm.t, now);
         tm.t = now;
-        return c.SDL_AcquireGPUCommandBuffer(tm.dev) orelse error.GpuSetupFailed;
+        return c.SDL_AcquireGPUCommandBuffer(tm.dev) orelse gpuFail("SDL_AcquireGPUCommandBuffer (timing lap)");
     }
 
     fn since(tm: *Timer) f32 {
         return msBetween(tm.t, c.SDL_GetPerformanceCounter());
     }
 };
+
+fn gpuFail(what: []const u8) error{GpuSetupFailed} {
+    std.log.err("gpu_world: {s} failed: {s}", .{ what, c.SDL_GetError() });
+    return error.GpuSetupFailed;
+}
 
 fn msBetween(a: u64, b: u64) f32 {
     return @floatCast(@as(f64, @floatFromInt(b - a)) * 1000.0 / @as(f64, @floatFromInt(c.SDL_GetPerformanceFrequency())));
