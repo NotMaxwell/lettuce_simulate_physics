@@ -160,7 +160,8 @@ inline fn resolve(A: *Ball, B: *Ball, first: bool) void {
         // merge from this event in the same tick.
         if (first) {
             const slot = c.atomicAdd(&events.v[0].kind, 1);
-            if (slot < L.max_events - 1) {
+            const cap = if (c.params.event_cap != 0) @min(c.params.event_cap, L.max_events - 1) else L.max_events - 1;
+            if (slot < cap) {
                 events.v[slot + 1] = .{ .kind = L.event_merge, .a = A.id, .b = B.id, .value = dist };
             } else {
                 _ = c.atomicAdd(&events.v[0].a, 1);

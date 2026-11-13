@@ -47,7 +47,8 @@ pub const GameParams = extern struct {
     fx_flags: u32,
     /// 1 = accrete: the merge kernel merges any touching pair, summing mass (L.CollideMode).
     collide: u32 = 0,
-    _pad1: u32 = 0,
+    /// gpu_layout SimParams.event_cap (0 = full), so merge reads the candidate list as it was written.
+    event_cap: u32 = 0,
     _pad2: u32 = 0,
     _pad3: u32 = 0,
     _pad4: u32 = 0,

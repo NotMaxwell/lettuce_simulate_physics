@@ -44,7 +44,7 @@ const GameParams = extern struct {
     fx_flags: u32 = 0,
     /// 1 = accrete (gpu_game/common.zig GameParams.collide).
     collide: u32 = 0,
-    _pad1: u32 = 0,
+    event_cap: u32 = 0,
     _pad2: u32 = 0,
     _pad3: u32 = 0,
     _pad4: u32 = 0,
@@ -126,9 +126,11 @@ comptime {
 pub const spawn_batch: u32 = 1 << 16;
 const max_poly: u32 = 4096;
 const max_blasts: u32 = 256;
-/// Game events per tick. Merges are bounded by gpu_sim's candidate list (max_events - 1); a
-/// state change that finds the list full is skipped, never lost, so the CPU mirror stays exact.
-const out_cap: u32 = 1 << 15;
+/// Game events per tick; the whole list is read back every tick (out_bytes). Merges are
+/// bounded by gpu_sim's candidate list (max_events - 1); a state change that finds the list full is
+/// skipped, never lost, so the CPU mirror stays exact: merging pairs keep overlapping and are
+/// found again next tick.
+const out_cap: u32 = L.max_events;
 const ring = 3;
 const out_bytes: u32 = (out_cap + 1) * @sizeOf(L.Event);
 const fx_bytes: u32 = fx_slots * 4;
@@ -785,6 +787,7 @@ pub const GpuWorld = struct {
             .mouse_x = in.mouse.x,
             .mouse_y = in.mouse.y,
             .attraction_strength = cfg.attraction_strength,
+            .event_cap = gw.sim.event_cap,
         };
         gw.sim.prepare(&p);
         return p;
@@ -873,6 +876,7 @@ pub const GpuWorld = struct {
             .hoop_left = b.x + cfg.hoop_left * hoop_scale,
             .hoop_right = b.x + cfg.hoop_right * hoop_scale,
             .collide = @intFromBool(in.collide == .accrete),
+            .event_cap = gw.sim.event_cap,
         };
         const groups = divCeil(@max(gw.count, 1), L.group_size);
 
@@ -1471,4 +1475,81 @@ test "gpu world: a body outside the gravity box does not corrupt the others" {
     try std.testing.expect(clamp_diff < 1e-4);
     try std.testing.expect(std.math.isFinite(e.x) and std.math.isFinite(e.y));
     try std.testing.expect(e.x < 0 and e.y < 0);
+}
+
+const PairRun = struct { ticks: u32, merges: u32, max_per_tick: u32, alive: u32, mass_ok: bool };
+
+/// `n` isolated touching pairs of unit-mass bodies in accrete mode on a lattice that leaves the
+/// pairs out of each other's reach; ticks until every pair has merged (at most `limit`).
+fn pairMergeRun(gpa: std.mem.Allocator, dev: *c.SDL_GPUDevice, n: u32, event_cap: u32, limit: u32) !PairRun {
+    var gw = try GpuWorld.init(gpa, dev);
+    defer gw.deinit();
+    gw.profile_every = 0;
+    gw.sim.event_cap = event_cap;
+    var w = world.World.init(gpa, 31);
+    defer w.deinit();
+    try gw.loadGalaxy(&w, .disk, 2);
+    gw.clearBalls(&w);
+    const side: u32 = @intFromFloat(@ceil(@sqrt(@as(f32, @floatFromInt(n)))));
+    const spacing: f32 = 40;
+    const size = spacing * @as(f32, @floatFromInt(side + 2));
+    w.bounds = .{ .x = 0, .y = 0, .w = size, .h = size };
+    w.prev_bounds = w.bounds;
+    gw.galaxy_centre = .{ .x = size / 2, .y = size / 2 };
+    gw.galaxy_extent = size / (2 * galaxy_tree_reach);
+    for (0..n) |k| {
+        const x = spacing * (1 + @as(f32, @floatFromInt(k % side)));
+        const y = spacing * (1 + @as(f32, @floatFromInt(k / side)));
+        for ([_]f32{ 0, 5 }) |dx| try gw.queueBody(&w, x + dx, y, galaxy.toNewBall(.{ .x = 0, .y = 0, .vx = 0, .vy = 0, .mass = 1, .radius = 3 }));
+    }
+    var run: PairRun = .{ .ticks = 0, .merges = 0, .max_per_tick = 0, .alive = 0, .mass_ok = false };
+    var last: u32 = 0;
+    while (run.ticks < limit) {
+        gw.tick(&w, .{ .collide = .accrete });
+        run.ticks += 1;
+        run.merges += w.events.merges;
+        run.max_per_tick = @max(run.max_per_tick, w.events.merges);
+        last = w.events.merges;
+        if (run.merges >= n) break;
+    }
+    gw.drain(&w);
+    run.merges += w.events.merges - last;
+    run.alive = gw.alive;
+    const d = try GalaxyDump.read(gpa, &gw);
+    defer d.free(gpa);
+    var live: u32 = 0;
+    var mass_ok = true;
+    for (d.body, d.meta) |b, mt| if (mt & L.flag_alive != 0) {
+        live += 1;
+        // A double merge would leave a mass-3 or mass-4 body (or a dead one still counted).
+        if (b.mass != 2) mass_ok = false;
+    };
+    run.mass_ok = mass_ok and live == gw.alive;
+    return run;
+}
+
+test "gpu world: more merge candidates than one tick can hold carry over without loss or double merges" {
+    _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SkipZigTest;
+    defer c.SDL_Quit();
+    const gfx = @import("gfx.zig");
+    var gpu = gfx.Gfx.init(.{ .window = null }) catch return error.SkipZigTest;
+    defer gpu.deinit();
+    const gpa = std.testing.allocator;
+
+    // 40000 candidates arrive over two ticks (spawn batches), the first with 32768: more than the list holds.
+    const all = try pairMergeRun(gpa, gpu.dev, 40_000, 0, 20);
+    std.debug.print("merge candidates 40000: {d} ticks, {d} merges (max {d} in one tick), alive {d}\n", .{ all.ticks, all.merges, all.max_per_tick, all.alive });
+    try std.testing.expectEqual(@as(u32, 40_000), all.merges);
+    try std.testing.expectEqual(@as(u32, 40_000), all.alive);
+    try std.testing.expect(all.mass_ok);
+
+    // A list of 1500 candidates against 6000 pairs: the rest wait for later ticks.
+    const capped = try pairMergeRun(gpa, gpu.dev, 6000, 1500, 60);
+    std.debug.print("merge candidates 6000, cap 1500: {d} ticks, {d} merges (max {d} in one tick), alive {d}\n", .{ capped.ticks, capped.merges, capped.max_per_tick, capped.alive });
+    try std.testing.expectEqual(@as(u32, 6000), capped.merges);
+    try std.testing.expectEqual(@as(u32, 6000), capped.alive);
+    try std.testing.expect(capped.max_per_tick <= 1500);
+    try std.testing.expect(capped.ticks >= 4);
+    try std.testing.expect(capped.mass_ok);
 }

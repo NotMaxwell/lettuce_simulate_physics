@@ -34,7 +34,8 @@ inline fn reserve() ?u32 {
 /// claimed by a pair that then lost its partner simply waits a tick).
 export fn merge() callconv(c.kernel_cc) void {
     const k = c.gid();
-    const count = @min(cand.v[0].kind, L.max_events - 1);
+    const cap = if (c.params.event_cap != 0) @min(c.params.event_cap, L.max_events - 1) else L.max_events - 1;
+    const count = @min(cand.v[0].kind, cap);
     if (k >= count) return;
     const e = cand.v[k + 1];
     if (e.kind != L.event_merge) return;

@@ -62,6 +62,8 @@ pub const Sim = struct {
     /// Approach speeds (px/tick) at or below this resolve as resting contacts (inelastic, only
     /// when elastic = false).
     rest_speed: f32 = 2,
+    /// Test hook, see SimParams.event_cap.
+    event_cap: u32 = 0,
 
     // Ball buffers, ball-id order (gpu_layout contract). Renderers may bind these read-only.
     pos: Buffer,
@@ -96,6 +98,7 @@ pub const Sim = struct {
         s.elastic = true;
         s.iterations = 1;
         s.rest_speed = 2;
+        s.event_cap = 0;
         const n = capacity;
         // +2: the dead-ball cell and the end sentinel of the last real cell's row range.
         const ncount = cell_capacity + 2;
