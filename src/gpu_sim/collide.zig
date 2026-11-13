@@ -433,33 +433,26 @@ pub const Sim = struct {
     }
 };
 
-/// Creates the pipelines on one thread each. Drivers translate SPIR-V at pipeline creation
-/// (dozen: to DXIL, 20-50 ms each), so creating ~40 serially dominated startup. SDL's Vulkan
-/// backend locks its shared layout cache and vkCreateComputePipelines is thread-safe.
+/// Creates the pipelines one after another. The thread-per-pipeline version (6410365) was
+/// dropped while chasing a RADV startup crash that turned out to be invalid SPIR-V (see
+/// gpu_game/common.zig blockSum); serial startup on RADV measured 370 ms warm / 560 ms cold
+/// cache, so the threads were not brought back.
 /// Returns false (after releasing any that were made) if one failed.
 pub fn createComputePipelines(
     dev: *c.SDL_GPUDevice,
     infos: []const c.SDL_GPUComputePipelineCreateInfo,
     out: []?*c.SDL_GPUComputePipeline,
 ) bool {
-    const Job = struct {
-        fn run(d: *c.SDL_GPUDevice, info: *const c.SDL_GPUComputePipelineCreateInfo, o: *?*c.SDL_GPUComputePipeline) void {
-            o.* = c.SDL_CreateGPUComputePipeline(d, info);
-            // SDL_GetError is per thread, so report here.
-            if (o.* == null) std.log.err("compute pipeline {s}: {s}", .{ info.entrypoint, c.SDL_GetError() });
+    std.debug.assert(out.len == infos.len);
+    @memset(out, null);
+    for (infos, out) |*info, *o| {
+        o.* = c.SDL_CreateGPUComputePipeline(dev, info);
+        if (o.* == null) {
+            std.log.err("compute pipeline {s}: {s}", .{ info.entrypoint, c.SDL_GetError() });
+            for (out) |q| if (q) |pp| c.SDL_ReleaseGPUComputePipeline(dev, pp);
+            return false;
         }
-    };
-    var threads: [64]?std.Thread = @splat(null);
-    std.debug.assert(infos.len <= threads.len and out.len == infos.len);
-    for (infos, out, threads[0..infos.len]) |*info, *o, *t| {
-        t.* = std.Thread.spawn(.{}, Job.run, .{ dev, info, o }) catch null;
-        if (t.* == null) Job.run(dev, info, o);
     }
-    for (threads[0..infos.len]) |t| if (t) |th| th.join();
-    for (out) |p| if (p == null) {
-        for (out) |q| if (q) |pp| c.SDL_ReleaseGPUComputePipeline(dev, pp);
-        return false;
-    };
     return true;
 }
 

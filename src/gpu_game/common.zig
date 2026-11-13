@@ -159,7 +159,10 @@ pub inline fn blockSum(v: u32) u32 {
         if (l < s) red[l] += red[l + s];
         spirv.workgroupBarrier();
     }
-    const total = red[0];
+    // Not `red[0]`: Zig's SPIR-V backend emits a comptime index 0 into a shared array as an
+    // access chain typed as the whole array (invalid SPIR-V), which segfaults RADV's
+    // vkCreateComputePipelines. A runtime index (always 0 here) emits a correct chain.
+    const total = red[l - l];
     spirv.workgroupBarrier();
     return total;
 }
