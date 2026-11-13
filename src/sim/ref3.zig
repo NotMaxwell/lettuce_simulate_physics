@@ -223,7 +223,9 @@ pub const Tree = struct {
             st.visits += 1;
             const r = [3]f64{ tp[0] - phys(n.com.x, t.box), tp[1] - phys(n.com.y, t.box), tp[2] - phys(n.com.z, t.box) };
             const r2 = r[0] * r[0] + r[1] * r[1] + r[2] * r[2];
-            if (r2 > n.open_r2) {
+            // Leaves are always summed directly (softened, exact); a cell is never used inside 40 softening
+            // lengths, where its unsoftened field would differ from the softened pair sum by more than 1e-3.
+            if (!isLeaf(n) and r2 > n.open_r2 and r2 > 1600 * eps2) {
                 st.cells += 1;
                 cellAccel(&acc, r, r2, n.mass, t.quads[idx]);
                 idx = n.skip;
@@ -324,6 +326,8 @@ inline fn karrasDelta(keys: []const u64, i: i64, j: i64) i32 {
 
 /// Builds the tree. `pos` and `mass` are in input order; `Tree.perm` maps the sorted order back.
 pub fn build(gpa: std.mem.Allocator, pos: []const Pos3, mass: []const f32, p: Params) !Tree {
+    // Above 2/sqrt(3) a cell containing the target can pass the opening test.
+    std.debug.assert(p.theta < 1.1547);
     std.debug.assert(pos.len == mass.len and pos.len > 0 and pos.len < leaf_flag);
     const n = pos.len;
     const sorted = try sortKeys(gpa, pos);
@@ -562,9 +566,10 @@ pub fn forceError(gpa: std.mem.Allocator, t: Tree, cloud_pos: []const Pos3, clou
     const errs = try gpa.alloc(f64, targets);
     defer gpa.free(errs);
     var st: Stats = .{};
+    var rng = std.Random.DefaultPrng.init(99);
     var sum2: f64 = 0;
-    for (errs, 0..) |*e, k| {
-        const i = k * (n / targets);
+    for (errs) |*e| {
+        const i = rng.random().uintLessThan(usize, n);
         const ex = directAt(cloud_pos, cloud_mass, t.box, cloud_pos[i], i, 1, test_eps);
         const ap = t.walk(cloud_pos[i], inv[i], 1, test_eps, &st);
         var d2: f64 = 0;
@@ -621,6 +626,7 @@ test "ref3: 10k Plummer force error, tree shape and invariants" {
             c.theta, e.rms, e.p99, @as(f64, @floatFromInt(t.nodes.len)) / n, e.visits, e.cells, e.pairs,
         });
         try testing.expect(e.rms <= c.rms_max);
+        if (c.theta == 0.6) try testing.expect(e.p99 <= 5e-3);
         try testing.expect(@as(f64, @floatFromInt(t.nodes.len)) / n <= 0.12);
         try testing.expectApproxEqRel(total, t.nodes[0].mass, 1e-6);
         try testing.expectEqual(@as(u32, n), nodeCount(t.nodes[0]));
@@ -724,4 +730,44 @@ test "ref3: prefix-cell criterion also meets the error targets" {
     defer t.deinit(gpa);
     const e = try forceError(gpa, t, cloud.pos, cloud.mass, 1000);
     try testing.expect(e.rms <= 1e-3);
+}
+
+test "ref3: two tight clumps a few softening lengths apart match direct sum" {
+    const gpa = testing.allocator;
+    const eps = 1e-4;
+    const per = 400;
+    var pos: [2 * per]Pos3 = undefined;
+    var mass: [2 * per]f32 = undefined;
+    var prng = std.Random.DefaultPrng.init(5);
+    const r = prng.random();
+    for (&pos, &mass, 0..) |*p, *m, i| {
+        const cx: f64 = if (i < per) 0.3 else 0.3 + 3 * eps;
+        const q = struct {
+            fn f(c: f64, j: f64) u32 {
+                return @intFromFloat((c + (j - 0.5) * 2e-5) * 4294967296.0);
+            }
+        }.f;
+        p.* = .{ .x = q(cx, r.float(f64)), .y = q(0.5, r.float(f64)), .z = q(0.5, r.float(f64)) };
+        m.* = 1;
+    }
+    const t = try build(gpa, &pos, &mass, .{ .box = 1, .theta = 0.6 });
+    defer t.deinit(gpa);
+    const inv = try gpa.alloc(u32, pos.len);
+    defer gpa.free(inv);
+    for (t.perm, 0..) |o, s| inv[o] = @intCast(s);
+    for (pos, 0..) |p, i| {
+        const ex = directAt(&pos, &mass, 1, p, i, 1, eps);
+        const ap = t.walk(p, inv[i], 1, eps, null);
+        var d2: f64 = 0;
+        var e2: f64 = 0;
+        for (0..3) |k| {
+            d2 += (ap.a[k] - ex.a[k]) * (ap.a[k] - ex.a[k]);
+            e2 += ex.a[k] * ex.a[k];
+        }
+        try testing.expect(@sqrt(d2 / e2) < 1e-3);
+    }
+}
+
+test {
+    _ = plummer;
 }
