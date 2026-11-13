@@ -5,6 +5,7 @@ const sim = @import("sim.zig");
 const snap = @import("snapshot.zig");
 const snapper = @import("snapper.zig");
 test { _ = @import("ref3.zig"); }
+test { _ = @import("walk3_tests.zig"); }
 const render = @import("render.zig");
 comptime { _ = @import("snap_tests.zig"); }
 comptime { _ = @import("sort3_tests.zig"); }
