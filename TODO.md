@@ -13,11 +13,14 @@
   `blockSum`), which may have been this. Needs a windowed retest on that machine.
 - Merges are capped at ~16k per tick by the event buffer (`max_events`).
 - Zig's SPIR-V backend omits the `Block` decoration (VUID-04680); `src/tools/spirv_fixup.zig` patches
-  it at build time (9d83558). Confirm every shader, including the trail shaders, passes `spirv-val`.
+  it at build time (9d83558). Every shader passes `spirv-val --target-env vulkan1.2` except
+  `gravity_kernels`: a Function-storage variable holding a StorageBuffer pointer (needs
+  VariablePointersStorageBuffer; likely `atomicAdd`'s pointer argument). RADV accepts it.
+- Escaped bodies are clamped into the gravity tree box (correct moments; they feel the pull from the
+  box edge, not their true position). Fine for the game; the sim version needs a box that grows.
 
 ## Not yet ported to the GPU
 - Impact heat (the solver does not expose approach speed); ash-ash collisions.
-- Trails: done on branch `trails` (see Galaxy mode 4).
 - Extra impulse on release after a grab; click pick/spawn arrives 2–3 ticks late.
 - HUD max level never decreases.
 
@@ -30,11 +33,13 @@ Balls orbiting each other in open space and forming little systems. Gravity stay
 pull g·m/r), so circular speed is sqrt(g·M_enclosed) at any radius; disks have flat rotation curves.
 1. [x] Zoom/pan/follow camera (wheel, middle-drag, Home, C).
 2. [x] Scenario builders, `src/galaxy.zig`: disk, colliding disks, cold cloud, cluster of star systems.
-3. [~] Galaxy mode in the GPU world: explicit g and softening, fixed open bounds, collision modes
-       solid / accrete / ghost, keys O, 1-4, X, [ ], click spawns a star system; `--galaxy`, `--collide`.
-       Done on branch `galaxy`, in review.
-4. [~] GPU trails so orbits are visible (key R). Done on branch `trails`, reviewed; to fix: head
-       segment kinks backward, clear trails on scene load; key not bound yet.
+3. [x] Galaxy mode in the GPU world: explicit g and softening, fixed open bounds, collision modes
+       solid / accrete / ghost (galaxy-only), keys O, 1-4, X, [ ], click spawns a star system;
+       `--galaxy`, `--collide`. Body radius capped at 10 (`galaxy.max_body_radius`) so solid mode is
+       playable; this costs ~20% per tick (disk 100k 1.57 -> 1.95 ms, 1M 13.9 -> 16.4 ms; cap 40 is
+       baseline). Worth revisiting: why a radius cap slows the gravity pass.
+4. [x] GPU trails so orbits are visible (key R); cleared whenever the world is cleared. Only checked
+       headless: look at the head segment and R toggle in a window.
 5. [ ] Diagnostics on the HUD: energy and angular-momentum drift.
 
 ## Scale (game): features at 1M balls, optimize toward 1B (standing goal, 2026-11-12)
