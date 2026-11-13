@@ -69,6 +69,15 @@ Decisions for the user (block the phases marked):
 - D2 Cluster: Alabama Supercomputer Center (docs https://hpcdocs.asc.edu/, being researched); which system, which GPUs, is Vulkan usable on compute nodes (else a CUDA/OpenCL backend),
      scheduler (Slurm?), GPUs per job, walltime, storage quota. On a compute node:
      `nvidia-smi`, `vulkaninfo --summary`, `sinfo`. Blocks 10+.
+  Public info so far (hpcdocs.asc.edu is behind a DUO login; these come from asc.edu pages and
+  2023 slide decks, possibly stale): ASA-X cluster (2023, replaced DMC), "A100 and H100 GPUs", AMD and
+  Intel nodes with 512 GB-4 TB RAM, InfiniBand, Slurm, LMOD + Spack, CUDA/OpenCL/OpenACC, NVIDIA HPC SDK,
+  Singularity/Apptainer. Queues in the old deck: `gpu` (360 h), `class` (12 h); an old deck says one GPU
+  per job. Home 100 GB (up to 7 TB on request), /scratch purged a week after the job. Vulkan is not
+  mentioned anywhere. To confirm on a GPU node: `nvidia-smi`, `vulkaninfo --summary`,
+  `ls /usr/share/vulkan/icd.d /etc/vulkan/icd.d`, `apptainer --version`, GPU limit per student job.
+  Fallback if no Vulkan: compile the same Zig kernels to PTX (nvptx64) and load them through the CUDA
+  driver API.
 - D3 Multi-node communication: MPI is C, an exception to "if it can be Zig, it is Zig"; the
      alternative is a Zig-native transport. Job scripts are shell: allowed as ops tooling like
      `.devcontainer/`? Blocks 12+.
