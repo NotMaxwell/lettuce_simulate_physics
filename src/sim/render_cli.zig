@@ -1,13 +1,17 @@
-//! `zig build render-snap -- <snapshot>... --out <dir> [--size WxH] [--center x,y --extent e] [--log]`
+//! `zig build render-snap -- <snapshot>... --out <dir> [--size WxH] [--center x,y[,z] --extent e] [--log] [--view xy|xz|yz|yaw,pitch] [--slab t]`
 const std = @import("std");
 const c = @import("c");
 const render = @import("render.zig");
 const sim = @import("sim.zig");
 
 const usage =
-    \\usage: render-snap <snapshot>... --out <dir> [--size 1920x1080] [--center x,y --extent e | auto] [--log]
+    \\usage: render-snap <snapshot>... --out <dir> [--size 1920x1080] [--center x,y[,z] --extent e | auto] [--log]
+    \\       [--view xy|xz|yz|yaw,pitch] [--slab thickness]
     \\  extent = half of the shorter image side in world units; without --center/--extent both are
-    \\  chosen from each snapshot (mean position, 3x rms radius).
+    \\  chosen from each snapshot (mean position, 1.05x the 99th percentile radius in the image plane).
+    \\  3D snapshots only: --view picks the orthographic projection (xy default; yaw,pitch in degrees,
+    \\  0,0 = xy, yaw turns around y, pitch around the turned x); --slab keeps bodies within +-t/2 of
+    \\  the view plane through the centre. 2D snapshots ignore both.
     \\
 ;
 
@@ -35,8 +39,19 @@ pub fn run(gpa: std.mem.Allocator, args: []const [:0]const u8) !void {
                 o.width = try std.fmt.parseInt(u32, v[0..x], 10);
                 o.height = try std.fmt.parseInt(u32, v[x + 1 ..], 10);
             } else if (std.mem.eql(u8, a, "--center")) {
-                const x = std.mem.indexOfScalar(u8, v, ',') orelse return fail("--center x,y");
-                o.center = .{ try std.fmt.parseFloat(f32, v[0..x]), try std.fmt.parseFloat(f32, v[x + 1 ..]) };
+                var ctr: [3]f32 = .{ 0, 0, 0 };
+                var parts = std.mem.splitScalar(u8, v, ',');
+                var k: usize = 0;
+                while (parts.next()) |part| : (k += 1) {
+                    if (k >= 3) return fail("--center x,y[,z]");
+                    ctr[k] = try std.fmt.parseFloat(f32, part);
+                }
+                if (k < 2) return fail("--center x,y[,z]");
+                o.center = ctr;
+            } else if (std.mem.eql(u8, a, "--view")) {
+                o.view = render.View.parse(v) catch return fail("--view xy|xz|yz|yaw,pitch");
+            } else if (std.mem.eql(u8, a, "--slab")) {
+                o.slab = try std.fmt.parseFloat(f32, v);
             } else if (std.mem.eql(u8, a, "--extent")) {
                 o.extent = try std.fmt.parseFloat(f32, v);
             } else return fail("unknown option");
@@ -58,7 +73,7 @@ pub fn run(gpa: std.mem.Allocator, args: []const [:0]const u8) !void {
         const stem = std.fs.path.stem(f);
         const out = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}.png", .{ out_dir, stem }, 0) catch return fail("path too long");
         const res = try r.render(gpa, f, out, o);
-        std.debug.print("{s}: {d} bodies, centre ({d:.1}, {d:.1}), extent {d:.1}, {d:.0} ms -> {s}\n", .{ f, res.n, res.cx, res.cy, res.extent, res.render_ms, out });
+        std.debug.print("{s}: {d} bodies, centre ({d:.3}, {d:.3}, {d:.3}), extent {d:.3}, {d:.0} ms -> {s}\n", .{ f, res.n, res.cx, res.cy, res.cz, res.extent, res.render_ms, out });
     }
 }
 
