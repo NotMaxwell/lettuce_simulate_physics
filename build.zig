@@ -118,6 +118,8 @@ fn setGpuEnv(b: *std.Build, run: *std.Build.Step.Run) void {
 pub fn addShaders(b: *std.Build, mod: *std.Build.Module, layout_mod: *std.Build.Module) void {
     addShader(b, mod, layout_mod, "src/shaders/sprite.zig", "sprite.spv");
     addShader(b, mod, layout_mod, "src/shaders/balls.zig", "balls.spv");
+    addShader(b, mod, layout_mod, "src/shaders/trails.zig", "trails.spv");
+    mod.addAnonymousImport("trail_rec.spv", .{ .root_source_file = spirvObject(b, "trail_rec", b.path("src/shaders/trail_rec.zig"), layout_mod, null) });
 }
 
 /// Compiles a Zig shader to SPIR-V (self-hosted backend; LLVM has no SPIR-V shader support)
