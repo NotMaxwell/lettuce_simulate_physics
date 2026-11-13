@@ -75,6 +75,11 @@ pub inline fn atomicAdd(p: *addrspace(.storage_buffer) u32, v: u32) u32 {
     );
 }
 
+/// atomicAdd on element `i` of a u32 storage buffer; keeps buffer fields out of kernel bodies.
+pub inline fn atomicAddAt(comptime buf: anytype, i: u32, v: u32) u32 {
+    return atomicAdd(&buf.v[i], v);
+}
+
 /// Shift-based because @clz is not implemented in the SPIR-V backend ("TODO (SPIR-V): implement
 /// unary operation 'clz'").
 pub inline fn clz(x0: u32) u32 {
