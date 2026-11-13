@@ -248,6 +248,38 @@ fn boxResize(gpa: std.mem.Allocator, img: Image, dst: usize, out: []u8) !void {
     }
 }
 
+fn buildTileJob(gpa: std.mem.Allocator, k: usize, atlas_px: []u8, result: *anyerror!void) void {
+    result.* = buildTile(gpa, k, atlas_px);
+}
+
+/// Loads ball image `k`, resizes and circle-masks it, and copies it with a clamped gutter into
+/// its atlas cell.
+fn buildTile(gpa: std.mem.Allocator, k: usize, atlas_px: []u8) !void {
+    const tile = try gpa.alloc(u8, tile_px * tile_px * 4);
+    defer gpa.free(tile);
+    var buf: [64]u8 = undefined;
+    const path = if (k == basketball_tile)
+        try std.mem.printSentinel(&buf, "assets/balls/basketball.png", .{}, 0)
+    else
+        try std.mem.printSentinel(&buf, "assets/balls/{d}.png", .{k + 1}, 0);
+    const img = try Image.load(path);
+    defer img.free();
+    try boxResize(gpa, img, tile_px, tile);
+    maskCircle(tile);
+
+    const cx0 = (k % atlas_cols) * cell_px;
+    const cy0 = (k / atlas_cols) * cell_px;
+    for (0..cell_px) |y| {
+        const sy = std.math.clamp(@as(isize, @intCast(y)) - gutter, 0, tile_px - 1);
+        for (0..cell_px) |x| {
+            const sx = std.math.clamp(@as(isize, @intCast(x)) - gutter, 0, tile_px - 1);
+            const src = (@as(usize, @intCast(sy)) * tile_px + @as(usize, @intCast(sx))) * 4;
+            const dst = ((cy0 + y) * atlas_w + cx0 + x) * 4;
+            @memcpy(atlas_px[dst..][0..4], tile[src..][0..4]);
+        }
+    }
+}
+
 fn maskCircle(tile: []u8) void {
     const half: f32 = tile_px / 2.0;
     for (0..tile_px) |y| {
@@ -290,32 +322,21 @@ pub const Renderer = struct {
         const atlas_px = try gpa.alloc(u8, atlas_w * atlas_h * 4);
         defer gpa.free(atlas_px);
         @memset(atlas_px, 0);
-        const tile = try gpa.alloc(u8, tile_px * tile_px * 4);
-        defer gpa.free(tile);
+        // Each tile is decoded and resized on its own thread (they write disjoint atlas cells);
+        // done one after another this was ~0.4 s of startup.
+        var results: [tile_count]anyerror!void = undefined;
+        var threads: [tile_count]?std.Thread = @splat(null);
+        for (0..tile_count) |k| {
+            threads[k] = std.Thread.spawn(.{}, buildTileJob, .{ gpa, k, atlas_px, &results[k] }) catch null;
+            if (threads[k] == null) buildTileJob(gpa, k, atlas_px, &results[k]);
+        }
+        for (threads) |t| if (t) |th| th.join();
+        for (results) |r| try r;
 
         var uv: [tile_count][4]f32 = undefined;
         for (0..tile_count) |k| {
-            var buf: [64]u8 = undefined;
-            const path = if (k == basketball_tile)
-                try std.mem.printSentinel(&buf, "assets/balls/basketball.png", .{}, 0)
-            else
-                try std.mem.printSentinel(&buf, "assets/balls/{d}.png", .{k + 1}, 0);
-            const img = try Image.load(path);
-            defer img.free();
-            try boxResize(gpa, img, tile_px, tile);
-            maskCircle(tile);
-
             const cx0 = (k % atlas_cols) * cell_px;
             const cy0 = (k / atlas_cols) * cell_px;
-            for (0..cell_px) |y| {
-                const sy = std.math.clamp(@as(isize, @intCast(y)) - gutter, 0, tile_px - 1);
-                for (0..cell_px) |x| {
-                    const sx = std.math.clamp(@as(isize, @intCast(x)) - gutter, 0, tile_px - 1);
-                    const src = (@as(usize, @intCast(sy)) * tile_px + @as(usize, @intCast(sx))) * 4;
-                    const dst = ((cy0 + y) * atlas_w + cx0 + x) * 4;
-                    @memcpy(atlas_px[dst..][0..4], tile[src..][0..4]);
-                }
-            }
             const aw: f32 = atlas_w;
             const ah: f32 = atlas_h;
             uv[k] = .{
