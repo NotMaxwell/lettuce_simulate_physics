@@ -87,13 +87,23 @@ export fn diagPartial() callconv(cc) void {
     spirv.workgroupBarrier();
     // Constant-index access to shared arrays miscompiles in the SPIR-V backend; l == 0 here.
     if (l == 0) {
-        const o = spirv.workgroup_id[0] * S.diag_stride;
+        const o = (spirv.workgroup_id[0] + spirv.workgroup_id[1] * S.dispatch_x) * S.diag_stride;
         partials_d.v[o] = sh0[l];
         partials_d.v[o + 1] = sh1[l];
         partials_d.v[o + 2] = sh2[l];
         partials_d.v[o + 3] = sh3[l];
         partials_d.v[o + 4] = sh4[l];
     }
+}
+
+fn hash(x0: u32) u32 {
+    var x = x0;
+    x ^= x >> 16;
+    x *%= 0x7feb352d;
+    x ^= x >> 15;
+    x *%= 0x846ca68b;
+    x ^= x >> 16;
+    return x;
 }
 
 /// Pair potential sum for sampled bodies: thread t takes sampled body (t % samples) and slice
@@ -104,18 +114,26 @@ export fn potential() callconv(cc) void {
     const t = gid();
     var acc: f32 = 0;
     if (t < params.samples * params.chunks) {
-        const i = params.offset + (t % params.samples) * params.stride;
+        const si = t % params.samples;
+        const i = if (params.samples == params.n) si else hash(si ^ params.seed) % params.n;
         const j0 = (t / params.samples) * params.chunk_len;
         const j1 = @min(j0 + params.chunk_len, params.n);
         const xi = pos_ro.v[i].x;
         const yi = pos_ro.v[i].y;
+        // Two-level sum: slices of 64 terms, then the slices, to keep f32 rounding error small
+        // over the ~50k terms a thread can see.
         var sum: f32 = 0;
         var j = j0;
-        while (j < j1) : (j += 1) {
-            if (j == i) continue;
-            const dx = pos_ro.v[j].x - xi;
-            const dy = pos_ro.v[j].y - yi;
-            sum += body.v[j].mass * @log(dx * dx + dy * dy + params.softening);
+        while (j < j1) {
+            var part: f32 = 0;
+            const end = @min(j + 64, j1);
+            while (j < end) : (j += 1) {
+                if (j == i) continue;
+                const dx = pos_ro.v[j].x - xi;
+                const dy = pos_ro.v[j].y - yi;
+                part += body.v[j].mass * @log(dx * dx + dy * dy + params.softening);
+            }
+            sum += part;
         }
         acc = 0.5 * body.v[i].mass * sum;
     }
@@ -126,5 +144,5 @@ export fn potential() callconv(cc) void {
         if (l < off) sh0[l] += sh0[l + off];
     }
     spirv.workgroupBarrier();
-    if (l == 0) partials_p.v[spirv.workgroup_id[0]] = sh0[l];
+    if (l == 0) partials_p.v[spirv.workgroup_id[0] + spirv.workgroup_id[1] * S.dispatch_x] = sh0[l];
 }

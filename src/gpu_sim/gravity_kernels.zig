@@ -485,7 +485,7 @@ export fn boundsPartial() callconv(kernel_cc) void {
     sh_maxy[l] = mxy;
     reduceBounds(l);
     if (l == 0) {
-        const g = spirv.workgroup_id[0];
+        const g = spirv.workgroup_id[0] + spirv.workgroup_id[1] * S.dispatch_x;
         mpole.v[2 * g].x = sh_minx[l];
         mpole.v[2 * g].y = sh_miny[l];
         mpole.v[2 * g + 1].x = sh_maxx[l];

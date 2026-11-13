@@ -51,6 +51,9 @@ pub const Gravity = struct {
     local: *c.SDL_GPUBuffer,
     /// Leaf level chosen by the last apply (for the perf overlay).
     last_leaf_level: u32 = 0,
+    /// Submit the command buffer in pieces (box+bin, tree build, evaluate) so no single submission
+    /// nears the driver's job watchdog at 100M+ bodies. Only `applyAutoBox` honours it.
+    split_submit: bool = false,
 
     pub fn init(device: *c.SDL_GPUDevice, capacity: u32) Error!Gravity {
         var g: Gravity = undefined;
@@ -106,24 +109,32 @@ pub const Gravity = struct {
         const size = @max(w, h, 1.0);
         // The tree is square over the bounds; only the w*h part of it holds balls.
         const fill = @max(w, 1.0) * @max(h, 1.0) / (size * size);
-        g.record(cmd, params.ball_count, fill, .{ params.bounds_min_x, params.bounds_min_y, size }, K.no_box, balls, g_scale, softening, false);
+        _ = g.record(cmd, params.ball_count, fill, .{ params.bounds_min_x, params.bounds_min_y, size }, K.no_box, balls, g_scale, softening, false, false);
     }
 
     /// Like `apply`, but the tree box is recomputed on the GPU from the bodies' bounding box (two
     /// small reduction passes, no readback), so bodies may roam anywhere. Assumes the bodies fill
     /// the box (fill = 1) when picking the leaf level.
-    pub fn applyAutoBox(g: *Gravity, cmd: *c.SDL_GPUCommandBuffer, n: u32, balls: Balls, g_scale: f32, softening: f32) void {
-        g.record(cmd, n, 1.0, .{ 0, 0, 1 }, g.box_word, balls, g_scale, softening, false);
+    /// Returns the command buffer to keep recording into (a new one when `split_submit` is set).
+    pub fn applyAutoBox(g: *Gravity, cmd: *c.SDL_GPUCommandBuffer, n: u32, balls: Balls, g_scale: f32, softening: f32) *c.SDL_GPUCommandBuffer {
+        return g.record(cmd, n, 1.0, .{ 0, 0, 1 }, g.box_word, balls, g_scale, softening, false, g.split_submit);
     }
 
     /// Records only the box reduction of `applyAutoBox` (for timing it).
     pub fn recordBoxOnly(g: *Gravity, cmd: *c.SDL_GPUCommandBuffer, n: u32, balls: Balls) void {
-        g.record(cmd, n, 1.0, .{ 0, 0, 1 }, g.box_word, balls, 0, 0, true);
+        _ = g.record(cmd, n, 1.0, .{ 0, 0, 1 }, g.box_word, balls, 0, 0, true, false);
     }
 
-    fn record(g: *Gravity, cmd: *c.SDL_GPUCommandBuffer, count: u32, fill: f32, box: [3]f32, box_word: u32, balls: Balls, g_scale: f32, softening: f32, box_only: bool) void {
+    fn splitHere(g: *Gravity, cmd: *c.SDL_GPUCommandBuffer, split: bool) *c.SDL_GPUCommandBuffer {
+        if (!split) return cmd;
+        _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+        return c.SDL_AcquireGPUCommandBuffer(g.device) orelse unreachable;
+    }
+
+    fn record(g: *Gravity, cmd0: *c.SDL_GPUCommandBuffer, count: u32, fill: f32, box: [3]f32, box_word: u32, balls: Balls, g_scale: f32, softening: f32, box_only: bool, split: bool) *c.SDL_GPUCommandBuffer {
+        var cmd = cmd0;
         const n = @min(count, g.capacity);
-        if (n < 2) return;
+        if (n < 2) return cmd;
         const leaf = leafLevelFor(n, fill, g.max_leaf_level);
         g.last_leaf_level = leaf;
         var kp: K.Params = .{
@@ -162,12 +173,13 @@ pub const Gravity = struct {
             pass(g, cmd, .boundsPartial, &kp, &ro, &rw, (n + K.bounds_per_thread - 1) / K.bounds_per_thread);
             pass(g, cmd, .boundsFinal, &kp, &ro, &rw, L.group_size);
         }
-        if (box_only) return;
+        if (box_only) return cmd;
         pass(g, cmd, .clearCounts, &kp, &ro, &rw, leaf_cells);
         pass(g, cmd, .binBalls, &kp, &ro, &rw, n);
         pass(g, cmd, .scanBlocks, &kp, &ro, &rw, (leaf_cells + K.scan_block - 1) / K.scan_block * L.group_size);
         pass(g, cmd, .scanTotals, &kp, &ro, &rw, L.group_size);
         pass(g, cmd, .scatterBalls, &kp, &ro, &rw, n);
+        cmd = g.splitHere(cmd, split);
         pass(g, cmd, .leafMultipoles, &kp, &ro, &rw, leaf_cells);
         var lvl = leaf;
         while (lvl > K.min_level) {
@@ -180,7 +192,9 @@ pub const Gravity = struct {
             kp.level = lvl;
             pass(g, cmd, .downwardPass, &kp, &ro, &rw, @as(u32, 1) << @intCast(2 * lvl));
         }
+        cmd = g.splitHere(cmd, split);
         pass(g, cmd, .evaluate, &kp, &ro, &rw, n);
+        return g.splitHere(cmd, split);
     }
 };
 

@@ -13,10 +13,11 @@ pub const potential_threads: u32 = 131072;
 
 pub const Params = extern struct {
     n: u32,
-    /// Potential pass: sampled bodies are offset + s * stride for s < samples.
+    /// Potential pass: sampled body s is s when samples == n, else a hash of (s, seed) mod n, so a
+    /// generator that orders bodies systematically cannot alias with the sample.
     samples: u32,
-    stride: u32,
-    offset: u32,
+    seed: u32,
+    _pad: u32 = 0,
     /// Potential pass: each sampled body's pair sum over all n is split into `chunks` slices of this length.
     chunks: u32,
     chunk_len: u32,

@@ -71,7 +71,7 @@ pub const Sim = struct {
     samples: u32,
     chunks: u32,
     chunk_len: u32,
-    stride: u32,
+    seed: u32 = 0x9e3779b9,
     tick_no: u64 = 0,
     half_pending: bool = true,
     /// Fixed tree box for the bench comparison only: centre 0, half side `box_half`.
@@ -85,6 +85,7 @@ pub const Sim = struct {
         s.tick_no = 0;
         s.half_pending = true;
         s.box_half = 0;
+        s.seed = 0x9e3779b9;
         const n = cfg.n;
         s.pos = try makeBuffer(dev, @as(u64, n) * @sizeOf(L.Vec2));
         errdefer c.SDL_ReleaseGPUBuffer(dev, s.pos);
@@ -94,6 +95,8 @@ pub const Sim = struct {
         errdefer c.SDL_ReleaseGPUBuffer(dev, s.body);
         s.grav = gravity.Gravity.init(dev, n) catch return error.GpuPipeline;
         errdefer s.grav.deinit();
+        // A tick of 100M+ bodies takes seconds; one submission per solver stage stays clear of the driver watchdog.
+        s.grav.split_submit = n >= 8_000_000;
 
         const Counts = struct { ro: u32, rw: u32 };
         const counts = [n_kernels]Counts{ .{ .ro = 0, .rw = 2 }, .{ .ro = 2, .rw = 2 }, .{ .ro = 2, .rw = 1 } };
@@ -119,7 +122,6 @@ pub const Sim = struct {
 
         s.diag_groups = ((n + sh.diag_per_thread - 1) / sh.diag_per_thread + L.group_size - 1) / L.group_size;
         s.samples = if (cfg.pe_samples == 0) autoSamples(n) else @min(cfg.pe_samples, n);
-        s.stride = n / s.samples;
         s.chunks = @min(@max(1, sh.potential_threads / s.samples), n);
         s.chunk_len = (n + s.chunks - 1) / s.chunks;
         s.chunks = (n + s.chunk_len - 1) / s.chunk_len;
@@ -192,9 +194,9 @@ pub const Sim = struct {
         s.box_half = half;
     }
 
-    fn kick(s: *Sim, cmd: *c.SDL_GPUCommandBuffer, factor: f32) void {
+    fn kick(s: *Sim, cmd: *c.SDL_GPUCommandBuffer, factor: f32) *c.SDL_GPUCommandBuffer {
         const scale = s.cfg.g * s.cfg.dt * factor;
-        s.grav.applyAutoBox(cmd, s.cfg.n, .{ .pos = s.pos, .body = s.body, .vel = s.vel }, scale, s.cfg.softening);
+        return s.grav.applyAutoBox(cmd, s.cfg.n, .{ .pos = s.pos, .body = s.body, .vel = s.vel }, scale, s.cfg.softening);
     }
 
     fn recordDrift(s: *Sim, cmd: *c.SDL_GPUCommandBuffer) void {
@@ -203,11 +205,13 @@ pub const Sim = struct {
     }
 
     /// Records one tick: the kick that takes velocities to the next half step, then the drift.
-    pub fn recordTick(s: *Sim, cmd: *c.SDL_GPUCommandBuffer) void {
-        s.kick(cmd, if (s.half_pending) 0.5 else 1.0);
+    /// Returns the command buffer to submit (not the one passed in when the solver splits submits).
+    pub fn recordTick(s: *Sim, cmd0: *c.SDL_GPUCommandBuffer) *c.SDL_GPUCommandBuffer {
+        const cmd = s.kick(cmd0, if (s.half_pending) 0.5 else 1.0);
         s.half_pending = false;
         s.recordDrift(cmd);
         s.tick_no += 1;
+        return cmd;
     }
 
     /// Runs `ticks` ticks, one command buffer each, keeping a few in flight; returns when done.
@@ -219,8 +223,8 @@ pub const Sim = struct {
             const slot = k % depth;
             if (fences[slot]) |f| waitRelease(s.dev, f);
             const cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
-            s.recordTick(cmd);
-            fences[slot] = c.SDL_SubmitGPUCommandBufferAndAcquireFence(cmd) orelse return error.GpuSubmit;
+            const last = s.recordTick(cmd);
+            fences[slot] = c.SDL_SubmitGPUCommandBufferAndAcquireFence(last) orelse return error.GpuSubmit;
         }
         for (&fences) |*f| if (f.*) |ff| {
             waitRelease(s.dev, ff);
@@ -237,9 +241,9 @@ pub const Sim = struct {
 
     /// Diagnostics at synchronous velocities (blocking). Applies the pending half kick if needed.
     pub fn measure(s: *Sim) Error!Diag {
-        const cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
+        var cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
         if (!s.half_pending) {
-            s.kick(cmd, 0.5);
+            cmd = s.kick(cmd, 0.5);
             s.half_pending = true;
         }
         s.recordDiag(cmd);
@@ -274,7 +278,7 @@ pub const Sim = struct {
         inline for (@typeInfo(Which).@"enum".field_names, 0..) |name, wi| {
             var total: f64 = 0;
             for (0..reps + 1) |k| {
-                const cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
+                var cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
                 const t0 = c.SDL_GetPerformanceCounter();
                 const balls: gravity.Balls = .{ .pos = s.pos, .body = s.body, .vel = s.vel };
                 const scale = s.cfg.g * s.cfg.dt;
@@ -289,7 +293,7 @@ pub const Sim = struct {
                         s.grav.apply(cmd, p, balls, scale, s.cfg.softening);
                     },
                     .box => s.grav.recordBoxOnly(cmd, s.cfg.n, balls),
-                    .gravity => s.grav.applyAutoBox(cmd, s.cfg.n, balls, scale, s.cfg.softening),
+                    .gravity => cmd = s.grav.applyAutoBox(cmd, s.cfg.n, balls, scale, s.cfg.softening),
                     .drift => s.recordDrift(cmd),
                     .diag => {
                         const ro = [_]Buffer{ s.pos, s.body };
@@ -312,8 +316,7 @@ pub const Sim = struct {
         const p: sh.Params = .{
             .n = s.cfg.n,
             .samples = s.samples,
-            .stride = s.stride,
-            .offset = s.stride / 2,
+            .seed = s.seed,
             .chunks = s.chunks,
             .chunk_len = s.chunk_len,
             .dt = s.cfg.dt,
