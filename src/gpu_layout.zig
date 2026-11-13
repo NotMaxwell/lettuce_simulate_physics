@@ -132,3 +132,52 @@ comptime {
     std.debug.assert(@sizeOf(SimParams) == 64);
     std.debug.assert(@sizeOf(Event) == 16);
 }
+
+// 3D matter sim (src/sim/sim3.zig, kernels in src/sim/k3/); layouts follow docs/sim3d.md.
+// Scalar members only: these cross the SDL_GPU storage-buffer and uniform boundaries unpadded.
+
+/// Position as per-axis fractions of the root cube (value / 2^32). Wrapped subtraction is the periodic minimum image.
+pub const Pos3 = extern struct { x: u32, y: u32, z: u32 };
+pub const Vel3 = extern struct { x: f32, y: f32, z: f32 };
+/// Sorted-key record (Morton key split in two words, original index).
+pub const SortRec = extern struct { key_hi: u32, key_lo: u32, idx: u32 };
+/// Binary radix tree node. child: left child, or bit31 | first body of a leaf; skip: rope; info: count | depth.
+pub const Node = extern struct { com: Pos3, mass: f32, open_r2: f32, child: u32, skip: u32, info: u32 };
+pub const NodeQuad = extern struct { xx: f32, xy: f32, xz: f32, yy: f32, yz: f32, zz: f32 };
+
+pub const sim3_flag_periodic: u32 = 1 << 0;
+/// Kick kernel: write per-body potential (diagnostic ticks).
+pub const sim3_flag_potential: u32 = 1 << 1;
+/// Kick kernel: store the acceleration into vel instead of adding kick * a (force tests).
+pub const sim3_flag_store_accel: u32 = 1 << 2;
+
+/// Uniform block of the 3D sim kernels (slot 0).
+pub const Params3 = extern struct {
+    n: u32,
+    /// First body of this dispatch (long kicks are split into chunks for the driver watchdog).
+    first: u32,
+    flags: u32,
+    _pad: u32 = 0,
+    g: f32,
+    eps: f32,
+    eps2: f32,
+    /// vel += kick * a, with kick = dt * (1 or 1/2).
+    kick: f32,
+    /// Quanta per unit velocity: dt * 2^32 / box_size.
+    drift_q: f32,
+    /// Length per position quantum: box_size / 2^32.
+    box_scale: f32,
+    dt: f32,
+    /// Time-step accuracy parameter for the rung histogram.
+    eta: f32,
+};
+
+comptime {
+    const std = @import("std");
+    std.debug.assert(@sizeOf(Pos3) == 12);
+    std.debug.assert(@sizeOf(Vel3) == 12);
+    std.debug.assert(@sizeOf(SortRec) == 12);
+    std.debug.assert(@sizeOf(Node) == 32);
+    std.debug.assert(@sizeOf(NodeQuad) == 24);
+    std.debug.assert(@sizeOf(Params3) == 48);
+}
