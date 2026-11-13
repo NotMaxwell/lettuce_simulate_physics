@@ -114,6 +114,8 @@ const event_burnout: u32 = 5;
 const c_fx_fire_alive: u32 = 2;
 const c_fx_ash_alive: u32 = 3;
 const fx_slots: u32 = 16;
+/// gpu_game/common.zig fx_impact.
+const c_fx_impact: u32 = 10;
 
 const Blast = extern struct { x: f32, y: f32, blast: f32, force: f32 };
 
@@ -216,6 +218,8 @@ const Slot = struct {
     tb: *c.SDL_GPUTransferBuffer,
     fence: ?*c.SDL_GPUFence = null,
     picked: bool = false,
+    /// gw.tick_no this slot was recorded in.
+    tick: u32 = 0,
     /// Energy epoch this tick's diagnostics were recorded in (null: none were), and what turns the
     /// raw sums into physical values.
     diag_epoch: ?u32 = null,
@@ -348,6 +352,8 @@ pub const GpuWorld = struct {
             .radius = try gpa.alloc(f32, cap),
         };
         @memset(gw.radius, 0);
+        gw.sim.heat_buf = gw.heat;
+        gw.sim.fx_buf = gw.fx;
         for (&gw.slots) |*s| s.* = .{ .tb = c.SDL_CreateGPUTransferBuffer(dev, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD, .size = download_bytes }) orelse return error.GpuSetupFailed };
         const kernels = comptime std.enums.values(Kernel);
         var infos: [kernels.len]c.SDL_GPUComputePipelineCreateInfo = undefined;
@@ -740,7 +746,7 @@ pub const GpuWorld = struct {
         };
         // Reduction done after this tick's merges and deaths: it replaces the running maximum, so the
         // level falls when the top balls merge away or die (level + 1; 0 = not recorded this tick).
-        if (ev[0].b != 0) w.current_level = @intCast(ev[0].b - 1);
+        if (ev[0].b != 0) w.current_level = @intCast(@max(cfg.start_level, ev[0].b - 1));
         const fxw: [*]const u32 = @ptrCast(@alignCast(m + out_bytes + 16));
         gw.stats = .{
             .burning = fxw[0],
@@ -751,6 +757,9 @@ pub const GpuWorld = struct {
             .ash_head = fxw[5],
         };
         if (gw.stats.burning > 0) w.events.any_burning = true;
+        // The solver warmed a ball by impact this tick: the counters do not know yet, so run the fire
+        // passes for a few ticks (they then keep running while anything is above room temperature).
+        if (fxw[c_fx_impact] == s.tick +% 1) gw.fire_wake = @max(gw.fire_wake, 4);
         if (s.picked) {
             const pick_word = std.mem.readInt(u32, m[out_bytes..][0..4], .little);
             gw.pick_result = pick_word != 0;
@@ -814,7 +823,7 @@ pub const GpuWorld = struct {
             .flags = (if (in.mutual_gravity) L.sim_flag_mutual_gravity else 0) |
                 (if (in.merging) L.sim_flag_merging else 0) |
                 (if (in.attract) L.sim_flag_attract else 0) |
-                (if (gw.galaxy_on) L.sim_flag_galaxy else 0) |
+                (if (gw.galaxy_on) L.sim_flag_galaxy else L.sim_flag_impact_heat) |
                 @as(u32, @backingInt(in.collide)) << L.sim_collide_shift,
             .mouse_x = in.mouse.x,
             .mouse_y = in.mouse.y,
@@ -828,6 +837,7 @@ pub const GpuWorld = struct {
     fn record(gw: *GpuWorld, w: *world.World, in: Input, sample: bool) !void {
         const slot = &gw.slots[gw.write_slot];
         std.debug.assert(slot.fence == null);
+        slot.tick = gw.tick_no;
 
         // Stage uploads: spawns (into free slots first, then the tail), lasso polygon, blasts.
         const up: [*]u8 = @ptrCast(c.SDL_MapGPUTransferBuffer(gw.dev, gw.upload_tb, true) orelse return gpuFail("SDL_MapGPUTransferBuffer (upload)"));
@@ -1710,4 +1720,46 @@ test "gpu world: releasing a grab adds the last follow step to the throw" {
     try gw.sim.download(0, .{ .pos = &pos });
     std.debug.print("release throw: x after the release tick {d:.3} (432 + 18 = 450 with the impulse, 446 without)\n", .{pos[0].x});
     try std.testing.expectApproxEqAbs(@as(f32, 450), pos[0].x, 0.05);
+}
+
+test "gpu world: an impact that reaches ignition lights both balls, a gentler one leaves them cold" {
+    _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SkipZigTest;
+    defer c.SDL_Quit();
+    const gfx = @import("gfx.zig");
+    var gpu = gfx.Gfx.init(.{ .window = null }) catch return error.SkipZigTest;
+    defer gpu.deinit();
+    const gpa = std.testing.allocator;
+    const in: Input = .{ .mutual_gravity = false, .merging = false, .random_explosions = false };
+
+    // Heat gained per ball = closing speed * 1.5 / mass * 10. Mass 5 closing at 56 px/tick: +168, past
+    // ignition. Mass 140 at 20: +2.1, which update_fire would reset anyway.
+    for ([_]struct { speed: f32, mass: f32, lit: bool }{ .{ .speed = 28, .mass = 5, .lit = true }, .{ .speed = 10, .mass = 140, .lit = false } }) |cs| {
+        var gw = try GpuWorld.init(gpa, gpu.dev);
+        defer gw.deinit();
+        gw.profile_every = 0;
+        var w = world.World.init(gpa, 71);
+        defer w.deinit();
+        for ([_]f32{ 400, 460 }) |x| try gw.queueBall(&w, x, 300);
+        for (gw.pending.items, [_]f32{ cs.speed, -cs.speed }) |*nb, vx| {
+            nb.vx = vx;
+            nb.vy = 0;
+            nb.gravity = 0;
+            nb.radius = 30;
+            nb.density = 1;
+            nb.mass = cs.mass;
+            nb.level = 5;
+        }
+        for (0..6) |_| gw.tick(&w, in);
+        gw.drain(&w);
+        var heat: [2]L.BallHeat = undefined;
+        try gw.sim.readBuffer(gw.heat, std.mem.sliceAsBytes(&heat));
+        var meta: [2]u32 = undefined;
+        try gw.sim.download(0, .{ .meta = &meta });
+        std.debug.print("impact heat (speed {d}, mass {d}): temps {d:.1} {d:.1}, burning {d}\n", .{ cs.speed, cs.mass, heat[0].temp, heat[1].temp, gw.stats.burning });
+        for (heat, meta) |h, m| {
+            try std.testing.expectEqual(cs.lit, h.temp >= cfg.ignition_temp);
+            try std.testing.expectEqual(cs.lit, m & L.flag_burning != 0);
+        }
+    }
 }

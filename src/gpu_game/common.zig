@@ -143,6 +143,9 @@ pub const fx_prev_burning = 6;
 pub const fx_prev_warm = 7;
 pub const fx_deaths = 8;
 pub const fx_prev_deaths = 9;
+/// Written by the solver's finish pass (gpu_sim/common.zig fx_impact): tick + 1 of the last tick
+/// in which impact heat warmed a ball, so the host wakes the fire passes.
+pub const fx_impact = 10;
 pub const fx_slots = 16;
 
 pub inline fn lid() u32 {

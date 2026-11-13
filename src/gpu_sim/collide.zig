@@ -40,7 +40,7 @@ const layouts = std.enums.EnumArray(Kernel, Layout).init(.{
     .scatter = .{ .ro = 2, .rw = 2, .uni = 1 },
     .gather = .{ .ro = 5, .rw = 3, .uni = 1 },
     .colored = .{ .ro = 4, .rw = 4, .uni = 2 },
-    .finish = .{ .ro = 6, .rw = 3, .uni = 1 },
+    .finish = .{ .ro = 6, .rw = 5, .uni = 1 },
 });
 
 const scan_block: u32 = L.group_size * 4; // matches common.scan_block
@@ -64,6 +64,10 @@ pub const Sim = struct {
     rest_speed: f32 = 2,
     /// Test hook, see SimParams.event_cap.
     event_cap: u32 = 0,
+    /// Game buffers impact heat (L.sim_flag_impact_heat) writes: BallHeat per ball, and the u32 counters
+    /// whose slot gpu_sim/common.zig fx_impact is stamped. Null: the flag is ignored.
+    heat_buf: ?Buffer = null,
+    fx_buf: ?Buffer = null,
 
     // Ball buffers, ball-id order (gpu_layout contract). Renderers may bind these read-only.
     pos: Buffer,
@@ -99,6 +103,8 @@ pub const Sim = struct {
         s.iterations = 1;
         s.rest_speed = 2;
         s.event_cap = 0;
+        s.heat_buf = null;
+        s.fx_buf = null;
         const n = capacity;
         // +2: the dead-ball cell and the end sentinel of the last real cell's row range.
         const ncount = cell_capacity + 2;
@@ -191,8 +197,10 @@ pub const Sim = struct {
     /// radius, a 3x3 cell query still finds every pair overlapping at binning time.
     /// Bind them as read-only storage buffers; per-ball data is in the id-order buffers.
     /// Record one tick. `p` must have gone through `prepare`.
-    pub fn step(s: *Sim, cmd: *c.SDL_GPUCommandBuffer, p: L.SimParams) void {
-        if (p.ball_count == 0) return;
+    pub fn step(s: *Sim, cmd: *c.SDL_GPUCommandBuffer, p_in: L.SimParams) void {
+        if (p_in.ball_count == 0) return;
+        var p = p_in;
+        if (s.heat_buf == null or s.fx_buf == null) p.flags &= ~L.sim_flag_impact_heat;
         s.record(cmd, p, .integrate);
         s.record(cmd, p, .scan);
         s.record(cmd, p, .scatter);
@@ -243,7 +251,7 @@ pub const Sim = struct {
             .collide => s.recordCollide(cmd, p, 0),
             .finish => {
                 s.push(cmd, 0, &p);
-                s.pass(cmd, .finish, &.{ s.s_prm, s.s_vel, s.ball_slot, s.body, s.s_spin, s.meta }, &.{ s.pos, s.vel, s.state }, groups);
+                s.pass(cmd, .finish, &.{ s.s_prm, s.s_vel, s.ball_slot, s.body, s.s_spin, s.meta }, &.{ s.pos, s.vel, s.state, s.heat_buf orelse s.events, s.fx_buf orelse s.events }, groups);
             },
         }
     }

@@ -85,6 +85,9 @@ pub const sim_flag_galaxy: u32 = 1 << 3;
 /// Collision response, two bits: solid (default solver), accrete (any touching pair merges,
 /// conserving mass and momentum), ghost (no contact forces; gravity softening only).
 pub const sim_collide_shift: u5 = 4;
+/// Solid contacts heat the balls involved (physics.zig resolvePair impact heat); needs a heat and an
+/// fx buffer attached to the solver (gpu_sim Sim.heat_buf / fx_buf). Off in galaxy mode.
+pub const sim_flag_impact_heat: u32 = 1 << 6;
 pub const sim_collide_mask: u32 = 3 << sim_collide_shift;
 pub const CollideMode = enum(u32) { solid = 0, accrete = 1, ghost = 2 };
 
