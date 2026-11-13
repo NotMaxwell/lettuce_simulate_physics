@@ -132,7 +132,12 @@ const out_cap: u32 = 1 << 15;
 const ring = 3;
 const out_bytes: u32 = (out_cap + 1) * @sizeOf(L.Event);
 const fx_bytes: u32 = fx_slots * 4;
-const download_bytes: u32 = out_bytes + 16 + fx_bytes;
+const diag_offset: u32 = out_bytes + 16 + fx_bytes;
+const download_bytes: u32 = diag_offset + 16;
+/// Galaxy energy diagnostics run every this many ticks (a few ms of GPU time per second at most).
+const diag_every_ticks: u32 = 20;
+/// Pair terms of the sampled potential sum: 0.2 ms or less at 100k bodies.
+const diag_pair_budget: u32 = 1 << 26;
 
 const Kernel = enum { spawn, reset, merge, hoop, clearPick, pick, grab, release, lasso, explode, conduct, fxReset, igniteGrab, burn, emitFire, emitAsh, fireUpdate, ashUpdate };
 const Module = enum { spawn, merge, act, conduct, burn, emit, particles };
@@ -206,6 +211,24 @@ const Slot = struct {
     tb: *c.SDL_GPUTransferBuffer,
     fence: ?*c.SDL_GPUFence = null,
     picked: bool = false,
+    /// Energy epoch this tick's diagnostics were recorded in (null: none were), and what turns the
+    /// raw sums into physical values.
+    diag_epoch: ?u32 = null,
+    diag_g: f32 = 0,
+    diag_weight: f64 = 1,
+};
+
+/// Totals of the galaxy bodies at one instant, in world units and ticks (arbitrary but consistent).
+pub const Energy = struct {
+    ke: f64,
+    /// Sampled, so it carries a small statistical error.
+    pe: f64,
+    lz: f64,
+    mass: f64,
+
+    pub fn total(e: Energy) f64 {
+        return e.ke + e.pe;
+    }
 };
 
 pub const GpuWorld = struct {
@@ -280,6 +303,13 @@ pub const GpuWorld = struct {
     galaxy_centre: Vec2 = .{},
     /// Bumped whenever the scene is replaced; renderers drop per-ball history (trails) on a change.
     scene_epoch: u32 = 0,
+    /// Latest galaxy energy readout of the current epoch, and the first one of it (the baseline).
+    energy: ?Energy = null,
+    energy_base: ?Energy = null,
+    /// Bumped whenever the quantities stop being comparable (load, spawn, mode or g change);
+    /// readouts recorded in an older epoch are dropped.
+    energy_epoch: u32 = 0,
+    diag_now: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, dev: *c.SDL_GPUDevice) Error!GpuWorld {
         const cap = L.max_balls;
@@ -437,6 +467,7 @@ pub const GpuWorld = struct {
     pub fn queueBody(gw: *GpuWorld, _: *world.World, x: f32, y: f32, nb: world.NewBall) !void {
         try gw.pending.append(gw.gpa, nb);
         errdefer _ = gw.pending.pop();
+        gw.resetEnergyBaseline();
         try gw.pending_pos.append(gw.gpa, .{ .x = x, .y = y });
         gw.total_area += std.math.pi * nb.radius * nb.radius;
         // The solver's cell size follows this; merges raise it later, spawns must too.
@@ -490,6 +521,14 @@ pub const GpuWorld = struct {
         gw.galaxy_g_mult = 1;
         gw.galaxy_extent = built.extent;
         gw.galaxy_centre = centre;
+    }
+
+    /// Starts the energy drift comparison over from the next readout.
+    pub fn resetEnergyBaseline(gw: *GpuWorld) void {
+        gw.energy_epoch +%= 1;
+        gw.energy = null;
+        gw.energy_base = null;
+        gw.diag_now = true;
     }
 
     /// Current gravity strength in galaxy mode.
@@ -631,6 +670,16 @@ pub const GpuWorld = struct {
     fn process(gw: *GpuWorld, w: *world.World, s: *Slot) void {
         const m: [*]const u8 = @ptrCast(c.SDL_MapGPUTransferBuffer(gw.dev, s.tb, false) orelse return);
         defer c.SDL_UnmapGPUTransferBuffer(gw.dev, s.tb);
+        if (s.diag_epoch) |ep| {
+            s.diag_epoch = null;
+            if (ep == gw.energy_epoch) {
+                const d: [*]const f32 = @ptrCast(@alignCast(m + diag_offset));
+                // pe = 1/2 * g * (n / samples) * sum, the 1/2 being the pair double count.
+                const e: Energy = .{ .ke = d[0], .lz = d[1], .mass = d[2], .pe = 0.5 * @as(f64, s.diag_g) * s.diag_weight * d[3] };
+                gw.energy = e;
+                if (gw.energy_base == null) gw.energy_base = e;
+            }
+        }
         const ev: [*]const L.Event = @ptrCast(@alignCast(m));
         const n = @min(ev[0].kind, out_cap);
         for (ev[1 .. n + 1]) |e| switch (e.kind & 0xff) {
@@ -696,10 +745,12 @@ pub const GpuWorld = struct {
     /// The region the gravity tree covers. Normally the play area; in galaxy mode the play area is
     /// much larger than the bodies (so walls are never met), and a tree over all of it would leave
     /// most leaf cells empty and the occupied ones crowded (1M disk: ~48 ms vs ~5 ms measured).
-    /// Walls sit at 4x the extent or more, so bodies can leave the box. The gravity kernels clamp
-    /// every body's position into the box (scatterBalls), so an escapee acts as if at the box edge:
-    /// it gets an approximate force and cannot corrupt the multipoles. Spawns that land outside grow
-    /// the extent (growToFit).
+    /// Galaxy mode only uses this as a window: the GPU takes the tight box of the bodies clamped
+    /// into it (Gravity.applyAutoBoxIn), so the tree is never larger than the window and shrinks to
+    /// the bodies. Walls sit at 4x the extent or more, so bodies can leave the window; the kernels
+    /// clamp every body into the box (scatterBalls), so an escapee acts as if at its edge: it gets an
+    /// approximate force and cannot corrupt the multipoles. Spawns that land outside grow the
+    /// extent (growToFit).
     fn gravityBox(gw: *const GpuWorld, sp: L.SimParams) L.SimParams {
         if (!gw.galaxy_on) return sp;
         var box = sp;
@@ -744,7 +795,7 @@ pub const GpuWorld = struct {
         std.debug.assert(slot.fence == null);
 
         // Stage uploads: spawns (into free slots first, then the tail), lasso polygon, blasts.
-        const up: [*]u8 = @ptrCast(c.SDL_MapGPUTransferBuffer(gw.dev, gw.upload_tb, true) orelse return error.GpuSetupFailed);
+        const up: [*]u8 = @ptrCast(c.SDL_MapGPUTransferBuffer(gw.dev, gw.upload_tb, true) orelse return gpuFail("SDL_MapGPUTransferBuffer (upload)"));
         const recs: [*]SpawnRec = @ptrCast(@alignCast(up));
         var n_spawn: u32 = 0;
         while (n_spawn < spawn_batch and gw.pending_head < gw.pending.items.len) {
@@ -798,7 +849,7 @@ pub const GpuWorld = struct {
 
         var timer = Timer{ .on = sample, .dev = gw.dev };
         if (sample) _ = c.SDL_WaitForGPUIdle(gw.dev);
-        var cmd = c.SDL_AcquireGPUCommandBuffer(gw.dev) orelse return error.GpuSetupFailed;
+        var cmd = c.SDL_AcquireGPUCommandBuffer(gw.dev) orelse return gpuFail("SDL_AcquireGPUCommandBuffer");
         timer.start();
 
         if (n_spawn > 0 or n_poly > 0 or n_blast > 0) {
@@ -870,7 +921,13 @@ pub const GpuWorld = struct {
         }
 
         const sp = gw.simParams(w, in);
-        if (in.mutual_gravity) gw.grav.apply(cmd, gw.gravityBox(sp), .{ .pos = gw.sim.pos, .body = gw.sim.body, .vel = gw.sim.vel }, gw.gravityScale(sp), if (gw.galaxy_on) galaxy_softening else @import("gravity").default_softening);
+        if (in.mutual_gravity) {
+            const balls: @import("gravity").Balls = .{ .pos = gw.sim.pos, .body = gw.sim.body, .vel = gw.sim.vel };
+            if (gw.galaxy_on) {
+                const win = gw.gravityBox(sp);
+                cmd = gw.grav.applyAutoBoxIn(cmd, sp.ball_count, balls, gw.gravityScale(sp), galaxy_softening, .{ win.bounds_min_x, win.bounds_min_y }, win.bounds_max_x - win.bounds_min_x);
+            } else gw.grav.apply(cmd, sp, balls, gw.gravityScale(sp), @import("gravity").default_softening);
+        }
         cmd = try timer.lap(cmd, &gw.profile.gravity_ms);
         gw.sim.step(cmd, sp);
         cmd = try timer.lap(cmd, &gw.profile.collide_ms);
@@ -884,12 +941,21 @@ pub const GpuWorld = struct {
             gw.recordFire(cmd, &gp, b, sp, groups);
             if (gw.fire_wake > 0) gw.fire_wake -= 1;
         }
+        const want_diag = gw.galaxy_on and in.mutual_gravity and gw.count >= 2 and gw.pending_head >= gw.pending.items.len and (gw.diag_now or gw.tick_no % diag_every_ticks == 0);
+        if (want_diag) {
+            gw.diag_now = false;
+            gw.grav.recordDiagnostics(cmd, gw.count, .{ .pos = gw.sim.pos, .body = gw.sim.body, .vel = gw.sim.vel }, galaxy_softening, gw.galaxy_extent, diag_pair_budget);
+            slot.diag_epoch = gw.energy_epoch;
+            slot.diag_g = gw.galaxyG();
+            slot.diag_weight = @as(f64, @floatFromInt(@min(gw.count, gw.grav.capacity))) / @as(f64, @floatFromInt(gw.grav.last_samples));
+        }
         const cp = c.SDL_BeginGPUCopyPass(cmd);
+        if (want_diag) gw.grav.downloadDiag(cp.?, slot.tb, diag_offset);
         c.SDL_DownloadFromGPUBuffer(cp, &.{ .buffer = gw.out, .size = out_bytes }, &.{ .transfer_buffer = slot.tb, .offset = 0 });
         c.SDL_DownloadFromGPUBuffer(cp, &.{ .buffer = gw.pick_buf, .size = 16 }, &.{ .transfer_buffer = slot.tb, .offset = out_bytes });
         c.SDL_DownloadFromGPUBuffer(cp, &.{ .buffer = gw.fx, .size = fx_bytes }, &.{ .transfer_buffer = slot.tb, .offset = out_bytes + 16 });
         c.SDL_EndGPUCopyPass(cp);
-        slot.fence = c.SDL_SubmitGPUCommandBufferAndAcquireFence(cmd) orelse return error.GpuSetupFailed;
+        slot.fence = c.SDL_SubmitGPUCommandBufferAndAcquireFence(cmd) orelse return gpuFail("SDL_SubmitGPUCommandBufferAndAcquireFence");
         if (sample) {
             _ = c.SDL_WaitForGPUFences(gw.dev, true, &slot.fence.?, 1);
             gw.profile.game_ms = timer.since();
@@ -1019,17 +1085,22 @@ const Timer = struct {
 
     fn lap(tm: *Timer, cmd: *c.SDL_GPUCommandBuffer, out: *f32) !*c.SDL_GPUCommandBuffer {
         if (!tm.on) return cmd;
-        gs.submitWait(tm.dev, cmd) catch return error.GpuSetupFailed;
+        gs.submitWait(tm.dev, cmd) catch return gpuFail("submitWait (timing lap)");
         const now = c.SDL_GetPerformanceCounter();
         out.* = msBetween(tm.t, now);
         tm.t = now;
-        return c.SDL_AcquireGPUCommandBuffer(tm.dev) orelse error.GpuSetupFailed;
+        return c.SDL_AcquireGPUCommandBuffer(tm.dev) orelse gpuFail("SDL_AcquireGPUCommandBuffer (timing lap)");
     }
 
     fn since(tm: *Timer) f32 {
         return msBetween(tm.t, c.SDL_GetPerformanceCounter());
     }
 };
+
+fn gpuFail(what: []const u8) error{GpuSetupFailed} {
+    std.log.err("gpu_world: {s} failed: {s}", .{ what, c.SDL_GetError() });
+    return error.GpuSetupFailed;
+}
 
 fn msBetween(a: u64, b: u64) f32 {
     return @floatCast(@as(f64, @floatFromInt(b - a)) * 1000.0 / @as(f64, @floatFromInt(c.SDL_GetPerformanceFrequency())));
@@ -1268,6 +1339,15 @@ test "gpu world: galaxy disk in ghost mode keeps its shape and angular momentum"
     const d1 = try GalaxyDump.read(gpa, &gw);
     defer d1.free(gpa);
     const s1 = d1.centreAndSpin();
+    // The GPU energy readout (latest one, <= 20 ticks old) matches a host sum over the dump.
+    var ke: f64 = 0;
+    for (d1.vel, d1.body, d1.meta) |v, b, mt| {
+        if (mt & L.flag_alive != 0) ke += 0.5 * b.mass * (@as(f64, v.x) * v.x + @as(f64, v.y) * v.y);
+    }
+    const e = gw.energy.?;
+    try std.testing.expectApproxEqRel(ke, e.ke, 0.05);
+    try std.testing.expect(e.pe < 0 and gw.energy_base != null);
+    try std.testing.expectApproxEqRel(d1.mass(), e.mass, 1e-3);
 
     var inside: usize = 0;
     for (d1.pos, d1.vel) |p, v| {

@@ -60,7 +60,13 @@ pub const GalaxyHud = struct {
     collide: []const u8,
     /// Gravity relative to the scenario's own (1 = as built).
     g_mult: f32,
+    /// Kinetic, (sampled) potential and angular momentum now and at scenario load; null until the
+    /// first readout of the scenario arrives.
+    energy: ?Energy = null,
+    energy0: Energy = .{},
 };
+
+pub const Energy = struct { ke: f64 = 0, pe: f64 = 0, lz: f64 = 0 };
 
 pub const Hud = struct {
     balls_per_click: u32 = 1,
@@ -869,6 +875,13 @@ pub const Renderer = struct {
         return font.textWidth(len, scale * self.hudScale());
     }
 
+    /// "+x.xx%" drift of `now` from `base`, or "n/a" when it is not a finite number.
+    fn driftText(buf: []u8, now: f64, base: f64, prec: u2) []const u8 {
+        const d = 100 * (now - base) / @abs(base);
+        if (!std.math.isFinite(d)) return "n/a";
+        return (if (prec == 2) std.fmt.bufPrint(buf, "{d:.2}%", .{d}) else std.fmt.bufPrint(buf, "{d:.3}%", .{d})) catch "n/a";
+    }
+
     fn drawText(self: *Renderer, w: *const world.World, hud: *const Hud) void {
         const hs = self.hudScale();
         const white = rgb8(255, 255, 255);
@@ -886,6 +899,20 @@ pub const Renderer = struct {
         if (hud.galaxy) |gh| {
             self.text(x, y, 2, rgb8(160, 200, 255), "GALAXY: {s}  bodies {d}  collide {s}  g x{d:.2}", .{ gh.scenario, gh.bodies, gh.collide, gh.g_mult });
             y += lh * 1.4;
+            if (gh.energy) |e| if (std.math.isFinite(e.ke + e.pe + e.lz)) show: {
+                const e0 = gh.energy0;
+                const grey = rgb8(190, 255, 190);
+                const tot = e.ke + e.pe;
+                const tot0 = e0.ke + e0.pe;
+                var b0: [32]u8 = undefined;
+                var b1: [32]u8 = undefined;
+                var b2: [32]u8 = undefined;
+                self.text(x, y, 1.5, grey, "KE {e:.3} ({s})  Lz {e:.3} ({s})", .{ e.ke, driftText(&b0, e.ke, e0.ke, 2), e.lz, driftText(&b1, e.lz, e0.lz, 3) });
+                y += lh;
+                self.text(x, y, 1.5, grey, "PE {e:.3} (sampled)  E {e:.3} ({s})  drift since load", .{ e.pe, tot, driftText(&b2, tot, tot0, 2) });
+                y += lh * 1.4;
+                break :show;
+            };
         }
         const help = [_][:0]const u8{
             "Press [LEFT CLICK] to spawn ball.",

@@ -21,7 +21,7 @@ pub const Balls = struct {
     vel: *c.SDL_GPUBuffer,
 };
 
-const Kernel = enum { boundsPartial, boundsFinal, clearCounts, binBalls, scanBlocks, scanTotals, scatterBalls, leafMultipoles, upwardPass, downwardPass, evaluate };
+const Kernel = enum { boundsPartial, boundsFinal, clearCounts, binBalls, scanBlocks, scanTotals, scatterBalls, leafMultipoles, upwardPass, downwardPass, evaluate, diagPartial, potentialPartial, diagFinal };
 const n_kernels = @typeInfo(Kernel).@"enum".field_names.len;
 
 /// Average balls per occupied leaf cell the leaf level aims for. Lower means more M2L work,
@@ -40,7 +40,8 @@ pub const scratch_bytes_per_body: u32 = @sizeOf(K.Key) + @sizeOf(K.Sorted);
 pub const Gravity = struct {
     device: *c.SDL_GPUDevice,
     capacity: u32,
-    /// Word index of the GPU-computed tree box in `cells` (the last three words, plus one spare).
+    /// Word index of the GPU-computed tree box in `cells`: three words of box, one spare, then the
+    /// diagnostics result (K.diag_result_words).
     box_word: u32,
     max_leaf_level: u32,
     pipes: [n_kernels]*c.SDL_GPUComputePipeline,
@@ -51,6 +52,9 @@ pub const Gravity = struct {
     local: *c.SDL_GPUBuffer,
     /// Leaf level chosen by the last apply (for the perf overlay).
     last_leaf_level: u32 = 0,
+    /// Sampled bodies of the last `recordDiagnostics` potential sum.
+    last_samples: u32 = 0,
+    local_slots: u32 = 0,
     /// Submit the command buffer in pieces (box+bin, tree build, evaluate) so no single submission
     /// nears the driver's job watchdog at 100M+ bodies. Only `applyAutoBox` honours it.
     split_submit: bool = false,
@@ -84,7 +88,7 @@ pub const Gravity = struct {
         const leaf_cells = @as(u32, 1) << @intCast(2 * g.max_leaf_level);
         const pyramid = K.levelOffset(g.max_leaf_level + 1);
         g.box_word = K.cellsWords(leaf_cells);
-        g.cells = try makeBuffer(device, (g.box_word + 4) * 4);
+        g.cells = try makeBuffer(device, (g.box_word + K.diag_result_offset + K.diag_result_words) * 4);
         errdefer c.SDL_ReleaseGPUBuffer(device, g.cells);
         g.keys = try makeBuffer(device, g.capacity * @sizeOf(K.Key));
         errdefer c.SDL_ReleaseGPUBuffer(device, g.keys);
@@ -92,6 +96,7 @@ pub const Gravity = struct {
         errdefer c.SDL_ReleaseGPUBuffer(device, g.sorted);
         g.mpole = try makeBuffer(device, pyramid * K.order * @sizeOf(L.Vec2));
         errdefer c.SDL_ReleaseGPUBuffer(device, g.mpole);
+        g.local_slots = pyramid * K.order;
         g.local = try makeBuffer(device, pyramid * K.order * @sizeOf(L.Vec2));
         return g;
     }
@@ -109,7 +114,7 @@ pub const Gravity = struct {
         const size = @max(w, h, 1.0);
         // The tree is square over the bounds; only the w*h part of it holds balls.
         const fill = @max(w, 1.0) * @max(h, 1.0) / (size * size);
-        _ = g.record(cmd, params.ball_count, fill, .{ params.bounds_min_x, params.bounds_min_y, size }, K.no_box, balls, g_scale, softening, false, false);
+        _ = g.record(cmd, params.ball_count, fill, .{ params.bounds_min_x, params.bounds_min_y, size }, K.no_box, balls, g_scale, softening, false, false, false);
     }
 
     /// Like `apply`, but the tree box is recomputed on the GPU from the bodies' bounding box (two
@@ -117,12 +122,74 @@ pub const Gravity = struct {
     /// the box (fill = 1) when picking the leaf level.
     /// Returns the command buffer to keep recording into (a new one when `split_submit` is set).
     pub fn applyAutoBox(g: *Gravity, cmd: *c.SDL_GPUCommandBuffer, n: u32, balls: Balls, g_scale: f32, softening: f32) *c.SDL_GPUCommandBuffer {
-        return g.record(cmd, n, 1.0, .{ 0, 0, 1 }, g.box_word, balls, g_scale, softening, false, g.split_submit);
+        return g.record(cmd, n, 1.0, .{ 0, 0, 1 }, g.box_word, balls, g_scale, softening, false, g.split_submit, false);
+    }
+
+    /// `applyAutoBox` with positions clamped into the square window (origin, side) before the box
+    /// is taken: the box is tight around the bodies but never larger than the window, so a few
+    /// escapees cost no more than a fixed window box would.
+    pub fn applyAutoBoxIn(g: *Gravity, cmd: *c.SDL_GPUCommandBuffer, n: u32, balls: Balls, g_scale: f32, softening: f32, origin: [2]f32, side: f32) *c.SDL_GPUCommandBuffer {
+        return g.record(cmd, n, 1.0, .{ origin[0], origin[1], side }, g.box_word, balls, g_scale, softening, false, g.split_submit, true);
     }
 
     /// Records only the box reduction of `applyAutoBox` (for timing it).
     pub fn recordBoxOnly(g: *Gravity, cmd: *c.SDL_GPUCommandBuffer, n: u32, balls: Balls) void {
-        _ = g.record(cmd, n, 1.0, .{ 0, 0, 1 }, g.box_word, balls, 0, 0, true, false);
+        _ = g.record(cmd, n, 1.0, .{ 0, 0, 1 }, g.box_word, balls, 0, 0, true, false, false);
+    }
+
+    /// Records the energy diagnostics passes (after `apply*`: they borrow `local` as scratch).
+    /// The result lands in `cells`; fetch it with `downloadDiag`. Potential energy is summed over
+    /// about `pair_budget / n` sampled bodies, with the zero of the potential at distance `ref_len` (all of them when that covers n).
+    pub fn recordDiagnostics(g: *Gravity, cmd: *c.SDL_GPUCommandBuffer, n_in: u32, balls: Balls, softening: f32, ref_len: f32, pair_budget: u32) void {
+        const n = @min(n_in, g.capacity);
+        g.last_samples = 1;
+        if (n < 2) return;
+        const samples = @min(n, @max(64, pair_budget / n));
+        // The partials live in `local`, which must be big enough for them.
+        const diag_groups = (n + K.diag_per_thread * L.group_size - 1) / (K.diag_per_thread * L.group_size);
+        const room = (g.local_slots - 2 * diag_groups) * L.group_size;
+        const chunks = @max(1, @min(K.potential_threads, room) / samples);
+        var kp: K.Params = .{
+            .n = n,
+            .leaf_level = 0,
+            .level = 0,
+            .origin_x = 0,
+            .origin_y = 0,
+            .root_size = 1,
+            .g_scale = 1 / (ref_len * ref_len),
+            .softening = softening,
+            .box_word = g.box_word,
+            .samples = samples,
+            .chunks = chunks,
+            .chunk_len = (n + chunks - 1) / chunks,
+            .seed = 0x2545F491,
+        };
+        g.last_samples = samples;
+        const ro = [_]*c.SDL_GPUBuffer{ balls.pos, balls.body };
+        const rw = [_]c.SDL_GPUStorageBufferReadWriteBinding{
+            .{ .buffer = balls.vel }, .{ .buffer = g.cells }, .{ .buffer = g.keys },
+            .{ .buffer = g.sorted },  .{ .buffer = g.mpole }, .{ .buffer = g.local },
+        };
+        const steps = [_]struct { k: Kernel, threads: u32 }{
+            .{ .k = .diagPartial, .threads = (n + K.diag_per_thread - 1) / K.diag_per_thread },
+            .{ .k = .potentialPartial, .threads = samples * chunks },
+            .{ .k = .diagFinal, .threads = L.group_size },
+        };
+        for (steps) |st| {
+            c.SDL_PushGPUComputeUniformData(cmd, 0, &kp, @sizeOf(K.Params));
+            const cp = c.SDL_BeginGPUComputePass(cmd, null, 0, &rw, rw.len);
+            c.SDL_BindGPUComputePipeline(cp, g.pipes[@backingInt(st.k)]);
+            c.SDL_BindGPUComputeStorageBuffers(cp, 0, &ro, ro.len);
+            const groups = (st.threads + L.group_size - 1) / L.group_size;
+            c.SDL_DispatchGPUCompute(cp, @min(groups, K.dispatch_x), (groups + K.dispatch_x - 1) / K.dispatch_x, 1);
+            c.SDL_EndGPUComputePass(cp);
+        }
+    }
+
+    /// Copies the 16 result bytes of `recordDiagnostics` (ke, lz, mass, potential sum as f32) into
+    /// `dst` at `offset`, inside a copy pass.
+    pub fn downloadDiag(g: *Gravity, cp: *c.SDL_GPUCopyPass, dst: *c.SDL_GPUTransferBuffer, offset: u32) void {
+        c.SDL_DownloadFromGPUBuffer(cp, &.{ .buffer = g.cells, .offset = (g.box_word + K.diag_result_offset) * 4, .size = K.diag_result_words * 4 }, &.{ .transfer_buffer = dst, .offset = offset });
     }
 
     fn splitHere(g: *Gravity, cmd: *c.SDL_GPUCommandBuffer, split: bool) *c.SDL_GPUCommandBuffer {
@@ -131,7 +198,7 @@ pub const Gravity = struct {
         return c.SDL_AcquireGPUCommandBuffer(g.device) orelse unreachable;
     }
 
-    fn record(g: *Gravity, cmd0: *c.SDL_GPUCommandBuffer, count: u32, fill: f32, box: [3]f32, box_word: u32, balls: Balls, g_scale: f32, softening: f32, box_only: bool, split: bool) *c.SDL_GPUCommandBuffer {
+    fn record(g: *Gravity, cmd0: *c.SDL_GPUCommandBuffer, count: u32, fill: f32, box: [3]f32, box_word: u32, balls: Balls, g_scale: f32, softening: f32, box_only: bool, split: bool, window: bool) *c.SDL_GPUCommandBuffer {
         var cmd = cmd0;
         const n = @min(count, g.capacity);
         if (n < 2) return cmd;
@@ -147,6 +214,7 @@ pub const Gravity = struct {
             .g_scale = g_scale,
             .softening = softening,
             .box_word = box_word,
+            .clamp_window = @intFromBool(window),
         };
         const leaf_cells = @as(u32, 1) << @intCast(2 * leaf);
         const ro = [_]*c.SDL_GPUBuffer{ balls.pos, balls.body };

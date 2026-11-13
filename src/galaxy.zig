@@ -91,7 +91,7 @@ pub fn system(gpa: std.mem.Allocator, list: *std.ArrayList(Body), r: std.Random,
     try list.append(gpa, body(c.x, c.y, bulk.x, bulk.y, star_m));
     var inner = star_m;
     const planets = r.intRangeAtMost(u32, 3, 6);
-    const star_r = radiusFor(star_m);
+    const star_r = layoutRadius(star_m);
     var a: f32 = star_r + 25;
     for (0..planets) |_| {
         a += 30 + r.float(f32) * 35;
@@ -107,7 +107,7 @@ pub fn system(gpa: std.mem.Allocator, list: *std.ArrayList(Body), r: std.Random,
         try list.append(gpa, body(px, py, pvx, pvy, pm));
         // A moon stays bound while the planet's pull g*m/d beats the star's tidal pull
         // g*M*d/a^2, i.e. d << a*sqrt(m/M); 0.4 of that bound keeps most moons for many orbits.
-        const pr = radiusFor(pm);
+        const pr = layoutRadius(pm);
         const d_max = 0.4 * a * @sqrt(pm / inner);
         var d = pr + 5;
         var moons: u32 = 0;
@@ -116,7 +116,7 @@ pub fn system(gpa: std.mem.Allocator, list: *std.ArrayList(Body), r: std.Random,
             const mth = r.float(f32) * std.math.tau;
             const mv = @sqrt(g * pm);
             try list.append(gpa, body(px + d * @cos(mth), py + d * @sin(mth), pvx - @sin(mth) * mv, pvy + @cos(mth) * mv, mm));
-            d += radiusFor(mm) * 2 + 3;
+            d += layoutRadius(mm) * 2 + 3;
         }
         inner += pm;
     }
@@ -134,7 +134,14 @@ pub const max_body_radius: f32 = 10;
 
 /// Ball radius for a body of mass `m` (world units). Area grows with mass, as for accretion.
 pub fn radiusFor(m: f32) f32 {
-    return std.math.clamp(1.2 + 1.1 * @sqrt(m), 1.5, @min(max_body_radius, cfg.max_radius * 0.4));
+    return @min(layoutRadius(m), max_body_radius);
+}
+
+/// Radius before the `max_body_radius` cap. Builders place bodies by this, so the cap changes only
+/// how big bodies are drawn and collide, not where orbits start (a smaller offset piled the
+/// innermost stars into a few gravity-tree leaf cells: +1.6 ms at 1M).
+fn layoutRadius(m: f32) f32 {
+    return std.math.clamp(1.2 + 1.1 * @sqrt(m), 1.5, cfg.max_radius * 0.4);
 }
 
 /// Merge-game level (ball texture) for a body of mass `m`: heavier bodies get later textures.
@@ -203,7 +210,7 @@ fn disk(gpa: std.mem.Allocator, list: *std.ArrayList(Body), r: std.Random, n: u3
     }
     const core_m = DiskOpts.core_frac_default * m_disk;
     const g = g_fixed orelse v0 * v0 / (core_m + m_disk);
-    const core_r = radiusFor(core_m);
+    const core_r = layoutRadius(core_m);
     // Circular speed needs the mass inside each orbit: sort by radius and accumulate.
     std.mem.sort(Body, stars, {}, struct {
         fn lt(_: void, a: Body, b: Body) bool {
