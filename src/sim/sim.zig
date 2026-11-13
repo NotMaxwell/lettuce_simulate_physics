@@ -150,43 +150,75 @@ pub const Sim = struct {
         return sh.bytes_per_body_state + gravity.scratch_bytes_per_body;
     }
 
+    /// Upload staging: one transfer buffer reused for every part.
+    pub const Uploader = struct {
+        tb: *c.SDL_GPUTransferBuffer,
+        capacity: usize,
+    };
+
+    pub fn uploaderInit(s: *Sim, capacity: usize) Error!Uploader {
+        const tb = c.SDL_CreateGPUTransferBuffer(s.dev, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = @intCast(capacity * @sizeOf(L.BallBody)) }) orelse return error.GpuBuffer;
+        return .{ .tb = tb, .capacity = capacity };
+    }
+
+    pub fn uploaderDeinit(s: *Sim, u: Uploader) void {
+        c.SDL_ReleaseGPUTransferBuffer(s.dev, u.tb);
+    }
+
+    /// Blocking upload of bodies [at, at + part.len); `part.len` must not exceed the uploader capacity.
+    pub fn uploadPart(s: *Sim, u: Uploader, at: usize, part: []const galaxy.Body) Error!void {
+        if (part.len > u.capacity or at + part.len > s.cfg.n) return error.OutOfRange;
+        const targets = [_]struct { buf: Buffer, size: usize }{
+            .{ .buf = s.pos, .size = @sizeOf(L.Vec2) },
+            .{ .buf = s.vel, .size = @sizeOf(L.Vec2) },
+            .{ .buf = s.body, .size = @sizeOf(L.BallBody) },
+        };
+        for (targets, 0..) |t, which| {
+            const m: [*]u8 = @ptrCast(c.SDL_MapGPUTransferBuffer(s.dev, u.tb, false) orelse return error.GpuBuffer);
+            switch (which) {
+                0 => for (@as([*]L.Vec2, @ptrCast(@alignCast(m)))[0..part.len], part) |*o, b| {
+                    o.* = .{ .x = b.x, .y = b.y };
+                },
+                1 => for (@as([*]L.Vec2, @ptrCast(@alignCast(m)))[0..part.len], part) |*o, b| {
+                    o.* = .{ .x = b.vx, .y = b.vy };
+                },
+                else => for (@as([*]L.BallBody, @ptrCast(@alignCast(m)))[0..part.len], part) |*o, b| {
+                    o.* = .{ .radius = 0, .mass = b.mass, .retention = 0, .friction = 0 };
+                },
+            }
+            c.SDL_UnmapGPUTransferBuffer(s.dev, u.tb);
+            const cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
+            const cp = c.SDL_BeginGPUCopyPass(cmd);
+            c.SDL_UploadToGPUBuffer(cp, &.{ .transfer_buffer = u.tb }, &.{ .buffer = t.buf, .offset = @intCast(at * t.size), .size = @intCast(part.len * t.size) }, false);
+            c.SDL_EndGPUCopyPass(cp);
+            try submitWait(s.dev, cmd);
+        }
+    }
+
     /// Blocking upload of the initial conditions. Synchronous velocities; resets the clock.
     pub fn upload(s: *Sim, bodies: []const galaxy.Body) Error!void {
         if (bodies.len != s.cfg.n) return error.OutOfRange;
         const chunk: usize = 1 << 20;
-        const tb = c.SDL_CreateGPUTransferBuffer(s.dev, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = @intCast(chunk * @sizeOf(L.BallBody)) }) orelse return error.GpuBuffer;
-        defer c.SDL_ReleaseGPUTransferBuffer(s.dev, tb);
+        const u = try s.uploaderInit(chunk);
+        defer s.uploaderDeinit(u);
         var at: usize = 0;
-        while (at < bodies.len) : (at += chunk) {
-            const part = bodies[at..@min(at + chunk, bodies.len)];
-            const targets = [_]struct { buf: Buffer, size: usize }{
-                .{ .buf = s.pos, .size = @sizeOf(L.Vec2) },
-                .{ .buf = s.vel, .size = @sizeOf(L.Vec2) },
-                .{ .buf = s.body, .size = @sizeOf(L.BallBody) },
-            };
-            for (targets, 0..) |t, which| {
-                const m: [*]u8 = @ptrCast(c.SDL_MapGPUTransferBuffer(s.dev, tb, false) orelse return error.GpuBuffer);
-                switch (which) {
-                    0 => for (@as([*]L.Vec2, @ptrCast(@alignCast(m)))[0..part.len], part) |*o, b| {
-                        o.* = .{ .x = b.x, .y = b.y };
-                    },
-                    1 => for (@as([*]L.Vec2, @ptrCast(@alignCast(m)))[0..part.len], part) |*o, b| {
-                        o.* = .{ .x = b.vx, .y = b.vy };
-                    },
-                    else => for (@as([*]L.BallBody, @ptrCast(@alignCast(m)))[0..part.len], part) |*o, b| {
-                        o.* = .{ .radius = 0, .mass = b.mass, .retention = 0, .friction = 0 };
-                    },
-                }
-                c.SDL_UnmapGPUTransferBuffer(s.dev, tb);
-                const cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
-                const cp = c.SDL_BeginGPUCopyPass(cmd);
-                c.SDL_UploadToGPUBuffer(cp, &.{ .transfer_buffer = tb }, &.{ .buffer = t.buf, .offset = @intCast(at * t.size), .size = @intCast(part.len * t.size) }, false);
-                c.SDL_EndGPUCopyPass(cp);
-                try submitWait(s.dev, cmd);
-            }
-        }
+        while (at < bodies.len) : (at += chunk) try s.uploadPart(u, at, bodies[at..@min(at + chunk, bodies.len)]);
         s.tick_no = 0;
         s.half_pending = true;
+    }
+
+    /// Sets the integrator clock after a restart.
+    pub fn setClock(s: *Sim, tick: u64, half_pending: bool) void {
+        s.tick_no = tick;
+        s.half_pending = half_pending;
+    }
+
+    /// Records the missing half kick (if any) so velocities are synchronous with positions; the
+    /// next tick then skips its opening half kick. Returns the command buffer to continue with.
+    pub fn recordSync(s: *Sim, cmd0: *c.SDL_GPUCommandBuffer) *c.SDL_GPUCommandBuffer {
+        if (s.half_pending) return cmd0;
+        s.half_pending = true;
+        return s.kick(cmd0, 0.5);
     }
 
     /// Sets the box half side `recordGravityFixedBox` uses (bench comparison only).
@@ -242,10 +274,7 @@ pub const Sim = struct {
     /// Diagnostics at synchronous velocities (blocking). Applies the pending half kick if needed.
     pub fn measure(s: *Sim) Error!Diag {
         var cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
-        if (!s.half_pending) {
-            cmd = s.kick(cmd, 0.5);
-            s.half_pending = true;
-        }
+        cmd = s.recordSync(cmd);
         s.recordDiag(cmd);
         const cp = c.SDL_BeginGPUCopyPass(cmd);
         const diag_bytes = s.diag_groups * sh.diag_stride * 4;

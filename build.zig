@@ -99,8 +99,12 @@ pub fn build(b: *std.Build) void {
         },
     });
     sim_mod.linkLibrary(sdl_lib);
+    // stb_image is only used to decode the renderer's PNGs in tests.
+    sim_mod.addIncludePath(b.path("vendor"));
+    sim_mod.addCSourceFile(.{ .file = b.path("vendor/impl.c"), .flags = &.{"-O2"} });
     const sim_layout = b.createModule(.{ .root_source_file = b.path("src/gpu_layout.zig") });
     sim_mod.addAnonymousImport("sim_kernels.spv", .{ .root_source_file = spirvObject(b, "sim_kernels", b.path("src/sim/kernels.zig"), sim_layout, null) });
+    sim_mod.addAnonymousImport("render_kernels.spv", .{ .root_source_file = spirvObject(b, "render_kernels", b.path("src/sim/render_kernels.zig"), sim_layout, null) });
     const sim_exe = b.addExecutable(.{ .name = "sim", .root_module = sim_mod });
     b.installArtifact(sim_exe);
     const sim_run = b.addRunArtifact(sim_exe);
@@ -108,6 +112,12 @@ pub fn build(b: *std.Build) void {
     sim_run.addPassthruArgs();
     setGpuEnv(b, sim_run);
     b.step("sim", "Headless matter simulation (see src/sim/main.zig for flags)").dependOn(&sim_run.step);
+    const render_run = b.addRunArtifact(sim_exe);
+    render_run.setCwd(b.path("."));
+    render_run.addArg("render-snap");
+    render_run.addPassthruArgs();
+    setGpuEnv(b, render_run);
+    b.step("render-snap", "Render snapshots to PNG density images (see src/sim/render_cli.zig)").dependOn(&render_run.step);
     const sim_test_run = b.addRunArtifact(b.addTest(.{ .root_module = sim_mod }));
     setGpuEnv(b, sim_test_run);
     test_step.dependOn(&sim_test_run.step);

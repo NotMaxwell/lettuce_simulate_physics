@@ -28,3 +28,15 @@ pub const Params = extern struct {
 /// Lean body layout the sim needs: position, velocity, mass (in `L.BallBody.mass` for now, because
 /// the shared gravity kernels read the mass from there).
 pub const bytes_per_body_state = @sizeOf(L.Vec2) * 2 + @sizeOf(L.BallBody);
+pub const RenderParams = extern struct {
+    count: u32,
+    width: u32,
+    height: u32,
+    log_scale: u32,
+    cx: f32,
+    cy: f32,
+    /// Pixels per world unit.
+    scale: f32,
+    /// Fixed-point weight of a body: u32(mass * weight_scale).
+    weight_scale: f32,
+};
