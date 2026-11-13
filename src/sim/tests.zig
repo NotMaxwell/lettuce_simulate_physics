@@ -8,6 +8,7 @@ test { _ = @import("ref3.zig"); }
 test { _ = @import("walk3_tests.zig"); }
 const render = @import("render.zig");
 comptime { _ = @import("snap_tests.zig"); }
+comptime { _ = @import("sort3_tests.zig"); }
 
 fn device() !*c.SDL_GPUDevice {
     _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
@@ -268,3 +269,4 @@ test "snapshot: truncated or unfinished files are rejected, and no temp file is 
     }
 }
 test { _ = @import("tests3.zig"); }
+test { _ = @import("tree3_tests.zig"); }

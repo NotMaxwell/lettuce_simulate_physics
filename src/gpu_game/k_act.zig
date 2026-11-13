@@ -1,6 +1,6 @@
 //! Player actions on GPU balls: pick/grab/release, lasso kill, explosion knockback.
 //! Bindings: ro 0 pos, 1 poly (lasso points), 2 blasts;
-//!           rw 0 vel, 1 body, 2 meta, 3 pick, 4 out, 5 heat.
+//!           rw 0 vel, 1 body, 2 meta, 3 pick, 4 out, 5 heat, 6 cand (gpu_sim event buffer).
 const c = @import("common.zig");
 const L = c.L;
 
@@ -13,6 +13,7 @@ const meta = c.rw(L.BallMeta, 2, "meta");
 const pick_buf = c.rw(u32, 3, "pick");
 const out = c.rw(L.Event, 4, "out");
 const heat = c.rw(L.BallHeat, 5, "heat");
+const cand = c.rw(L.Event, 6, "cand");
 const cfg = c.cfg;
 
 export fn clearPick() callconv(c.kernel_cc) void {
@@ -51,15 +52,20 @@ export fn grab() callconv(c.kernel_cc) void {
     }
     heat.v[i].temp = t;
     meta.v[i] = m;
+    // No follow step yet: a release before the next integrate adds nothing.
+    cand.v[0].b = 0;
+    cand.v[0].value = 0;
 }
 
-/// physics.zig releaseGrabs. The CPU also adds the last follow step's motion; the GPU integrate
-/// already accumulates the mouse motion into the velocity every held tick, so it is skipped.
+/// physics.zig releaseGrabs: the throw also gets the last follow step's motion (integrate leaves
+/// it in the candidate list's header), as Ball.releaseGrab adds it to the speed.
 export fn release() callconv(c.kernel_cc) void {
     const i = c.gid();
     if (i >= c.params.ball_count) return;
     const m = meta.v[i];
     if (m & L.flag_grabbed == 0) return;
+    const v = vel.v[i];
+    vel.v[i] = .{ .x = v.x + @as(f32, @bitCast(cand.v[0].b)), .y = v.y + cand.v[0].value };
     meta.v[i] = (m & ~L.flag_grabbed) | L.flag_thrown;
 }
 

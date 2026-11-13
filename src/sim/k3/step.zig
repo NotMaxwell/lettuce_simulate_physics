@@ -55,6 +55,10 @@ fn groups(n: u32) u32 {
 
 /// Per workgroup sums. Strided so a warp reads consecutive bodies. L is about the box centre.
 export fn diag() callconv(C.cc) void {
+    // 2D dispatches round the group count up to a multiple of dispatch_x; the extra groups would
+    // double-count and write past the partials. The return is uniform across the group, so it
+    // precedes every barrier safely.
+    if (C.groupId() >= groups(params.n)) return;
     const l = C.lid();
     const stride = groups(params.n) * C.group_size;
     var acc: [diag_fields]f32 = @splat(0);
@@ -120,5 +124,5 @@ export fn rungs() callconv(C.cc) void {
         const c: u32 = @intFromFloat(@ceil(@min(ratio, 1048576.0)));
         r = 32 - C.clz(c - 1);
     }
-    _ = C.atomicAdd(&bins.v[@min(r, rung_bins - 1)], 1);
+    _ = C.atomicAddAt(bins, @min(r, rung_bins - 1), 1);
 }

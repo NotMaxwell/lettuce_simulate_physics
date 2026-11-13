@@ -69,6 +69,18 @@ pub inline fn cellOf(p: Vec2, P: *addrspace(.uniform) Params) u32 {
 pub const flag_mutual_gravity = L.sim_flag_mutual_gravity;
 pub const flag_merging = L.sim_flag_merging;
 pub const flag_attract = L.sim_flag_attract;
+pub const flag_impact_heat = L.sim_flag_impact_heat;
+
+/// Temperature gained per unit of speed change over mass: config.zig impact_heat_mult (1.5) times the
+/// `* 10` of resolvePair's heat transfer, halved because a contact's velocity change is up to
+/// twice the closing speed (see k_finish: the estimate is a lower bound).
+pub const impact_heat_k: f32 = 7.5;
+/// Velocity changes of one solve below this are not considered for impact heat.
+pub const impact_dv_min: f32 = 30.0;
+/// Must equal config.zig ignition_temp.
+pub const ignition_temp: f32 = 100;
+/// gpu_game/common.zig fx_impact: finish stamps tick + 1 here when it lit a ball.
+pub const fx_impact = 10;
 
 /// The collision response chosen in SimParams.flags (L.CollideMode as a u32).
 pub inline fn collideMode(flags: u32) u32 {

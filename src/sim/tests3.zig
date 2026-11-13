@@ -5,6 +5,8 @@ const L = @import("gpu_layout");
 const ic3 = @import("ic3");
 const sim = @import("sim.zig");
 const sim3 = @import("sim3.zig");
+const snap = @import("snapshot.zig");
+const render = @import("render.zig");
 
 fn device() !*c.SDL_GPUDevice {
     _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
@@ -34,7 +36,7 @@ test "sim3: GPU forces on 10k Plummer bodies match an f64 direct sum" {
     const m = try gpa.alloc(f64, n);
     defer gpa.free(m);
     for (x, m, pos, bodies) |*xi, *mi, p, b| {
-        xi.* = .{ s.toWorld(p.x, 0), s.toWorld(p.y, 1), s.toWorld(p.z, 2) };
+        xi.* = .{ s.toWorld(p.x), s.toWorld(p.y), s.toWorld(p.z) };
         mi.* = @as(f32, @floatCast(b.m));
     }
     const acc = try gpa.alloc(L.Vel3, n);
@@ -66,7 +68,7 @@ test "sim3: GPU forces on 10k Plummer bodies match an f64 direct sum" {
 }
 
 fn keplerRun(dev: *c.SDL_GPUDevice, o: ic3.Kepler, periods: u32, steps_per_period: u32) !struct { s: sim3.Sim3, d0: sim3.Diag3, bodies: [2]ic3.Body3 } {
-    const bodies = ic3.kepler(o);
+    var bodies = ic3.kepler(o);
     const dt: f32 = @floatCast(ic3.keplerPeriod(o) / @as(f64, @floatFromInt(steps_per_period)));
     _ = periods;
     var s = try sim3.Sim3.init(dev, .{ .n = 2, .eps = 1e-4, .dt = dt, .box = ic3.fitBox(&bodies, 4) });
@@ -85,7 +87,7 @@ test "sim3: circular Kepler orbit at 2000 steps per period returns within 1e-3 a
     try r.s.read(L.Pos3, r.s.pos, &pos);
     var worst: f64 = 0;
     for (pos, r.bodies) |p, b| {
-        const d = [3]f64{ r.s.toWorld(p.x, 0) - b.x, r.s.toWorld(p.y, 1) - b.y, r.s.toWorld(p.z, 2) - b.z };
+        const d = [3]f64{ r.s.toWorld(p.x) - b.x, r.s.toWorld(p.y) - b.y, r.s.toWorld(p.z) - b.z };
         worst = @max(worst, @sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]));
     }
     std.debug.print("sim3 circular Kepler return error {e:.3} a\n", .{worst});
@@ -126,4 +128,94 @@ test "sim3: 10k Plummer sphere stays virialised over 10 crossing times" {
     const d1 = try s.measure();
     std.debug.print("sim3 Plummer 2K/|W| {d:.4} -> {d:.4}, dE/E {e:.2}, escapers {d}\n", .{ d0.virial(), d1.virial(), (d1.e() - d0.e()) / @abs(d0.e()), d1.escaped });
     try std.testing.expect(@abs(d1.virial() - 1) <= 0.05);
+}
+
+test "sim3: softening must be positive" {
+    const dev = try device();
+    defer c.SDL_DestroyGPUDevice(dev);
+    try std.testing.expectError(error.OutOfRange, sim3.Sim3.init(dev, .{ .n = 2, .eps = 0, .dt = 0.01, .box = .{ .size = 1 } }));
+}
+
+fn plummerSim(dev: *c.SDL_GPUDevice, gpa: std.mem.Allocator, n: u32) !sim3.Sim3 {
+    var prng = std.Random.DefaultPrng.init(9);
+    const bodies = try ic3.plummer(gpa, prng.random(), n, .{});
+    defer gpa.free(bodies);
+    var s = try sim3.Sim3.init(dev, .{ .n = n, .eps = 0.02, .dt = 0.01, .box = ic3.fitBox(bodies, 4) });
+    errdefer s.deinit();
+    try s.upload(bodies);
+    return s;
+}
+
+fn takeSnapshot(gpa: std.mem.Allocator, s: *sim3.Sim3, path: [:0]const u8) !void {
+    const sn = try s.snapshotter(gpa);
+    defer sn.destroy(gpa);
+    try sn.write(path, 9, 0);
+    sn.flush();
+    try std.testing.expect(!sn.writeFailed());
+}
+
+test "sim3: a restarted run is bit-identical to the continuous run" {
+    const dev = try device();
+    defer c.SDL_DestroyGPUDevice(dev);
+    const gpa = std.testing.allocator;
+    _ = c.SDL_CreateDirectory(".scratch");
+    const n = 3000;
+    const path = ".scratch/test3_restart.snap";
+
+    var a = try plummerSim(dev, gpa, n);
+    defer a.deinit();
+    try a.run(60);
+    try takeSnapshot(gpa, &a, path);
+    try a.run(60);
+
+    const io = try snap.open(path);
+    defer _ = c.SDL_CloseIO(io);
+    const h = try snap.readHeader(io);
+    try std.testing.expectEqual(@as(u64, 60), h.tick);
+    var b = try sim3.Sim3.init(dev, .{ .n = n, .g = h.g, .eps = h.softening, .dt = h.dt, .box = .{ .size = h.box_size } });
+    defer b.deinit();
+    try b.restore(gpa, io, &h);
+    try b.run(60);
+
+    try std.testing.expectEqual(a.tick_no, b.tick_no);
+    const pa = try gpa.alloc(L.Pos3, n);
+    defer gpa.free(pa);
+    const pb = try gpa.alloc(L.Pos3, n);
+    defer gpa.free(pb);
+    const va = try gpa.alloc(L.Vel3, n);
+    defer gpa.free(va);
+    const vb = try gpa.alloc(L.Vel3, n);
+    defer gpa.free(vb);
+    try a.read(L.Pos3, a.pos, pa);
+    try b.read(L.Pos3, b.pos, pb);
+    try a.read(L.Vel3, a.vel, va);
+    try b.read(L.Vel3, b.vel, vb);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(pa), std.mem.sliceAsBytes(pb));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(va), std.mem.sliceAsBytes(vb));
+}
+
+test "sim3: render-snap of a 3D snapshot gives a PNG with lit pixels" {
+    const dev = try device();
+    defer c.SDL_DestroyGPUDevice(dev);
+    const gpa = std.testing.allocator;
+    _ = c.SDL_CreateDirectory(".scratch");
+    var s = try plummerSim(dev, gpa, 5000);
+    defer s.deinit();
+    try s.run(20);
+    try takeSnapshot(gpa, &s, ".scratch/test3_render.snap");
+    var r = try render.Renderer.init(dev, 320, 200);
+    defer r.deinit();
+    _ = try r.render(gpa, ".scratch/test3_render.snap", ".scratch/test3_render.png", .{ .log = true });
+    var size: usize = 0;
+    const file: [*]const u8 = @ptrCast(c.SDL_LoadFile(".scratch/test3_render.png", &size) orelse return error.FileOpen);
+    defer c.SDL_free(@constCast(file));
+    var w: c_int = 0;
+    var hgt: c_int = 0;
+    var comp: c_int = 0;
+    const px = c.stbi_load_from_memory(file, @intCast(size), &w, &hgt, &comp, 3) orelse return error.PngDecode;
+    defer c.stbi_image_free(px);
+    try std.testing.expectEqual(@as(c_int, 320), w);
+    var lit: usize = 0;
+    for (px[0..@intCast(w * hgt * 3)]) |v| lit += @intFromBool(v != 0);
+    try std.testing.expect(lit > 300);
 }

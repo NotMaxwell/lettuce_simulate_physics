@@ -71,7 +71,9 @@ pub const SimParams = extern struct {
     mouse_x: f32,
     mouse_y: f32,
     attraction_strength: f32,
-    _pad: f32 = 0,
+    /// Merge candidate list capacity (header excluded); 0 = the full max_events - 1. A test hook:
+    /// a small value forces the overflow path with few balls.
+    event_cap: u32 = 0,
 };
 
 /// SimParams.flags bits. gpu_sim/common.zig re-exports the first three under its old names.
@@ -83,6 +85,9 @@ pub const sim_flag_galaxy: u32 = 1 << 3;
 /// Collision response, two bits: solid (default solver), accrete (any touching pair merges,
 /// conserving mass and momentum), ghost (no contact forces; gravity softening only).
 pub const sim_collide_shift: u5 = 4;
+/// Solid contacts heat the balls involved (physics.zig resolvePair impact heat); needs a heat and an
+/// fx buffer attached to the solver (gpu_sim Sim.heat_buf / fx_buf). Off in galaxy mode.
+pub const sim_flag_impact_heat: u32 = 1 << 6;
 pub const sim_collide_mask: u32 = 3 << sim_collide_shift;
 pub const CollideMode = enum(u32) { solid = 0, accrete = 1, ghost = 2 };
 
@@ -100,7 +105,9 @@ pub const event_death: u32 = 2;
 pub const event_explosion: u32 = 3;
 pub const event_score: u32 = 4;
 
-pub const max_events: u32 = 1 << 14;
+/// Merge candidates one tick can hold (plus the header). A candidate that does not fit is not
+/// lost: merging pairs get no contact response, so they still overlap and are found again next tick.
+pub const max_events: u32 = 1 << 15;
 
 /// Generic textured, rotatable quad for the sprite pipeline (backgrounds, explosions, HUD,
 /// glyphs, particles while still CPU-side). Balls are drawn by a dedicated pipeline that reads
@@ -200,4 +207,35 @@ comptime {
     std.debug.assert(@sizeOf(NodeQuad) == 24);
     std.debug.assert(@sizeOf(Params3) == 48);
     std.debug.assert(@sizeOf(WalkParams3) == 48);
+}
+
+/// Uniform block of the 3D tree build (src/sim/k3/tree.zig, recorded by src/sim/tree3.zig).
+/// Offsets are in u32 words of the build scratch buffer.
+pub const TreeParams3 = extern struct {
+    n: u32,
+    node_cap: u32,
+    leaf_cap: u32,
+    /// Depth handled by this moments pass.
+    depth: u32,
+    /// Length per position quantum: box_size / 2^32.
+    box_scale: f32,
+    theta: f32,
+    scan_count: u32 = 0,
+    scan_data: u32 = 0,
+    scan_sums: u32 = 0,
+    off_hdr: u32,
+    off_lstart: u32,
+    off_lkey: u32,
+    off_parent: u32,
+    off_bbox: u32,
+    off_sums0: u32,
+    off_total: u32,
+    off_rem: u32,
+    off_dmax: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+};
+
+comptime {
+    @import("std").debug.assert(@sizeOf(TreeParams3) == 80);
 }

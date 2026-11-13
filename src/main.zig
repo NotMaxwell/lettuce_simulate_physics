@@ -36,6 +36,10 @@ const Options = struct {
     galaxy_n: u32 = 0,
     /// null = solid in the normal game, ghost in galaxy mode (see enterGalaxy).
     collide: ?L.CollideMode = null,
+    /// false = retention-based ball-ball restitution (gpu_sim Sim.elastic), for scale checks.
+    elastic: bool = true,
+    /// Print a full state sanity readback after the last frame.
+    check: bool = false,
 };
 
 const Game = struct {
@@ -257,9 +261,8 @@ const Game = struct {
                 g.lasso.clearRetainingCapacity();
                 g.lasso.append(g.gpa, p) catch {};
             } else {
-                // The pick runs on the GPU and its result arrives a few ticks later: a hit has
-                // already been grabbed there, a miss starts the spawn (see `tick`).
-                g.gw.requestPick();
+                // Resolved at the start of the next tick (see `tick`): a hit is grabbed, a miss
+                // starts the spawn.
                 g.pick_pending = true;
             }
         }
@@ -285,6 +288,17 @@ const Game = struct {
     }
 
     fn tick(g: *Game) void {
+        // Before anything is queued, so a miss spawns in this very tick.
+        if (g.pick_pending) {
+            g.pick_pending = false;
+            if (g.gw.pickNow(g.mouse)) |hit| {
+                if (!hit and !(g.gw.galaxy_on and g.attracting())) {
+                    if (g.gw.galaxy_on) {
+                        g.gw.spawnSystemAt(&g.w, g.mouse.x, g.mouse.y) catch {};
+                    } else g.startSpawn();
+                }
+            }
+        }
         if (g.spawn_ticks_left > 0) {
             const extra = if (g.spawn_ticks_left == 1) g.spawn_remainder else 0;
             g.gw.queueBurst(&g.w, g.mouse.x, g.mouse.y, g.spawn_per_tick + extra) catch {};
@@ -300,15 +314,6 @@ const Game = struct {
             .merging = g.merging,
             .collide = g.collide,
         });
-
-        if (g.pick_pending) if (g.gw.pick_result) |hit| {
-            g.pick_pending = false;
-            if (!hit and !(g.gw.galaxy_on and g.attracting())) {
-                if (g.gw.galaxy_on) {
-                    g.gw.spawnSystemAt(&g.w, g.mouse.x, g.mouse.y) catch {};
-                } else g.startSpawn();
-            }
-        };
 
         const ev = g.w.events;
         g.merges_total += ev.merges;
@@ -395,6 +400,10 @@ fn parseOptions(args: []const [:0]const u8) Options {
                 o.galaxy_n = n;
                 i += 1;
             } else |_| {};
+        } else if (std.mem.eql(u8, flag, "--elastic")) {
+            o.elastic = !std.mem.eql(u8, value, "off");
+        } else if (std.mem.eql(u8, flag, "--check")) {
+            o.check = std.mem.eql(u8, value, "on");
         } else if (std.mem.eql(u8, flag, "--collide")) {
             o.collide = std.meta.stringToEnum(L.CollideMode, value);
         }
@@ -449,6 +458,7 @@ pub fn main(init: std.process.Init) !void {
 
     gw.ignite_every = opts.ignite;
     gw.fire_enabled = opts.fire;
+    gw.sim.elastic = opts.elastic;
     if (opts.stress > 0) g.stress(opts.stress);
     if (opts.merge) g.merging = true;
     g.collide = opts.collide orelse .solid;
@@ -539,6 +549,12 @@ pub fn main(init: std.process.Init) !void {
         if (done) {
             std.debug.print("frames={d} balls={d} ids={d} queued={d} max_level={d} merges={d} fps={d:.1} tick_ms={d:.3} render_ms={d:.3} gpu_gravity_ms={d:.3} gpu_collide_ms={d:.3} gpu_game_ms={d:.3} (samples {d}) burning={d} particles={d} ashes={d}\n", .{ frame + 1, gw.alive, gw.count, gw.pendingSpawns(), g.w.current_level, g.merges_total, g.perf.fps, g.perf.tick_ms, g.perf.render_ms, g.perf.gpu_gravity_ms, g.perf.gpu_collide_ms, g.perf.gpu_game_ms, gw.profile.samples, gw.stats.burning, gw.stats.particles, gw.stats.ashes });
             running = false;
+            if (opts.check) {
+                gw.drain(&g.w);
+                if (gw.sanity(&g.w)) |s| {
+                    std.debug.print("sanity: alive={d} nonfinite={d} outside={d} max_speed={d:.2} mean_speed={d:.3}\n", .{ s.alive, s.nonfinite, s.outside, s.max_speed, s.mean_speed });
+                } else |e| std.debug.print("sanity readback failed: {s}\n", .{@errorName(e)});
+            }
         }
     }
 }
