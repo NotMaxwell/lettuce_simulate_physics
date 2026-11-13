@@ -77,6 +77,16 @@ One-time host setup: `sudo usermod -aG docker $USER`, then log out and back in.
   ```
   `claude --dangerously-skip-permissions` is acceptable only inside a container; it still has
   network access and the repo mounted read-write.
+- **Headless container agent** (how the lead delegates): write the task prompt to
+  `.scratch/prompts/<name>.md`, create the worktree from the current branch, then run in the background
+  ```bash
+  docker run --rm --device /dev/dri -v "$PWD:$PWD" -v "$WT:$WT" -w "$WT" \
+    -v lettuce-zig-cache:/home/dev/.cache/zig -v lettuce-claude-config:/home/dev/.claude \
+    lettuce-dev claude -p --agent builder --dangerously-skip-permissions \
+    "$(cat .scratch/prompts/<name>.md)" > .scratch/agents/<name>.log 2>&1
+  ```
+  The agent commits on its worktree branch; a second container agent (`--agent architect` or `builder`)
+  reviews the branch diff before the lead merges.
 - Reset: `docker volume rm lettuce-zig-cache lettuce-claude-config` (the second logs you out).
 
 ## Subagents and cost

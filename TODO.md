@@ -34,3 +34,21 @@ pull g·m/r), so circular speed is sqrt(g·M_enclosed) at any radius; disks have
        solid / accrete / ghost, keys G, 1-4, X, [ ], click spawns a star system; `--galaxy`, `--collide`.
 4. [ ] GPU trails so orbits are visible (key R).
 5. [ ] Diagnostics on the HUD: energy and angular-momentum drift.
+
+## Scale: features at 1M balls, optimize toward 1B (standing goal, 2026-11-12)
+End goal: simulate small-universe matter on the Alabama supercomputer (student account). Every feature
+must work at 1M balls on one GPU; every design choice should keep a path open to 1B.
+Today (RX 7800 XT): 1M balls 2.39 ms/tick with gravity, 1.48 ms without; 100k 0.32-0.45 ms.
+1. [ ] Profile per pass at 1M/4M/16M (GPU timestamps, not blocking samples) and publish the table
+       in the perf overlay and `zig build bench`.
+2. [ ] Raise `max_balls` (1 << 20 today) to what VRAM allows; find the real per-ball byte cost.
+3. [ ] Lean "matter" layout for galaxy/universe mode: pos + vel + mass (~20 B/body) without the
+       merge-game fields (heat, state, body.friction...), so 1B bodies is ~20 GB, i.e. multi-GPU.
+4. [ ] Kernel work: fuse passes, Morton/Hilbert ordering for locality, indirect dispatch sized on
+       the GPU, no per-tick CPU readback that scales with N.
+5. [ ] Rendering at scale: point sprites / density splatting for sub-pixel bodies, LOD, culling.
+6. [ ] Precision: f32 positions break down over large extents; cell-relative or fixed-point coords.
+7. [ ] Headless "sim only" path for clusters: no window, periodic snapshots to disk, offline rendering.
+8. [ ] Past one GPU: domain decomposition, distributed tree/FMM or TreePM, multi-node communication.
+Open questions for the user (block 3, 6, 8): 2D log-potential gravity or 3D 1/r^2 for the universe
+sim; what GPUs, drivers (Vulkan available?) and scheduler the cluster offers.

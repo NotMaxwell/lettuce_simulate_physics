@@ -7,8 +7,12 @@ commands, the file-ownership map and anything repo-specific. Agent definitions l
 ## Roles
 - **Lead (the main session)** plans the split, defines interfaces before anyone codes, owns the
   shared files (build files, data contract, CLAUDE.md), integrates, runs final verification,
-  commits. The lead does small work itself: a spawn starts cold and re-reads context, so it only
-  pays off for work that is big, parallel, or would flood the lead's context.
+  commits. The lead writes no code (user rule, 2026-11-12): code changes, including small fixes
+  and changes to lead-owned contract files, are specified by the lead and written by an agent;
+  review is a separate agent. The lead edits only docs (CLAUDE.md, TODO.md, .claude/).
+- **Container agents** are the default workers: headless `claude -p` sessions, one per git
+  worktree, each in its own dev container (recipe in CLAUDE.md). In-session subagents are for
+  read-only work (Explore, verifier) or when containers are unavailable.
 - **Subagents** each own one file set and get a way to verify alone. No two agents edit the same
   file at the same time.
 
