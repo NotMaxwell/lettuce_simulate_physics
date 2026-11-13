@@ -193,8 +193,11 @@ pub const Sim = struct {
         s.record(cmd, p, .integrate);
         s.record(cmd, p, .scan);
         s.record(cmd, p, .scatter);
+        // Ghost mode: no contact response. Binning (integrate/scan/scatter) still ran, so the
+        // grid other passes read is valid, and `finish` copies the unchanged sorted state back.
+        const ghost = (p.flags & L.sim_collide_mask) >> L.sim_collide_shift == @intFromEnum(L.CollideMode.ghost);
         var it: u32 = 0;
-        while (it < s.iterations) : (it += 1) s.recordCollide(cmd, p, it);
+        while (!ghost and it < s.iterations) : (it += 1) s.recordCollide(cmd, p, it);
         s.record(cmd, p, .finish);
     }
 

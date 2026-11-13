@@ -19,7 +19,6 @@ const L = @import("gpu_layout");
 const S = @import("gravity_shared.zig");
 const order = S.order;
 const scan_block = S.scan_block;
-const softening = S.softening;
 const min_level = S.min_level;
 const Params = S.Params;
 const Key = S.Key;
@@ -236,7 +235,7 @@ export fn leafMultipoles() callconv(kernel_cc) void {
     const s1 = s0 + cells.v[countsOffset() + cell];
     var s = s0;
     while (s < s1) : (s += 1) {
-        const b = &sorted.v[s];
+        const b = sorted.v[s];
         const w: C = .{ .re = (b.x - center.re) * inv_side, .im = (b.y - center.im) * inv_side };
         var wk: C = .{ .re = b.m, .im = 0 };
         inline for (0..order) |k| {
@@ -351,7 +350,7 @@ export fn evaluate() callconv(kernel_cc) void {
     // Only live balls were sorted; slots past the last cell hold stale data.
     const last = leafDim() * leafDim() - 1;
     if (s >= cellStart(last) + cells.v[countsOffset() + last]) return;
-    const b = &sorted.v[s];
+    const b = sorted.v[s];
     const lvl = params.leaf_level;
     const dim = leafDim();
     const cell = leafCellOf(b.x, b.y);
@@ -378,15 +377,15 @@ export fn evaluate() callconv(kernel_cc) void {
         const t1 = cellStart(row + x1) + cells.v[countsOffset() + row + x1];
         var t = t0;
         while (t < t1) : (t += 1) {
-            const o = &sorted.v[t];
+            const o = sorted.v[t];
             const dx = o.x - b.x;
             const dy = o.y - b.y;
-            const f = o.m / (dx * dx + dy * dy + softening);
+            const f = o.m / (dx * dx + dy * dy + params.softening);
             ax += f * dx;
             ay += f * dy;
         }
     }
-    const vp = &vel.v[b.id];
-    vp.x += params.g_scale * ax;
-    vp.y += params.g_scale * ay;
+
+    vel.v[b.id].x += params.g_scale * ax;
+    vel.v[b.id].y += params.g_scale * ay;
 }

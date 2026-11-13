@@ -53,6 +53,15 @@ pub const GpuBalls = struct {
     ashes: u32 = 0,
 };
 
+/// Galaxy-mode readout; null in the normal game.
+pub const GalaxyHud = struct {
+    scenario: []const u8,
+    bodies: u32,
+    collide: []const u8,
+    /// Gravity relative to the scenario's own (1 = as built).
+    g_mult: f32,
+};
+
 pub const Hud = struct {
     balls_per_click: u32 = 1,
     countdown: i32 = 120,
@@ -66,6 +75,7 @@ pub const Hud = struct {
     show_perf: bool = true,
     perf: Perf = .{},
     gpu: ?GpuBalls = null,
+    galaxy: ?GalaxyHud = null,
 };
 
 const Vertex = gfx.Vertex;
@@ -840,8 +850,21 @@ pub const Renderer = struct {
         const lh = 17 * hs;
         const x = (cfg.wall + 5) * hs;
         var y = (cfg.wall + 5) * hs;
+        const galaxy_help = [_][:0]const u8{
+            "[LEFT CLICK] spawn a star system. [RIGHT CLICK] ignite.",
+            "[1] disk  [2] collision  [3] cloud  [4] systems",
+            "[X] collision mode: solid / accrete / ghost",
+            "[ and ] weaken / strengthen gravity",
+            "[O] back to the normal game   [G + LEFT DRAG] attract   [C] follow   [HOME] reset view",
+            "[P] perf overlay   [M] mute",
+        };
+        if (hud.galaxy) |gh| {
+            self.text(x, y, 2, rgb8(160, 200, 255), "GALAXY: {s}  bodies {d}  collide {s}  g x{d:.2}", .{ gh.scenario, gh.bodies, gh.collide, gh.g_mult });
+            y += lh * 1.4;
+        }
         const help = [_][:0]const u8{
             "Press [LEFT CLICK] to spawn ball.",
+            "Press [O] for galaxy mode (orbiting bodies).",
             "Press [RIGHT CLICK] to ignite a ball.",
             "Hold [SHIFT] while dragging mouse to lasso. Lasso around ball to make boom boom.",
             "Press [M] to mute background music.",
@@ -851,7 +874,8 @@ pub const Renderer = struct {
             "[P] perf overlay",
             "[T] stress test: +100000 balls, merging off",
         };
-        for (help) |line| {
+        const lines: []const [:0]const u8 = if (hud.galaxy != null) &galaxy_help else &help;
+        for (lines) |line| {
             self.text(x, y, 1.5, white, "{s}", .{line});
             y += lh;
         }
@@ -882,6 +906,7 @@ pub const Renderer = struct {
         const panel_x = self.out_w - 149 * hs;
         if (bestBall(w, hud)) |bb| self.text(panel_x + 96 * hs, 15 * hs + 44 * hs, 2, white, "{d}", .{bb.level});
 
+        if (hud.galaxy != null) return;
         var pb: [32]u8 = undefined;
         const bpc = std.fmt.bufPrint(&pb, "balls per click: {d}", .{hud.balls_per_click}) catch "";
         const bpc_y = self.out_h - 50 * hs;

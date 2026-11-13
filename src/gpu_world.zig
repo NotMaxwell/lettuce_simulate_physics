@@ -15,6 +15,7 @@ const cfg = @import("config.zig");
 const world = @import("world.zig");
 const physics = @import("physics.zig");
 const effects = @import("effects.zig");
+const galaxy = @import("galaxy.zig");
 
 const Buffer = *c.SDL_GPUBuffer;
 const Vec2 = world.Vec2;
@@ -41,7 +42,8 @@ const GameParams = extern struct {
     grid_cells_y: u32 = 0,
     pool_mask: u32 = 0,
     fx_flags: u32 = 0,
-    _pad0: u32 = 0,
+    /// 1 = accrete (gpu_game/common.zig GameParams.collide).
+    collide: u32 = 0,
     _pad1: u32 = 0,
     _pad2: u32 = 0,
     _pad3: u32 = 0,
@@ -174,12 +176,22 @@ const module_layout = std.enums.EnumArray(Module, Layout).init(.{
     .particles = .{ .ro = 0, .rw = 7 },
 });
 
+/// Gravity softening eps^2 (world units^2) in galaxy mode: bodies are a few units wide and
+/// orbit at speed ~2.5, so 2 units of softening tames close passes without blurring orbits.
+pub const galaxy_softening: f32 = 4;
+
+/// Half-side of the gravity tree box, in multiples of the scenario's extent.
+const galaxy_tree_reach: f32 = 1.75;
+
 pub const Input = struct {
     mouse: Vec2 = .{},
     attract: bool = false,
     mutual_gravity: bool = true,
     merging: bool = true,
     random_explosions: bool = true,
+    /// Contact response (L.CollideMode). In galaxy mode the world also forces mutual gravity on,
+    /// random explosions off, and merging on only for accrete.
+    collide: L.CollideMode = .solid,
 };
 
 /// GPU time of the last sampled tick (blocking sample, see `profile_every`).
@@ -257,6 +269,15 @@ pub const GpuWorld = struct {
     /// Every this many ticks one tick is split into separately fenced command buffers and waited
     /// on, to time gravity and the solver (SDL_GPU has no timestamp queries). 0 = never.
     profile_every: u32 = 120,
+
+    /// Galaxy mode state (see loadGalaxy): fixed bounds, forced mutual gravity, own g and softening.
+    galaxy_on: bool = false,
+    galaxy_scenario: galaxy.Scenario = .disk,
+    /// Gravity strength the loaded scenario was built for, and the user's multiplier on it.
+    galaxy_g_base: f32 = 0,
+    galaxy_g_mult: f32 = 1,
+    galaxy_extent: f32 = 0,
+    galaxy_centre: Vec2 = .{},
 
     pub fn init(gpa: std.mem.Allocator, dev: *c.SDL_GPUDevice) Error!GpuWorld {
         const cap = L.max_balls;
@@ -410,6 +431,84 @@ pub const GpuWorld = struct {
         }
     }
 
+    /// Queues one ball with explicit properties (galaxy bodies, systems).
+    pub fn queueBody(gw: *GpuWorld, _: *world.World, x: f32, y: f32, nb: world.NewBall) !void {
+        try gw.pending.append(gw.gpa, nb);
+        errdefer _ = gw.pending.pop();
+        try gw.pending_pos.append(gw.gpa, .{ .x = x, .y = y });
+        gw.total_area += std.math.pi * nb.radius * nb.radius;
+        // The solver's cell size follows this; merges raise it later, spawns must too.
+        gw.max_radius = @max(gw.max_radius, nb.radius);
+    }
+
+    /// Removes every ball and queued spawn and returns the CPU mirror to its initial state. The
+    /// GPU buffers are not wiped: kernels only look at ids below `count`, and a spawn rewrites
+    /// every field of its slot.
+    fn clearBalls(gw: *GpuWorld, w: *world.World) void {
+        gw.drain(w);
+        @memset(gw.radius[0..gw.count], 0);
+        gw.count = 0;
+        gw.alive = 0;
+        gw.free.clearRetainingCapacity();
+        gw.pending.clearRetainingCapacity();
+        gw.pending_pos.clearRetainingCapacity();
+        gw.pending_head = 0;
+        gw.blasts.clearRetainingCapacity();
+        gw.lasso_poly.clearRetainingCapacity();
+        gw.lasso_req = false;
+        gw.pick_req = false;
+        gw.release_req = false;
+        gw.ignite_req = false;
+        gw.pick_result = null;
+        gw.total_area = 0;
+        gw.max_radius = cfg.spawn_radius_max;
+        w.explosions.clearRetainingCapacity();
+        w.current_level = cfg.start_level;
+        w.events = .{};
+        w.pending_events = .{};
+    }
+
+    /// Replaces the game with galaxy scenario `s` of about `n` bodies around the current play
+    /// area's centre, in a large fixed play area. Bodies reach the GPU over the next ticks.
+    pub fn loadGalaxy(gw: *GpuWorld, w: *world.World, s: galaxy.Scenario, n: u32) !void {
+        gw.clearBalls(w);
+        const centre: Vec2 = .{ .x = w.bounds.x + w.bounds.w / 2, .y = w.bounds.y + w.bounds.h / 2 };
+        var built = try galaxy.build(gw.gpa, w.prng.random(), s, n, centre);
+        defer built.deinit(gw.gpa);
+        try gw.pending.ensureUnusedCapacity(gw.gpa, built.bodies.len);
+        try gw.pending_pos.ensureUnusedCapacity(gw.gpa, built.bodies.len);
+        for (built.bodies) |b| try gw.queueBody(w, b.x, b.y, galaxy.toNewBall(b));
+        w.bounds = galaxy.boundsFor(centre, built.extent);
+        w.prev_bounds = w.bounds;
+        gw.galaxy_on = true;
+        gw.galaxy_scenario = s;
+        gw.galaxy_g_base = built.g;
+        gw.galaxy_g_mult = 1;
+        gw.galaxy_extent = built.extent;
+        gw.galaxy_centre = centre;
+    }
+
+    /// Current gravity strength in galaxy mode.
+    pub fn galaxyG(gw: *const GpuWorld) f32 {
+        return gw.galaxy_g_base * gw.galaxy_g_mult;
+    }
+
+    /// One star system at (x, y), at rest, for the current gravity strength.
+    pub fn spawnSystemAt(gw: *GpuWorld, w: *world.World, x: f32, y: f32) !void {
+        var list: std.ArrayList(galaxy.Body) = .empty;
+        defer list.deinit(gw.gpa);
+        _ = try galaxy.system(gw.gpa, &list, w.prng.random(), .{ .x = x, .y = y }, .{}, gw.galaxyG());
+        for (list.items) |b| try gw.queueBody(w, b.x, b.y, galaxy.toNewBall(b));
+    }
+
+    /// Leaves galaxy mode for a fresh normal game.
+    pub fn exitGalaxy(gw: *GpuWorld, w: *world.World) void {
+        gw.clearBalls(w);
+        gw.galaxy_on = false;
+        w.bounds = .{ .x = 0, .y = 0, .w = cfg.base_w, .h = cfg.base_h };
+        w.prev_bounds = w.bounds;
+    }
+
     /// Jumps the play area to fit every live and queued ball (stress fills).
     pub fn snapBounds(gw: *const GpuWorld, w: *world.World) void {
         w.bounds = physics.targetBounds(@floatCast(gw.total_area));
@@ -449,7 +548,16 @@ pub const GpuWorld = struct {
 
     /// One simulation tick. Fills `w.events` (from results read back this tick), eases
     /// `w.bounds`, and ages explosions. `w.balls` is not used.
-    pub fn tick(gw: *GpuWorld, w: *world.World, in: Input) void {
+    pub fn tick(gw: *GpuWorld, w: *world.World, in_req: Input) void {
+        var in = in_req;
+        const accrete = in.collide == .accrete;
+        if (gw.galaxy_on) {
+            in.mutual_gravity = true;
+            in.random_explosions = false;
+            in.merging = accrete;
+        } else if (accrete) {
+            in.merging = true;
+        }
         w.events = w.pending_events;
         w.pending_events = .{};
         w.prev_bounds = w.bounds;
@@ -476,7 +584,7 @@ pub const GpuWorld = struct {
 
         w.current_level = @max(w.current_level, cfg.start_level);
         w.events.won = w.current_level >= cfg.max_level;
-        w.bounds = physics.easeBounds(w.bounds, @floatCast(gw.total_area));
+        if (!gw.galaxy_on) w.bounds = physics.easeBounds(w.bounds, @floatCast(gw.total_area));
         w.tick += 1;
         gw.tick_no += 1;
     }
@@ -560,6 +668,31 @@ pub const GpuWorld = struct {
         gw.free.append(gw.gpa, id) catch {};
     }
 
+    /// Mutual gravity strength (vel += g_scale * a). Normal play: physics.zig's crowd formula,
+    /// weaker the more balls there are; galaxy mode: the scenario's own g.
+    fn gravityScale(gw: *const GpuWorld, sp: L.SimParams) f32 {
+        if (gw.galaxy_on) return gw.galaxyG();
+        const n = @min(sp.ball_count, gw.grav.capacity);
+        const crowd = @min(1.0, cfg.gravity_full_count / @as(f32, @floatFromInt(n)));
+        return 0.5 * sp.mutual_g * crowd;
+    }
+
+    /// The region the gravity tree covers. Normally the play area; in galaxy mode the play area is
+    /// much larger than the bodies (so walls are never met), and a tree over all of it would leave
+    /// most leaf cells empty and the occupied ones crowded (1M disk: ~48 ms vs ~5 ms measured).
+    /// Bodies that stray outside the box are clamped into its edge cells, which costs them force
+    /// accuracy only.
+    fn gravityBox(gw: *const GpuWorld, sp: L.SimParams) L.SimParams {
+        if (!gw.galaxy_on) return sp;
+        var box = sp;
+        const r = galaxy_tree_reach * gw.galaxy_extent;
+        box.bounds_min_x = gw.galaxy_centre.x - r;
+        box.bounds_max_x = gw.galaxy_centre.x + r;
+        box.bounds_min_y = gw.galaxy_centre.y - r;
+        box.bounds_max_y = gw.galaxy_centre.y + r;
+        return box;
+    }
+
     fn simParams(gw: *const GpuWorld, w: *const world.World, in: Input) L.SimParams {
         const b = w.bounds;
         var p: L.SimParams = .{
@@ -575,7 +708,11 @@ pub const GpuWorld = struct {
             .cell_size = 2 * gw.max_radius,
             .mutual_g = cfg.mutual_g,
             .wall = cfg.wall,
-            .flags = @as(u32, @intFromBool(in.mutual_gravity)) | @as(u32, @intFromBool(in.merging)) << 1 | @as(u32, @intFromBool(in.attract)) << 2,
+            .flags = (if (in.mutual_gravity) L.sim_flag_mutual_gravity else 0) |
+                (if (in.merging) L.sim_flag_merging else 0) |
+                (if (in.attract) L.sim_flag_attract else 0) |
+                (if (gw.galaxy_on) L.sim_flag_galaxy else 0) |
+                @as(u32, @intFromEnum(in.collide)) << L.sim_collide_shift,
             .mouse_x = in.mouse.x,
             .mouse_y = in.mouse.y,
             .attraction_strength = cfg.attraction_strength,
@@ -666,6 +803,7 @@ pub const GpuWorld = struct {
             .hoop_y = b.y + cfg.hoop_y * hoop_scale,
             .hoop_left = b.x + cfg.hoop_left * hoop_scale,
             .hoop_right = b.x + cfg.hoop_right * hoop_scale,
+            .collide = @intFromBool(in.collide == .accrete),
         };
         const groups = divCeil(@max(gw.count, 1), L.group_size);
 
@@ -714,12 +852,12 @@ pub const GpuWorld = struct {
         }
 
         const sp = gw.simParams(w, in);
-        if (in.mutual_gravity) gw.grav.apply(cmd, sp, .{ .pos = gw.sim.pos, .body = gw.sim.body, .vel = gw.sim.vel });
+        if (in.mutual_gravity) gw.grav.apply(cmd, gw.gravityBox(sp), .{ .pos = gw.sim.pos, .body = gw.sim.body, .vel = gw.sim.vel }, gw.gravityScale(sp), if (gw.galaxy_on) galaxy_softening else @import("gravity").default_softening);
         cmd = try timer.lap(cmd, &gw.profile.gravity_ms);
         gw.sim.step(cmd, sp);
         cmd = try timer.lap(cmd, &gw.profile.collide_ms);
         if (in.merging) gw.dispatch(cmd, .merge, &gp, divCeil(L.max_events - 1, L.group_size));
-        gw.dispatch(cmd, .hoop, &gp, groups);
+        if (!gw.galaxy_on) gw.dispatch(cmd, .hoop, &gp, groups);
 
         // Fire: roll the counters, conduct heat (Jacobi), update burning/burn-out, emit and move
         // particles. Uses this tick's broad-phase grid from the solver step above.
@@ -1027,4 +1165,142 @@ test "gpu world: conduction ignites a neighbour, burning balls emit particles an
     try std.testing.expect(gw.stats.ash_head > 0);
     try std.testing.expect(peak_ashes > 0);
     try std.testing.expectEqual(@as(u32, 0), gw.stats.burning);
+}
+
+const GalaxyDump = struct {
+    pos: []L.Vec2,
+    vel: []L.Vec2,
+    body: []L.BallBody,
+    meta: []L.BallMeta,
+
+    fn read(gpa: std.mem.Allocator, gw: *GpuWorld) !GalaxyDump {
+        const n = gw.count;
+        const d: GalaxyDump = .{
+            .pos = try gpa.alloc(L.Vec2, n),
+            .vel = try gpa.alloc(L.Vec2, n),
+            .body = try gpa.alloc(L.BallBody, n),
+            .meta = try gpa.alloc(L.BallMeta, n),
+        };
+        try gw.sim.download(0, .{ .pos = d.pos, .vel = d.vel, .body = d.body, .meta = d.meta });
+        return d;
+    }
+
+    fn free(d: GalaxyDump, gpa: std.mem.Allocator) void {
+        gpa.free(d.pos);
+        gpa.free(d.vel);
+        gpa.free(d.body);
+        gpa.free(d.meta);
+    }
+
+    fn mass(d: GalaxyDump) f64 {
+        var m: f64 = 0;
+        for (d.body, d.meta) |b, mt| {
+            if (mt & L.flag_alive != 0) m += b.mass;
+        }
+        return m;
+    }
+
+    /// Mass-weighted centre and angular momentum about it over the live bodies.
+    fn centreAndSpin(d: GalaxyDump) struct { cx: f64, cy: f64, spin: f64 } {
+        var m: f64 = 0;
+        var cx: f64 = 0;
+        var cy: f64 = 0;
+        for (d.pos, d.body, d.meta) |p, b, mt| {
+            if (mt & L.flag_alive == 0) continue;
+            m += b.mass;
+            cx += b.mass * p.x;
+            cy += b.mass * p.y;
+        }
+        cx /= m;
+        cy /= m;
+        var spin: f64 = 0;
+        for (d.pos, d.vel, d.body, d.meta) |p, v, b, mt| {
+            if (mt & L.flag_alive == 0) continue;
+            spin += b.mass * ((p.x - cx) * v.y - (p.y - cy) * v.x);
+        }
+        return .{ .cx = cx, .cy = cy, .spin = spin };
+    }
+};
+
+
+test "gpu world: galaxy disk in ghost mode keeps its shape and angular momentum" {
+    _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SkipZigTest;
+    defer c.SDL_Quit();
+    const gfx = @import("gfx.zig");
+    var gpu = gfx.Gfx.init(.{ .window = null }) catch return error.SkipZigTest;
+    defer gpu.deinit();
+    const gpa = std.testing.allocator;
+    var gw = try GpuWorld.init(gpa, gpu.dev);
+    defer gw.deinit();
+    gw.profile_every = 0;
+    var w = world.World.init(gpa, 11);
+    defer w.deinit();
+
+    try gw.loadGalaxy(&w, .disk, 2000);
+    try std.testing.expect(gw.galaxy_on);
+    const extent = gw.galaxy_extent;
+    for (0..8) |_| gw.tick(&w, .{ .collide = .ghost });
+    gw.drain(&w);
+    try std.testing.expectEqual(@as(u32, 2001), gw.alive);
+    const d0 = try GalaxyDump.read(gpa, &gw);
+    defer d0.free(gpa);
+    const s0 = d0.centreAndSpin();
+    for (0..600) |_| gw.tick(&w, .{ .collide = .ghost });
+    gw.drain(&w);
+    const d1 = try GalaxyDump.read(gpa, &gw);
+    defer d1.free(gpa);
+    const s1 = d1.centreAndSpin();
+
+    var inside: usize = 0;
+    for (d1.pos, d1.vel) |p, v| {
+        try std.testing.expect(std.math.isFinite(p.x) and std.math.isFinite(p.y) and std.math.isFinite(v.x) and std.math.isFinite(v.y));
+        const dx = p.x - s0.cx;
+        const dy = p.y - s0.cy;
+        if (@sqrt(dx * dx + dy * dy) < 1.5 * extent) inside += 1;
+    }
+    const frac = @as(f64, @floatFromInt(inside)) / @as(f64, @floatFromInt(d1.pos.len));
+    const drift = @abs(s1.spin - s0.spin) / @abs(s0.spin);
+    std.debug.print("galaxy ghost: inside 1.5x extent {d:.1}%, angular momentum drift {d:.2}%\n", .{ frac * 100, drift * 100 });
+    try std.testing.expect(frac >= 0.9);
+    try std.testing.expect(drift < 0.05);
+    // Ghost never merges.
+    try std.testing.expectEqual(@as(u32, 2001), gw.alive);
+}
+
+test "gpu world: galaxy accretion merges bodies and conserves mass" {
+    _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SkipZigTest;
+    defer c.SDL_Quit();
+    const gfx = @import("gfx.zig");
+    var gpu = gfx.Gfx.init(.{ .window = null }) catch return error.SkipZigTest;
+    defer gpu.deinit();
+    const gpa = std.testing.allocator;
+    var gw = try GpuWorld.init(gpa, gpu.dev);
+    defer gw.deinit();
+    gw.profile_every = 0;
+    var w = world.World.init(gpa, 12);
+    defer w.deinit();
+
+    try gw.loadGalaxy(&w, .disk, 2000);
+    for (0..4) |_| gw.tick(&w, .{ .collide = .accrete });
+    gw.drain(&w);
+    const d0 = try GalaxyDump.read(gpa, &gw);
+    defer d0.free(gpa);
+    const m0 = d0.mass();
+    const n0 = gw.alive;
+    for (0..200) |_| gw.tick(&w, .{ .collide = .accrete });
+    gw.drain(&w);
+    const d1 = try GalaxyDump.read(gpa, &gw);
+    defer d1.free(gpa);
+    var live: u32 = 0;
+    for (d1.meta) |mt| live += @intFromBool(mt & L.flag_alive != 0);
+    std.debug.print("galaxy accrete: bodies {d} -> {d}, mass {d:.1} -> {d:.1}\n", .{ n0, live, m0, d1.mass() });
+    try std.testing.expect(live < n0);
+    // The CPU mirror follows the GPU's merges.
+    try std.testing.expectEqual(live, gw.alive);
+    try std.testing.expectApproxEqRel(m0, d1.mass(), 1e-4);
+    for (d1.pos, d1.meta) |p, mt| if (mt & L.flag_alive != 0) {
+        try std.testing.expect(std.math.isFinite(p.x) and std.math.isFinite(p.y));
+    };
 }

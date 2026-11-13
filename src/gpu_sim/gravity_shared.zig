@@ -5,7 +5,8 @@ const L = @import("gpu_layout");
 /// force error; 8 is ~4x more accurate and ~30% slower at 1M balls; 5 is ~4x less accurate.
 pub const order = 6;
 pub const scan_block: u32 = 1024; // cells per workgroup in scanBlocks (4 per thread)
-pub const softening: f32 = 0.001; // physics.zig GravityJob eps
+/// Default eps^2 (physics.zig GravityJob eps); the caller passes the real value in Params.softening.
+pub const softening: f32 = 0.001;
 pub const min_level: u32 = 2;
 pub const max_level: u32 = 10;
 
@@ -14,7 +15,8 @@ pub const Params = extern struct {
     leaf_level: u32,
     /// Level the current pass works on (m2m / m2l).
     level: u32,
-    _pad: u32 = 0,
+    /// Plummer eps^2 (world units^2) of the near-field pair force.
+    softening: f32,
     // Scalars, not a Vec2 struct: std140 rounds a struct member up to 16 bytes, so a Vec2 here
     // would overlap the next field in the uniform block.
     origin_x: f32,

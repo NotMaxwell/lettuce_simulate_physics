@@ -66,9 +66,16 @@ pub inline fn cellOf(p: Vec2, P: *addrspace(.uniform) Params) u32 {
     return cy * P.grid_cells_x + cx;
 }
 
-pub const flag_mutual_gravity: u32 = 1 << 0;
-pub const flag_merging: u32 = 1 << 1;
-pub const flag_attract: u32 = 1 << 2;
+pub const flag_mutual_gravity = L.sim_flag_mutual_gravity;
+pub const flag_merging = L.sim_flag_merging;
+pub const flag_attract = L.sim_flag_attract;
+
+/// The collision response chosen in SimParams.flags (L.CollideMode as a u32).
+pub inline fn collideMode(flags: u32) u32 {
+    return (flags & L.sim_collide_mask) >> L.sim_collide_shift;
+}
+pub const collide_accrete: u32 = @intFromEnum(L.CollideMode.accrete);
+pub const collide_ghost: u32 = @intFromEnum(L.CollideMode.ghost);
 
 pub inline fn level(meta: u32) u32 {
     return meta & 0xff;

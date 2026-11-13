@@ -45,7 +45,8 @@ pub const GameParams = extern struct {
     pool_mask: u32,
     /// bit0: the conduction pass ran this tick (burn reads its scratch temperatures).
     fx_flags: u32,
-    _pad0: u32 = 0,
+    /// 1 = accrete: the merge kernel merges any touching pair, summing mass (L.CollideMode).
+    collide: u32 = 0,
     _pad1: u32 = 0,
     _pad2: u32 = 0,
     _pad3: u32 = 0,
@@ -119,7 +120,7 @@ pub inline fn atomicUMax(p: *addrspace(.storage_buffer) u32, v: u32) u32 {
     );
 }
 
-pub const max_level: u32 = 38;
+pub const max_level: u32 = cfg.max_level;
 pub const id_bits: u32 = 20;
 pub const id_mask: u32 = (1 << id_bits) - 1;
 

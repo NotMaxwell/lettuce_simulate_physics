@@ -7,6 +7,8 @@ const render = @import("render.zig");
 const audio = @import("audio.zig");
 const gfx = @import("gfx.zig");
 const gpu_world = @import("gpu_world.zig");
+const galaxy = @import("galaxy.zig");
+const L = @import("gpu_layout");
 
 const Vec2 = world.Vec2;
 const tick_seconds: f64 = 1.0 / @as(f64, cfg.tick_hz);
@@ -29,6 +31,11 @@ const Options = struct {
     autoplay: bool = false,
     /// Initial view zoom, for zoomed screenshots.
     zoom: f32 = 1,
+    /// Start in galaxy mode with this scenario (--galaxy <name> [n]); n 0 = the scenario default.
+    galaxy: ?galaxy.Scenario = null,
+    galaxy_n: u32 = 0,
+    /// null = solid in the normal game, ghost in galaxy mode (see enterGalaxy).
+    collide: ?L.CollideMode = null,
 };
 
 const Game = struct {
@@ -47,6 +54,12 @@ const Game = struct {
 
     mutual_gravity: bool = true,
     merging: bool = true,
+    /// Contact response (X in galaxy mode, --collide).
+    collide: L.CollideMode = .solid,
+    /// --collide was given: galaxy mode keeps it instead of defaulting to ghost.
+    collide_explicit: bool = false,
+    /// Body count the galaxy keys load (0 = each scenario's default); set by --galaxy <name> <n>.
+    galaxy_n: u32 = 0,
     muted: bool = false,
     show_perf: bool = true,
     won: bool = false,
@@ -121,8 +134,74 @@ const Game = struct {
         g.spawn_remainder = n - g.spawn_per_tick * ticks;
     }
 
-    fn onKey(g: *Game, key: c.SDL_Keycode, mods: c.SDL_Keymod) void {
+    fn enterGalaxy(g: *Game, s: galaxy.Scenario) void {
+        const n = if (g.galaxy_n > 0) g.galaxy_n else s.defaultCount();
+        const entering = !g.gw.galaxy_on;
+        g.gw.loadGalaxy(&g.w, s, n) catch |e| {
+            std.log.err("galaxy load failed: {s}", .{@errorName(e)});
+            return;
+        };
+        // Ghost by default: the solver runs one thread per grid cell, and the heavy cores make a few
+        // cells hold hundreds of bodies (3000-body disk: ~30 ms/tick solid, ~0.1 ms ghost).
+        if (entering and !g.collide_explicit) g.collide = .ghost;
+        g.follow_centre = false;
+        g.pick_pending = false;
+        g.spawn_ticks_left = 0;
+        g.renderer.resetView();
+        // Fit the scenario to ~80% of the window height. At zoom 1 the camera fits the (much
+        // larger) play area, so the zoom is the ratio of the two.
+        var pw: c_int = 0;
+        var ph: c_int = 0;
+        _ = c.SDL_GetWindowSizeInPixels(g.window, &pw, &ph);
+        const out_w: f32 = @floatFromInt(@max(pw, 1));
+        const out_h: f32 = @floatFromInt(@max(ph, 1));
+        const b = g.w.bounds;
+        const fit = @min(out_w / b.w, out_h / b.h);
+        const want = 0.8 * out_h / (2 * g.gw.galaxy_extent);
+        g.renderer.zoom = std.math.clamp(want / fit, render.Renderer.zoom_min, render.Renderer.zoom_max);
+    }
+
+    fn leaveGalaxy(g: *Game) void {
+        g.gw.exitGalaxy(&g.w);
+        if (!g.collide_explicit) g.collide = .solid;
+        g.follow_centre = false;
+        g.pick_pending = false;
+        g.renderer.resetView();
+        g.won = false;
+        g.countdown = cfg.countdown_seconds;
+    }
+
+    fn onGalaxyKey(g: *Game, key: c.SDL_Keycode) void {
+        switch (key) {
+            c.SDLK_1 => g.enterGalaxy(.disk),
+            c.SDLK_2 => g.enterGalaxy(.collision),
+            c.SDLK_3 => g.enterGalaxy(.cloud),
+            c.SDLK_4 => g.enterGalaxy(.systems),
+            c.SDLK_X => g.collide = switch (g.collide) {
+                .solid => .accrete,
+                .accrete => .ghost,
+                .ghost => .solid,
+            },
+            c.SDLK_LEFTBRACKET => g.gw.galaxy_g_mult = @max(g.gw.galaxy_g_mult * 0.8, 0.02),
+            c.SDLK_RIGHTBRACKET => g.gw.galaxy_g_mult = @min(g.gw.galaxy_g_mult * 1.25, 50),
+            else => {},
+        }
+    }
+
+    fn onKey(g: *Game, key: c.SDL_Keycode, mods: c.SDL_Keymod, repeat: bool) void {
         const step: u32 = if (mods & c.SDL_KMOD_CTRL != 0) 25 else 1;
+        if (key == c.SDLK_O) {
+            if (repeat) return;
+            if (g.gw.galaxy_on) g.leaveGalaxy() else g.enterGalaxy(.disk);
+            return;
+        }
+        if (g.gw.galaxy_on) switch (key) {
+            c.SDLK_1, c.SDLK_2, c.SDLK_3, c.SDLK_4, c.SDLK_X, c.SDLK_LEFTBRACKET, c.SDLK_RIGHTBRACKET => return g.onGalaxyKey(key),
+            // Mutual gravity is forced on, merging follows the collide mode, and a stress burst
+            // would overrun the fixed play area.
+            c.SDLK_F, c.SDLK_N, c.SDLK_T => return,
+            else => {},
+        };
         switch (key) {
             c.SDLK_M => {
                 g.muted = !g.muted;
@@ -207,20 +286,25 @@ const Game = struct {
             .attract = g.attracting(),
             .mutual_gravity = g.mutual_gravity,
             .merging = g.merging,
+            .collide = g.collide,
         });
 
         if (g.pick_pending) if (g.gw.pick_result) |hit| {
             g.pick_pending = false;
-            if (!hit) g.startSpawn();
+            if (!hit and !(g.gw.galaxy_on and g.attracting())) {
+                if (g.gw.galaxy_on) {
+                    g.gw.spawnSystemAt(&g.w, g.mouse.x, g.mouse.y) catch {};
+                } else g.startSpawn();
+            }
         };
 
         const ev = g.w.events;
         g.merges_total += ev.merges;
-        if (ev.merges > 0) g.sound.play(.hit);
+        if (ev.merges > 0 and !g.gw.galaxy_on) g.sound.play(.hit);
         if (ev.deaths > 0) g.sound.play(.death);
         if (ev.explosions > 0) g.sound.play(.explosion);
         if (ev.any_burning) g.sound.play(.damage);
-        if (ev.won) g.won = true;
+        if (ev.won and !g.gw.galaxy_on) g.won = true;
 
         g.second_accum += tick_seconds;
         if (g.second_accum >= 1.0) {
@@ -287,6 +371,15 @@ fn parseOptions(args: []const [:0]const u8) Options {
             o.merge = std.mem.eql(u8, value, "on");
         } else if (std.mem.eql(u8, flag, "--autoplay")) {
             o.autoplay = std.mem.eql(u8, value, "on");
+        } else if (std.mem.eql(u8, flag, "--galaxy")) {
+            o.galaxy = std.meta.stringToEnum(galaxy.Scenario, value);
+            // The body count is optional: only consumed when the next argument is a number.
+            if (i + 2 < args.len) if (std.fmt.parseInt(u32, args[i + 2], 10)) |n| {
+                o.galaxy_n = n;
+                i += 1;
+            } else |_| {};
+        } else if (std.mem.eql(u8, flag, "--collide")) {
+            o.collide = std.meta.stringToEnum(L.CollideMode, value);
         }
     }
     return o;
@@ -341,7 +434,11 @@ pub fn main(init: std.process.Init) !void {
     gw.fire_enabled = opts.fire;
     if (opts.stress > 0) g.stress(opts.stress);
     if (opts.merge) g.merging = true;
+    g.collide = opts.collide orelse .solid;
+    g.collide_explicit = opts.collide != null;
+    g.galaxy_n = opts.galaxy_n;
     g.renderer.zoom = std.math.clamp(opts.zoom, render.Renderer.zoom_min, render.Renderer.zoom_max);
+    if (opts.galaxy) |s| g.enterGalaxy(s);
 
     var last = c.SDL_GetPerformanceCounter();
     var accumulator: f64 = 0;
@@ -353,7 +450,7 @@ pub fn main(init: std.process.Init) !void {
         while (c.SDL_PollEvent(&event)) {
             switch (event.type) {
                 c.SDL_EVENT_QUIT => running = false,
-                c.SDL_EVENT_KEY_DOWN => g.onKey(event.key.key, event.key.mod),
+                c.SDL_EVENT_KEY_DOWN => g.onKey(event.key.key, event.key.mod, event.key.repeat),
                 c.SDL_EVENT_MOUSE_WHEEL => g.onWheel(event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y),
                 c.SDL_EVENT_MOUSE_BUTTON_DOWN => if (event.button.button == c.SDL_BUTTON_MIDDLE) {
                     g.panning = true;
@@ -409,6 +506,7 @@ pub fn main(init: std.process.Init) !void {
             .show_perf = g.show_perf,
             .perf = g.perf,
             .gpu = gpuBalls(&gw, g.w.current_level),
+            .galaxy = if (gw.galaxy_on) .{ .scenario = @tagName(gw.galaxy_scenario), .bodies = gw.alive, .collide = @tagName(g.collide), .g_mult = gw.galaxy_g_mult } else null,
         };
         const r0 = c.SDL_GetPerformanceCounter();
         if (g.follow_centre) g.renderer.follow(.{ .x = g.w.bounds.x + g.w.bounds.w / 2, .y = g.w.bounds.y + g.w.bounds.h / 2 });
@@ -453,8 +551,14 @@ fn autoplay(g: *Game, frame: u32) void {
             }
             g.onMouseUp(c.SDL_BUTTON_LEFT);
         },
-        9 => g.onKey(c.SDLK_EQUALS, c.SDL_KMOD_CTRL),
-        10 => g.onKey(c.SDLK_F, 0),
+        9 => g.onKey(c.SDLK_EQUALS, c.SDL_KMOD_CTRL, false),
+        10 => g.onKey(c.SDLK_F, 0, false),
+        11 => {
+            const keys = [_]c.SDL_Keycode{ c.SDLK_O, c.SDLK_1, c.SDLK_2, c.SDLK_3, c.SDLK_4, c.SDLK_X, c.SDLK_X, c.SDLK_LEFTBRACKET, c.SDLK_RIGHTBRACKET };
+            // Most draws are collide-mode and gravity keys; entering and leaving galaxy mode (which
+            // reloads thousands of bodies) is rarer.
+            if (r.uintLessThan(u8, 8) == 0) g.onKey(keys[r.uintLessThan(usize, keys.len)], 0, false);
+        },
         else => {},
     }
 }

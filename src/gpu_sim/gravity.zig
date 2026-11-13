@@ -8,7 +8,6 @@
 const std = @import("std");
 const c = @import("c");
 const L = @import("gpu_layout");
-const cfg = @import("config");
 const K = @import("gravity_shared.zig");
 
 const spv = @embedFile("gravity.spv");
@@ -28,6 +27,9 @@ const n_kernels = @typeInfo(Kernel).@"enum".field_names.len;
 /// Average balls per occupied leaf cell the leaf level aims for. Lower means more M2L work,
 /// higher more pairwise work; 6-12 measured fastest in the harness at 10k-1M balls.
 pub const target_per_leaf: f32 = 8;
+
+/// Default softening eps^2 (world units^2) for `apply`; the game uses it outside galaxy mode.
+pub const default_softening: f32 = K.softening;
 
 pub const Gravity = struct {
     device: *c.SDL_GPUDevice,
@@ -87,9 +89,9 @@ pub const Gravity = struct {
         for ([_]*c.SDL_GPUBuffer{ g.cells, g.keys, g.sorted, g.mpole, g.local }) |b| c.SDL_ReleaseGPUBuffer(g.device, b);
     }
 
-    /// Records the gravity passes into `cmd`: vel += g * a for the first params.ball_count balls.
-    /// Strength mirrors physics.zig: 0.5 * mutual_g * min(1, gravity_full_count / n).
-    pub fn apply(g: *Gravity, cmd: *c.SDL_GPUCommandBuffer, params: L.SimParams, balls: Balls) void {
+    /// Records the gravity passes into `cmd`: vel += g_scale * a for the first params.ball_count
+    /// balls. `softening` is eps^2 in world units^2 (see gravity_shared.softening for the default).
+    pub fn apply(g: *Gravity, cmd: *c.SDL_GPUCommandBuffer, params: L.SimParams, balls: Balls, g_scale: f32, softening: f32) void {
         const n = @min(params.ball_count, g.capacity);
         if (n < 2) return;
         const w = params.bounds_max_x - params.bounds_min_x;
@@ -99,7 +101,6 @@ pub const Gravity = struct {
         const fill = @max(w, 1.0) * @max(h, 1.0) / (size * size);
         const leaf = leafLevelFor(n, fill, g.max_leaf_level);
         g.last_leaf_level = leaf;
-        const crowd = @min(1.0, cfg.gravity_full_count / @as(f32, @floatFromInt(n)));
         var kp: K.Params = .{
             .n = n,
             .leaf_level = leaf,
@@ -107,7 +108,8 @@ pub const Gravity = struct {
             .origin_x = params.bounds_min_x,
             .origin_y = params.bounds_min_y,
             .root_size = size,
-            .g_scale = 0.5 * params.mutual_g * crowd,
+            .g_scale = g_scale,
+            .softening = softening,
         };
         const leaf_cells = @as(u32, 1) << @intCast(2 * leaf);
         const ro = [_]*c.SDL_GPUBuffer{ balls.pos, balls.body };

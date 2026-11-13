@@ -153,9 +153,11 @@ inline fn resolve(A: *Ball, B: *Ball, first: bool) void {
     if (!(d2 > 0 and d2 < rsum * rsum) or A.r <= 0 or B.r <= 0) return;
     const dist = @sqrt(d2);
 
-    if (c.params.flags & c.flag_merging != 0 and A.level == B.level and A.level < c.max_level) {
-        // Merging pairs get no contact response (as on the CPU); the CPU applies the merge
-        // from this event one frame later.
+    // Accretion merges every touching pair whatever its level; otherwise only equal levels.
+    const accrete = c.collideMode(c.params.flags) == c.collide_accrete;
+    if (c.params.flags & c.flag_merging != 0 and (accrete or (A.level == B.level and A.level < c.max_level))) {
+        // Merging pairs get no contact response (as on the CPU); the merge kernel applies the
+        // merge from this event in the same tick.
         if (first) {
             const slot = c.atomicAdd(&events.v[0].kind, 1);
             if (slot < L.max_events - 1) {

@@ -43,7 +43,8 @@ export fn merge() callconv(c.kernel_cc) void {
     const ma = meta.v[a];
     const mb = meta.v[b];
     if (ma & L.flag_alive == 0 or mb & L.flag_alive == 0) return;
-    if (ma & 0xff != mb & 0xff or ma & 0xff >= c.max_level) return;
+    const accrete = c.params.collide == 1;
+    if (!accrete and (ma & 0xff != mb & 0xff or ma & 0xff >= c.max_level)) return;
     const stamp = c.params.stamp;
     if (c.atomicExchange(&claim.v[a], stamp) == stamp) return;
     if (c.atomicExchange(&claim.v[b], stamp) == stamp) return;
@@ -51,9 +52,12 @@ export fn merge() callconv(c.kernel_cc) void {
 
     const ra = body.v[a].radius;
     const rb = body.v[b].radius;
-    // physics.zig resolvePair: the larger ball survives (j on ties).
-    const keep = if (ra > rb) a else b;
-    const gone = if (ra > rb) b else a;
+    const ba = body.v[a].mass;
+    const bb = body.v[b].mass;
+    // physics.zig resolvePair: the larger ball survives (j on ties); accretion keeps the heavier.
+    const a_wins = if (accrete) ba > bb else ra > rb;
+    const keep = if (a_wins) a else b;
+    const gone = if (a_wins) b else a;
     const mk = body.v[keep].mass;
     const mg = body.v[gone].mass;
     const pk = pos.v[keep];
@@ -67,9 +71,18 @@ export fn merge() callconv(c.kernel_cc) void {
     pos.v[keep] = .{ .x = (pk.x * mk + pg.x * mg) * inv, .y = (pk.y * mk + pg.y * mg) * inv };
     vel.v[keep] = .{ .x = (vk.x * mk + vg.x * mg) * inv, .y = (vk.y * mk + vg.y * mg) * inv };
     const r_keep = body.v[keep].radius;
-    const r_new = @min(c.params.max_radius, r_keep + @log(1.0 + body.v[gone].radius));
+    var r_new = @min(c.params.max_radius, r_keep + @log(1.0 + body.v[gone].radius));
+    var lvl: u32 = @min((ma & 0xff) + 1, c.max_level);
+    if (accrete) {
+        // Area adds up (mass-proportional area), and the level is galaxy.zig levelFor(mass):
+        // kernels cannot import galaxy.zig, so the formula is duplicated here.
+        const m = mk + mg;
+        r_new = @min(c.params.max_radius, @sqrt(r_keep * r_keep + body.v[gone].radius * body.v[gone].radius));
+        const l = 1.0 + @log2(@max(m, 1.0));
+        lvl = @intFromFloat(@min(@max(l, 1.0), @as(f32, @floatFromInt(c.max_level))));
+        body.v[keep].mass = m;
+    }
     body.v[keep].radius = r_new;
-    const lvl: u32 = @min((ma & 0xff) + 1, c.max_level);
     meta.v[keep] = (meta.v[keep] & ~@as(u32, 0xff)) | lvl;
     // Dead balls keep their slot until the CPU reuses it; mass 0 removes them from gravity.
     meta.v[gone] = meta.v[gone] & ~(L.flag_alive | L.flag_grabbed);
