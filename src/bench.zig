@@ -1,9 +1,11 @@
-//! Headless physics benchmark: `zig build bench -- <balls> <ticks>`.
+//! Headless physics benchmark: `zig build bench -- <balls> <ticks> [gpu]`.
 const std = @import("std");
 const c = @import("c");
 const cfg = @import("config.zig");
 const world = @import("world.zig");
 const physics = @import("physics.zig");
+const gfx = @import("gfx.zig");
+const gpu_world = @import("gpu_world.zig");
 
 test {
     _ = physics;
@@ -50,6 +52,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     _ = it.next();
     const n = if (it.next()) |a| try std.fmt.parseInt(u32, a, 10) else 1000;
     const ticks = if (it.next()) |a| try std.fmt.parseInt(u32, a, 10) else 600;
+    if (it.next()) |mode| if (std.mem.eql(u8, mode, "gpu")) return gpuBench(n, ticks);
 
     const base: world.TickInput = .{ .merging = false, .random_explosions = false };
     var on = base;
@@ -136,4 +139,67 @@ fn run(s: Scenario, n: u32, ticks: u32) !void {
 
 fn ms(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1e6;
+}
+
+/// GPU world: balls uniformly random over the snapped play area, merging and random explosions
+/// off. Reports pipelined throughput (ticks submitted back to back, wall time / ticks, which is
+/// the GPU cost per tick once the queue is full) and a per-stage breakdown from blocking samples.
+fn gpuBench(n: u32, ticks: u32) !void {
+    // SDL_GPU needs the video subsystem; the bench never opens a window.
+    _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SdlInit;
+    defer c.SDL_Quit();
+    var gpu = try gfx.Gfx.init(.{ .window = null });
+    defer gpu.deinit();
+    const gpa = std.heap.smp_allocator;
+    var gw = try gpu_world.GpuWorld.init(gpa, gpu.dev);
+    defer gw.deinit();
+    var w = world.World.init(gpa, 42);
+    defer w.deinit();
+
+    for (0..n) |_| try gw.queueBall(&w, 0, 0);
+    gw.snapBounds(&w);
+    const r = w.prng.random();
+    const b = w.bounds;
+    for (gw.pending_pos.items, gw.pending.items) |*p, nb| {
+        const m = nb.radius + cfg.wall;
+        p.* = .{ .x = b.x + m + r.float(f32) * (b.w - 2 * m), .y = b.y + m + r.float(f32) * (b.h - 2 * m) };
+    }
+    std.debug.print("gpu bench: {d} balls, {d} ticks, merging off, random explosions off\n", .{ n, ticks });
+
+    const freq: f64 = @floatFromInt(c.SDL_GetPerformanceFrequency());
+    for ([_]bool{ true, false }) |grav| {
+        const in: gpu_world.Input = .{ .mutual_gravity = grav, .merging = false, .random_explosions = false };
+        gw.profile_every = 0;
+        // Upload every ball and warm up pipelines; not measured.
+        while (gw.pendingSpawns() > 0) gw.tick(&w, in);
+        for (0..10) |_| gw.tick(&w, in);
+        gw.drain(&w);
+
+        const t0 = c.SDL_GetPerformanceCounter();
+        for (0..ticks) |_| gw.tick(&w, in);
+        gw.drain(&w);
+        const wall_ms = @as(f64, @floatFromInt(c.SDL_GetPerformanceCounter() - t0)) * 1000.0 / freq;
+
+        const samples: u32 = @min(ticks, 30);
+        gw.profile_every = 1;
+        var gsum: f64 = 0;
+        var csum: f64 = 0;
+        var osum: f64 = 0;
+        for (0..samples) |_| {
+            gw.tick(&w, in);
+            gsum += gw.profile.gravity_ms;
+            csum += gw.profile.collide_ms;
+            osum += gw.profile.game_ms;
+        }
+        gw.drain(&w);
+        const ns: f64 = @floatFromInt(samples);
+        std.debug.print(
+            \\[GPU mutual gravity {s}]
+            \\  pipelined: {d:.3} ms/tick ({d} ticks)
+            \\  blocking samples (mean of {d}, include submit+wait latency): gravity {d:.3}  collide {d:.3}  merge/hoop/readback {d:.3} ms
+            \\  balls alive {d}
+            \\
+        , .{ if (grav) "ON " else "OFF", wall_ms / @as(f64, @floatFromInt(ticks)), ticks, samples, gsum / ns, csum / ns, osum / ns, gw.alive });
+    }
 }

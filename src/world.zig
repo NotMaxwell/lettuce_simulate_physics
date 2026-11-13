@@ -135,28 +135,61 @@ pub const World = struct {
         w.explosions.deinit(w.gpa);
     }
 
-    /// Mirrors Ball.__init__ in the Python original.
     pub fn spawnBall(w: *World, x: f32, y: f32) !void {
-        const r = w.prng.random();
-        const radius: f32 = @floatFromInt(r.intRangeAtMost(u8, cfg.spawn_radius_min, cfg.spawn_radius_max));
-        const density = 0.5 + r.float(f32) * 1.5;
+        const nb = randomBall(w.prng.random(), w.current_level);
         try w.balls.append(w.gpa, .{
             .x = x,
             .y = y,
             .prev_x = x,
             .prev_y = y,
-            .vx = @floatFromInt(r.intRangeAtMost(i8, -5, 5)),
-            .vy = @floatFromInt(r.intRangeAtMost(i8, -5, 5)),
-            .radius = radius,
-            .mass = @floor(20 + radius * 4 * density),
-            .density = density,
-            .retention = 0.7 + r.float(f32) * 0.25,
-            .friction = 0.05 + r.float(f32) * 0.25,
-            .gravity = 0.6 + 0.3 * @as(f32, @floatFromInt(r.intRangeAtMost(u8, 0, 5))),
-            .level = r.intRangeAtMost(u8, 1, w.current_level),
+            .vx = nb.vx,
+            .vy = nb.vy,
+            .radius = nb.radius,
+            .mass = nb.mass,
+            .density = nb.density,
+            .retention = nb.retention,
+            .friction = nb.friction,
+            .gravity = nb.gravity,
+            .level = nb.level,
         });
     }
 };
+
+/// Random properties of a new ball, shared by the CPU world and gpu_world.
+pub const NewBall = struct {
+    vx: f32,
+    vy: f32,
+    radius: f32,
+    mass: f32,
+    density: f32,
+    retention: f32,
+    friction: f32,
+    gravity: f32,
+    level: u8,
+};
+
+/// Mirrors Ball.__init__ in the Python original. Draw order is kept from the original spawnBall
+/// so seeded CPU runs are unchanged.
+pub fn randomBall(r: std.Random, current_level: u8) NewBall {
+    const radius: f32 = @floatFromInt(r.intRangeAtMost(u8, cfg.spawn_radius_min, cfg.spawn_radius_max));
+    const density = 0.5 + r.float(f32) * 1.5;
+    const vx: f32 = @floatFromInt(r.intRangeAtMost(i8, -5, 5));
+    const vy: f32 = @floatFromInt(r.intRangeAtMost(i8, -5, 5));
+    const retention = 0.7 + r.float(f32) * 0.25;
+    const friction = 0.05 + r.float(f32) * 0.25;
+    const gravity = 0.6 + 0.3 * @as(f32, @floatFromInt(r.intRangeAtMost(u8, 0, 5)));
+    return .{
+        .vx = vx,
+        .vy = vy,
+        .radius = radius,
+        .mass = @floor(20 + radius * 4 * density),
+        .density = density,
+        .retention = retention,
+        .friction = friction,
+        .gravity = gravity,
+        .level = r.intRangeAtMost(u8, 1, current_level),
+    };
+}
 
 test "spawn" {
     var w = World.init(std.testing.allocator, 1);

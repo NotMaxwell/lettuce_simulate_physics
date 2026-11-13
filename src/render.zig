@@ -1,11 +1,57 @@
-//! Batched GPU renderer: every visual layer is one SDL_RenderGeometry call
-//! (balls, trails, particles, HUD...), so cost scales with vertex fill, not draw calls.
+//! Batched GPU renderer on SDL_GPU: balls and text are instanced sprites filled in place in
+//! mapped GPU memory, everything else is a plain triangle list, so cost scales with fill and
+//! vertex count rather than draw calls.
 const std = @import("std");
 const c = @import("c");
 const world = @import("world.zig");
 const cfg = @import("config.zig");
+const gfx = @import("gfx.zig");
+const font = @import("font.zig");
 
-pub const Perf = struct { fps: f32 = 0, tick_ms: f32 = 0, render_ms: f32 = 0 };
+pub const Perf = struct {
+    fps: f32 = 0,
+    tick_ms: f32 = 0,
+    render_ms: f32 = 0,
+    /// GPU stage times from gpu_world's blocking samples (0 = no GPU world).
+    gpu_gravity_ms: f32 = 0,
+    gpu_collide_ms: f32 = 0,
+    gpu_game_ms: f32 = 0,
+};
+
+/// A particle ring pool on the GPU (gpu_world.Pool), drawn as flat squares by the ball shader.
+pub const GpuPool = struct {
+    pos: *c.SDL_GPUBuffer,
+    prev_pos: *c.SDL_GPUBuffer,
+    body: *c.SDL_GPUBuffer,
+    state: *c.SDL_GPUBuffer,
+    heat: *c.SDL_GPUBuffer,
+    meta: *c.SDL_GPUBuffer,
+    /// Ring slots to draw (dead entries are skipped on the GPU).
+    count: u32,
+};
+
+/// Balls living on the GPU (gpu_world.zig); drawn with gfx.ballPass instead of `World.balls`.
+pub const GpuBalls = struct {
+    pos: *c.SDL_GPUBuffer,
+    prev_pos: *c.SDL_GPUBuffer,
+    body: *c.SDL_GPUBuffer,
+    state: *c.SDL_GPUBuffer,
+    heat: *c.SDL_GPUBuffer,
+    meta: *c.SDL_GPUBuffer,
+    /// Ball ids to draw (dead ids are skipped on the GPU).
+    count: u32,
+    alive: u32,
+    queued: usize = 0,
+    max_level: u8,
+    fire: ?GpuPool = null,
+    ash: ?GpuPool = null,
+    /// One-entry tile table for the pools (uv 0..1 over the white texture).
+    pool_tiles: ?*c.SDL_GPUBuffer = null,
+    /// Counters from the GPU fire system (about two ticks old).
+    burning: u32 = 0,
+    particles: u32 = 0,
+    ashes: u32 = 0,
+};
 
 pub const Hud = struct {
     balls_per_click: u32 = 1,
@@ -19,9 +65,12 @@ pub const Hud = struct {
     lasso_alpha: f32 = 1,
     show_perf: bool = true,
     perf: Perf = .{},
+    gpu: ?GpuBalls = null,
 };
 
-const Vertex = c.SDL_Vertex;
+const Vertex = gfx.Vertex;
+const Sprite = gfx.Sprite;
+const Rgba = [4]f32;
 const tile_px = 256;
 const gutter = 1;
 const cell_px = tile_px + 2 * gutter;
@@ -44,93 +93,75 @@ fn rgb8(r: u8, g: u8, b: u8) Color {
     return .{ .r = @as(f32, @floatFromInt(r)) / 255, .g = @as(f32, @floatFromInt(g)) / 255, .b = @as(f32, @floatFromInt(b)) / 255 };
 }
 
-fn fcolor(col: Color) c.SDL_FColor {
-    return .{ .r = col.r, .g = col.g, .b = col.b, .a = col.a };
+fn fcolor(col: Color) Rgba {
+    return .{ col.r, col.g, col.b, col.a };
 }
 
-/// Growable vertex/index arrays that keep their capacity between frames.
+inline fn vtx(x: f32, y: f32, col: Rgba, u: f32, v: f32) Vertex {
+    return .{ .pos = .{ .x = x, .y = y }, .uv = .{ .x = u, .y = v }, .color = col };
+}
+
+/// Growable triangle-list vertex array that keeps its capacity between frames.
 const Batch = struct {
     v: []Vertex = &.{},
-    ix: []c_int = &.{},
     nv: usize = 0,
-    ni: usize = 0,
 
     fn deinit(b: *Batch, gpa: std.mem.Allocator) void {
         gpa.free(b.v);
-        gpa.free(b.ix);
     }
 
-    fn reserve(b: *Batch, gpa: std.mem.Allocator, add_v: usize, add_i: usize) !void {
-        if (b.nv + add_v > b.v.len) b.v = try gpa.realloc(b.v, @max(b.nv + add_v, b.v.len * 2));
-        if (b.ni + add_i > b.ix.len) b.ix = try gpa.realloc(b.ix, @max(b.ni + add_i, b.ix.len * 2));
+    fn reserve(b: *Batch, gpa: std.mem.Allocator, add: usize) !void {
+        if (b.nv + add > b.v.len) b.v = try gpa.realloc(b.v, @max(b.nv + add, b.v.len * 2));
     }
 
-    inline fn vert(b: *Batch, x: f32, y: f32, col: c.SDL_FColor, u: f32, vv: f32) void {
-        b.v[b.nv] = .{ .position = .{ .x = x, .y = y }, .color = col, .tex_coord = .{ .x = u, .y = vv } };
-        b.nv += 1;
-    }
-
-    /// Triangles (0,1,2) and (0,2,3) over the last four vertices written.
-    inline fn quadIndices(b: *Batch) void {
-        const base: c_int = @intCast(b.nv - 4);
-        const ids = [6]c_int{ 0, 1, 2, 0, 2, 3 };
-        inline for (ids, 0..) |k, j| b.ix[b.ni + j] = base + k;
-        b.ni += 6;
+    /// Triangles (0,1,2) and (0,2,3).
+    inline fn quad(b: *Batch, p0: Vertex, p1: Vertex, p2: Vertex, p3: Vertex) void {
+        b.v[b.nv..][0..6].* = .{ p0, p1, p2, p0, p2, p3 };
+        b.nv += 6;
     }
 
     fn rect(b: *Batch, x: f32, y: f32, w: f32, h: f32, col: Color) void {
         const fc = fcolor(col);
-        b.vert(x, y, fc, 0, 0);
-        b.vert(x + w, y, fc, 0, 0);
-        b.vert(x + w, y + h, fc, 0, 0);
-        b.vert(x, y + h, fc, 0, 0);
-        b.quadIndices();
+        b.quad(vtx(x, y, fc, 0, 0), vtx(x + w, y, fc, 0, 0), vtx(x + w, y + h, fc, 0, 0), vtx(x, y + h, fc, 0, 0));
     }
 
-    /// Axis-aligned textured quad; u/v are the tile or frame rectangle.
-    fn texRect(b: *Batch, x: f32, y: f32, w: f32, h: f32, uv: [4]f32, col: c.SDL_FColor) void {
-        b.vert(x, y, col, uv[0], uv[1]);
-        b.vert(x + w, y, col, uv[2], uv[1]);
-        b.vert(x + w, y + h, col, uv[2], uv[3]);
-        b.vert(x, y + h, col, uv[0], uv[3]);
-        b.quadIndices();
+    /// Axis-aligned textured quad; uv is {u0, v0, u1, v1}.
+    fn texRect(b: *Batch, x: f32, y: f32, w: f32, h: f32, uv: [4]f32, col: Rgba) void {
+        b.quad(vtx(x, y, col, uv[0], uv[1]), vtx(x + w, y, col, uv[2], uv[1]), vtx(x + w, y + h, col, uv[2], uv[3]), vtx(x, y + h, col, uv[0], uv[3]));
     }
 
     const corner_steps = 6;
-    const round_rect_verts = 1 + 4 * (corner_steps + 1);
-    const round_rect_idx = 3 * 4 * (corner_steps + 1);
+    const ring_pts = 4 * (corner_steps + 1);
+    const round_rect_verts = 3 * ring_pts;
 
     fn roundRect(b: *Batch, x: f32, y: f32, w: f32, h: f32, radius: f32, col: Color) void {
         const r = @min(radius, w / 2, h / 2);
         const fc = fcolor(col);
-        const centre: c_int = @intCast(b.nv);
-        b.vert(x + w / 2, y + h / 2, fc, 0, 0);
+        const centre = vtx(x + w / 2, y + h / 2, fc, 0, 0);
         const corners = [4][3]f32{
             .{ x + w - r, y + r, -std.math.pi / 2.0 },
             .{ x + w - r, y + h - r, 0 },
             .{ x + r, y + h - r, std.math.pi / 2.0 },
             .{ x + r, y + r, std.math.pi },
         };
+        var ring: [ring_pts]Vertex = undefined;
+        var n: usize = 0;
         for (corners) |cn| {
             for (0..corner_steps + 1) |k| {
                 const a = cn[2] + (std.math.pi / 2.0) * @as(f32, @floatFromInt(k)) / corner_steps;
-                b.vert(cn[0] + r * @cos(a), cn[1] + r * @sin(a), fc, 0, 0);
+                ring[n] = vtx(cn[0] + r * @cos(a), cn[1] + r * @sin(a), fc, 0, 0);
+                n += 1;
             }
         }
-        const n: c_int = 4 * (corner_steps + 1);
-        var i: c_int = 0;
-        while (i < n) : (i += 1) {
-            b.ix[b.ni] = centre;
-            b.ix[b.ni + 1] = centre + 1 + i;
-            b.ix[b.ni + 2] = centre + 1 + @mod(i + 1, n);
-            b.ni += 3;
+        for (0..ring_pts) |i| {
+            b.v[b.nv..][0..3].* = .{ centre, ring[i], ring[(i + 1) % ring_pts] };
+            b.nv += 3;
         }
     }
 
-    fn flush(b: *Batch, r: *c.SDL_Renderer, tex: ?*c.SDL_Texture) void {
-        if (b.ni > 0) _ = c.SDL_RenderGeometry(r, tex, b.v.ptr, @intCast(b.nv), b.ix.ptr, @intCast(b.ni));
-        b.nv = 0;
-        b.ni = 0;
+    fn flush(b: *Batch, g: *gfx.Gfx, tex: ?gfx.Texture) !void {
+        defer b.nv = 0;
+        try g.triangles(tex, b.v[0..b.nv]);
     }
 };
 
@@ -230,34 +261,32 @@ fn maskCircle(tile: []u8) void {
     }
 }
 
-fn texFromPixels(sdl: *c.SDL_Renderer, px: []const u8, w: usize, h: usize) !*c.SDL_Texture {
-    const tex = c.SDL_CreateTexture(sdl, c.SDL_PIXELFORMAT_RGBA32, c.SDL_TEXTUREACCESS_STATIC, @intCast(w), @intCast(h)) orelse return error.Texture;
-    errdefer c.SDL_DestroyTexture(tex);
-    if (!c.SDL_UpdateTexture(tex, null, px.ptr, @intCast(w * 4))) return error.Texture;
-    _ = c.SDL_SetTextureScaleMode(tex, c.SDL_SCALEMODE_LINEAR);
-    _ = c.SDL_SetTextureBlendMode(tex, c.SDL_BLENDMODE_BLEND);
-    return tex;
+
+fn texFromPixels(g: *gfx.Gfx, px: []const u8, w: usize, h: usize) !gfx.Texture {
+    return g.uploadTexture(px, @intCast(w), @intCast(h), false);
 }
 
 pub const Renderer = struct {
     gpa: std.mem.Allocator,
-    sdl: *c.SDL_Renderer,
-    atlas: *c.SDL_Texture,
-    bg: *c.SDL_Texture,
+    gfx: *gfx.Gfx,
+    atlas: gfx.Texture,
+    bg: gfx.Texture,
     bg_w: f32,
     bg_h: f32,
-    expl: *c.SDL_Texture,
+    expl: gfx.Texture,
+    font_tex: gfx.Texture,
+    font_atlas: font.Atlas,
     tile_uv: [tile_count][4]f32,
+    /// tile_uv as a GPU storage buffer, the tile table of gfx.ballPass.
+    tiles: *c.SDL_GPUBuffer,
     tris: Batch = .{},
-    quads: Batch = .{},
+    trail_buf: []Vertex = &.{},
     cam: Camera = .{},
     out_w: f32 = hud_w,
     out_h: f32 = hud_h,
     rng: u64 = 0x9E3779B97F4A7C15,
 
-    pub fn init(gpa: std.mem.Allocator, sdl: *c.SDL_Renderer) !Renderer {
-        _ = c.SDL_SetRenderDrawBlendMode(sdl, c.SDL_BLENDMODE_BLEND);
-
+    pub fn init(gpa: std.mem.Allocator, g: *gfx.Gfx) !Renderer {
         const atlas_px = try gpa.alloc(u8, atlas_w * atlas_h * 4);
         defer gpa.free(atlas_px);
         @memset(atlas_px, 0);
@@ -296,38 +325,51 @@ pub const Renderer = struct {
                 @as(f32, @floatFromInt(cy0 + gutter + tile_px)) / ah,
             };
         }
-        const atlas = try texFromPixels(sdl, atlas_px, atlas_w, atlas_h);
-        errdefer c.SDL_DestroyTexture(atlas);
+        const atlas = try texFromPixels(g, atlas_px, atlas_w, atlas_h);
+        errdefer g.releaseTexture(atlas);
 
         const bg_img = try Image.load("assets/background/background.png");
         defer bg_img.free();
-        const bg = try texFromPixels(sdl, bg_img.px, bg_img.w, bg_img.h);
-        errdefer c.SDL_DestroyTexture(bg);
+        const bg = try texFromPixels(g, bg_img.px, bg_img.w, bg_img.h);
+        errdefer g.releaseTexture(bg);
 
         const ex_img = try Image.load("assets/explosion/explosion.png");
         defer ex_img.free();
-        const expl = try texFromPixels(sdl, ex_img.px, ex_img.w, ex_img.h);
+        const expl = try texFromPixels(g, ex_img.px, ex_img.w, ex_img.h);
+        errdefer g.releaseTexture(expl);
+
+        var fa = try font.Atlas.init(gpa);
+        errdefer fa.deinit(gpa);
+        const font_tex = try texFromPixels(g, fa.pixels, fa.w, fa.h);
 
         return .{
             .gpa = gpa,
-            .sdl = sdl,
+            .gfx = g,
             .atlas = atlas,
             .bg = bg,
             .bg_w = @floatFromInt(bg_img.w),
             .bg_h = @floatFromInt(bg_img.h),
             .expl = expl,
+            .font_tex = font_tex,
+            .font_atlas = fa,
             .tile_uv = uv,
+            .tiles = try tileBuffer(g, &uv),
         };
     }
 
     pub fn deinit(self: *Renderer) void {
-        c.SDL_DestroyTexture(self.atlas);
-        c.SDL_DestroyTexture(self.bg);
-        c.SDL_DestroyTexture(self.expl);
+        _ = c.SDL_WaitForGPUIdle(self.gfx.dev);
+        self.gfx.releaseTexture(self.atlas);
+        self.gfx.releaseTexture(self.bg);
+        self.gfx.releaseTexture(self.expl);
+        self.gfx.releaseTexture(self.font_tex);
+        c.SDL_ReleaseGPUBuffer(self.gfx.dev, self.tiles);
+        self.font_atlas.deinit(self.gpa);
         self.tris.deinit(self.gpa);
-        self.quads.deinit(self.gpa);
+        self.gpa.free(self.trail_buf);
     }
 
+    /// Takes window pixel coordinates (not window points on high-DPI displays).
     pub fn screenToWorld(self: *const Renderer, w: *const world.World, sx: f32, sy: f32) world.Vec2 {
         _ = w;
         const cam = self.cam;
@@ -341,17 +383,19 @@ pub const Renderer = struct {
         return self.rng | 1;
     }
 
+    /// Records the frame; `present` submits it.
     pub fn draw(self: *Renderer, w: *const world.World, alpha: f32, hud: *const Hud) void {
-        self.drawInner(w, alpha, hud) catch {};
+        self.drawInner(w, alpha, hud) catch |e| std.log.err("draw failed: {s}", .{@errorName(e)});
+    }
+
+    pub fn present(self: *Renderer, screenshot: ?[*:0]const u8) void {
+        self.gfx.end(.{ .screenshot = screenshot }) catch |e| std.log.err("present failed: {s}", .{@errorName(e)});
     }
 
     fn drawInner(self: *Renderer, w: *const world.World, alpha: f32, hud: *const Hud) !void {
-        const sdl = self.sdl;
-        var iw: c_int = 0;
-        var ih: c_int = 0;
-        _ = c.SDL_GetCurrentRenderOutputSize(sdl, &iw, &ih);
-        self.out_w = @floatFromInt(@max(iw, 1));
-        self.out_h = @floatFromInt(@max(ih, 1));
+        self.gfx.begin(.{ 12.0 / 255.0, 12.0 / 255.0, 16.0 / 255.0, 1 });
+        self.out_w = @floatFromInt(self.gfx.width);
+        self.out_h = @floatFromInt(self.gfx.height);
 
         const pb = w.prev_bounds;
         const nb = w.bounds;
@@ -364,14 +408,31 @@ pub const Renderer = struct {
         const cam = Camera.fit(bounds, self.out_w, self.out_h);
         self.cam = cam;
 
-        _ = c.SDL_SetRenderScale(sdl, 1, 1);
-        _ = c.SDL_SetRenderDrawColor(sdl, 12, 12, 16, 255);
-        _ = c.SDL_RenderClear(sdl);
-
         try self.drawBackground(bounds, cam);
-        try self.drawTrails(w, cam);
-        try self.drawBalls(w, alpha, cam);
-        try self.drawParticles(w, alpha, cam);
+        if (hud.gpu) |gb| {
+            // Trails need CPU positions, which GPU balls never send back; they are CPU-mode only.
+            try self.gfx.ballPass(.{
+                .bufs = .{ .pos = gb.pos, .prev_pos = gb.prev_pos, .body = gb.body, .state = gb.state, .heat = gb.heat, .meta = gb.meta, .tiles = self.tiles },
+                .atlas = self.atlas,
+                .count = gb.count,
+                .alpha = alpha,
+                .cam = .{ .scale = cam.s, .ox = cam.ox, .oy = cam.oy, .bx = cam.bx, .by = cam.by },
+            });
+        } else {
+            try self.drawTrails(w, cam);
+            try self.drawBalls(w, alpha, cam);
+        }
+        if (hud.gpu) |gb| {
+            if (gb.pool_tiles) |tiles| for ([_]?GpuPool{ gb.fire, gb.ash }) |maybe| if (maybe) |pool| {
+                try self.gfx.ballPass(.{
+                    .bufs = .{ .pos = pool.pos, .prev_pos = pool.prev_pos, .body = pool.body, .state = pool.state, .heat = pool.heat, .meta = pool.meta, .tiles = tiles },
+                    .atlas = self.gfx.white,
+                    .count = pool.count,
+                    .alpha = alpha,
+                    .cam = .{ .scale = cam.s, .ox = cam.ox, .oy = cam.oy, .bx = cam.bx, .by = cam.by },
+                });
+            };
+        } else try self.drawParticles(w, alpha, cam);
         try self.drawHud(w, hud);
         try self.drawExplosions(w, cam);
         self.drawText(w, hud);
@@ -380,12 +441,11 @@ pub const Renderer = struct {
     fn drawBackground(self: *Renderer, b: world.Rect, cam: Camera) !void {
         // The original window showed the image's top-left base_w x base_h crop; that crop is
         // stretched over the whole play area so the hoop stays where physics expects it.
-        const q = &self.quads;
-        try q.reserve(self.gpa, 4, 6);
-        q.texRect(cam.sx(b.x), cam.sy(b.y), b.w * cam.s, b.h * cam.s, .{ 0, 0, cfg.base_w / self.bg_w, cfg.base_h / self.bg_h }, fcolor(.{ .r = 1, .g = 1, .b = 1 }));
-        q.flush(self.sdl, self.bg);
         const t = &self.tris;
-        try t.reserve(self.gpa, 16, 24);
+        try t.reserve(self.gpa, 6);
+        t.texRect(cam.sx(b.x), cam.sy(b.y), b.w * cam.s, b.h * cam.s, .{ 0, 0, cfg.base_w / self.bg_w, cfg.base_h / self.bg_h }, .{ 1, 1, 1, 1 });
+        try t.flush(self.gfx, self.bg);
+        try t.reserve(self.gpa, 24);
         const wc = rgb8(70, 72, 84);
         const l = cam.sx(b.x);
         const tp = cam.sy(b.y);
@@ -396,12 +456,11 @@ pub const Renderer = struct {
         t.rect(l, tp + bh - th, bw, th, wc);
         t.rect(l, tp + th, th, bh - 2 * th, wc);
         t.rect(l + bw - th, tp + th, th, bh - 2 * th, wc);
-        t.flush(self.sdl, null);
+        try t.flush(self.gfx, null);
     }
 
     const trail_threads = 4;
-    const trail_vpb = cfg.max_trail * 2;
-    const trail_ipb = (cfg.max_trail - 1) * 6;
+    const trail_vpb = (cfg.max_trail - 1) * 6;
 
     const TrailJob = struct {
         sl: std.MultiArrayList(world.Ball).Slice,
@@ -411,9 +470,7 @@ pub const Renderer = struct {
         stride: usize,
         rng: u64,
         verts: []Vertex,
-        idx: []c_int,
         nv: usize = 0,
-        ni: usize = 0,
 
         fn rand01(job: *@This()) f32 {
             job.rng ^= job.rng << 13;
@@ -422,7 +479,7 @@ pub const Renderer = struct {
             return @as(f32, @floatFromInt(@as(u32, @truncate(job.rng >> 32)) >> 8)) / 16777216.0;
         }
 
-        /// Writes ribbons for balls lo..hi; indices are relative to this job's own vertex slice.
+        /// Writes ribbons for balls lo..hi into this job's own vertex slice.
         fn run(job: *@This()) void {
             const trails = job.sl.items(.trail);
             const lens = job.sl.items(.trail_len);
@@ -460,9 +517,7 @@ pub const Renderer = struct {
                 std.mem.reverse(f32, sxs[0..m]);
                 std.mem.reverse(f32, sys[0..m]);
 
-                const base: c_int = @intCast(job.nv);
-                const vp = job.verts[job.nv..][0 .. 2 * m];
-                const ip = job.idx[job.ni..][0 .. 6 * (m - 1)];
+                var pts: [2 * cfg.max_trail]Vertex = undefined;
                 var nx: f32 = 0;
                 var ny: f32 = 1;
                 const inv_m1 = 1.0 / @as(f32, @floatFromInt(m - 1));
@@ -477,26 +532,29 @@ pub const Renderer = struct {
                     }
                     const wpx = @floor(2 + @as(f32, @floatFromInt(q)) * inv_m1 * 4);
                     const hw = @max(wpx * cam.s, 1) * 0.5;
-                    vp[2 * q] = .{ .position = .{ .x = sxs[q] + nx * hw, .y = sys[q] + ny * hw }, .color = col, .tex_coord = .{} };
-                    vp[2 * q + 1] = .{ .position = .{ .x = sxs[q] - nx * hw, .y = sys[q] - ny * hw }, .color = col, .tex_coord = .{} };
+                    pts[2 * q] = vtx(sxs[q] + nx * hw, sys[q] + ny * hw, col, 0, 0);
+                    pts[2 * q + 1] = vtx(sxs[q] - nx * hw, sys[q] - ny * hw, col, 0, 0);
                 }
-                job.nv += 2 * m;
+                const out = job.verts[job.nv..][0 .. 6 * (m - 1)];
                 for (0..m - 1) |sg| {
-                    const a: c_int = base + @as(c_int, @intCast(2 * sg));
-                    ip[6 * sg ..][0..6].* = .{ a, a + 1, a + 2, a + 1, a + 3, a + 2 };
+                    const a = 2 * sg;
+                    out[6 * sg ..][0..6].* = .{ pts[a], pts[a + 1], pts[a + 2], pts[a + 1], pts[a + 3], pts[a + 2] };
                 }
-                job.ni += 6 * (m - 1);
+                job.nv += 6 * (m - 1);
             }
         }
     };
 
     /// Ribbon generation is the heaviest CPU stage, so balls are split over a few threads;
-    /// each writes its own slice of the buffers and gets its own draw call.
+    /// each writes its own slice of the scratch buffer.
     fn drawTrails(self: *Renderer, w: *const world.World, cam: Camera) !void {
         const sl = w.balls.slice();
         const n_balls = sl.len;
-        const t = &self.tris;
-        try t.reserve(self.gpa, n_balls * trail_vpb, n_balls * trail_ipb);
+        if (self.trail_buf.len < n_balls * trail_vpb) {
+            self.gpa.free(self.trail_buf);
+            self.trail_buf = &.{};
+            self.trail_buf = try self.gpa.alloc(Vertex, n_balls * trail_vpb);
+        }
         const stride: usize = if (cam.s < 0.6) 2 else 1;
         const n_jobs: usize = if (n_balls >= 600) trail_threads else 1;
         const per = (n_balls + n_jobs - 1) / n_jobs;
@@ -512,8 +570,7 @@ pub const Renderer = struct {
                 .cam = cam,
                 .stride = stride,
                 .rng = self.nextSeed(),
-                .verts = t.v[lo * trail_vpb .. hi * trail_vpb],
-                .idx = t.ix[lo * trail_ipb .. hi * trail_ipb],
+                .verts = self.trail_buf[lo * trail_vpb .. hi * trail_vpb],
             };
         }
         for (1..n_jobs) |j| threads[j] = std.Thread.spawn(.{}, TrailJob.run, .{&jobs[j]}) catch null;
@@ -521,58 +578,84 @@ pub const Renderer = struct {
         for (1..n_jobs) |j| {
             if (threads[j]) |th| th.join() else jobs[j].run();
         }
-        for (jobs[0..n_jobs]) |*job| {
-            if (job.ni > 0) _ = c.SDL_RenderGeometry(self.sdl, null, job.verts.ptr, @intCast(job.nv), job.idx.ptr, @intCast(job.ni));
-        }
+        for (jobs[0..n_jobs]) |*job| try self.gfx.triangles(null, job.verts[0..job.nv]);
     }
+
+    const BallJob = struct {
+        sl: std.MultiArrayList(world.Ball).Slice,
+        out: []Sprite,
+        lo: usize,
+        hi: usize,
+        alpha: f32,
+        cam: Camera,
+        tile_uv: *const [tile_count][4]f32,
+
+        /// Dead balls become zero-size sprites so slots stay aligned with ball indices.
+        fn run(job: *@This()) void {
+            const sl = job.sl;
+            const xs = sl.items(.x);
+            const ys = sl.items(.y);
+            const pxs = sl.items(.prev_x);
+            const pys = sl.items(.prev_y);
+            const angs = sl.items(.angle);
+            const pangs = sl.items(.prev_angle);
+            const rads = sl.items(.radius);
+            const temps = sl.items(.temp);
+            const burns = sl.items(.burn);
+            const levels = sl.items(.level);
+            const flags = sl.items(.flags);
+            const cam = job.cam;
+            const alpha = job.alpha;
+            const rad_per_deg = std.math.pi / 180.0;
+            for (job.lo..job.hi) |i| {
+                const f = flags[i];
+                const o = &job.out[i];
+                if (!f.alive) {
+                    o.* = std.mem.zeroes(Sprite);
+                    continue;
+                }
+                const heat = std.math.clamp((temps[i] - cfg.room_temp) / (cfg.ignition_temp - cfg.room_temp), 0, 1);
+                const char = 1.0 - std.math.clamp(burns[i] / cfg.max_burn, 0, 1);
+                const gb = (1.0 - heat * 0.5) * char;
+                const tile = if (f.scored) basketball_tile else std.math.clamp(@as(usize, levels[i]), 1, cfg.max_level) - 1;
+                const uv = job.tile_uv[tile];
+                const r = rads[i] * cam.s;
+                o.* = .{
+                    .center = .{ .x = cam.sx(lerp(pxs[i], xs[i], alpha)), .y = cam.sy(lerp(pys[i], ys[i], alpha)) },
+                    .half = .{ .x = r, .y = r },
+                    .uv_min = .{ .x = uv[0], .y = uv[1] },
+                    .uv_max = .{ .x = uv[2], .y = uv[3] },
+                    .color = .{ char, gb, gb, 1 },
+                    .angle = lerp(pangs[i], angs[i], alpha) * rad_per_deg,
+                };
+            }
+        }
+    };
 
     fn drawBalls(self: *Renderer, w: *const world.World, alpha: f32, cam: Camera) !void {
         const sl = w.balls.slice();
-        const xs = sl.items(.x);
-        const ys = sl.items(.y);
-        const pxs = sl.items(.prev_x);
-        const pys = sl.items(.prev_y);
-        const angs = sl.items(.angle);
-        const pangs = sl.items(.prev_angle);
-        const rads = sl.items(.radius);
-        const temps = sl.items(.temp);
-        const burns = sl.items(.burn);
-        const levels = sl.items(.level);
-        const flags = sl.items(.flags);
-        const q = &self.quads;
-        try q.reserve(self.gpa, sl.len * 4, sl.len * 6);
-        const rad_per_deg = std.math.pi / 180.0;
-        for (0..sl.len) |i| {
-            const f = flags[i];
-            if (!f.alive) continue;
-            const heat = std.math.clamp((temps[i] - cfg.room_temp) / (cfg.ignition_temp - cfg.room_temp), 0, 1);
-            const char = 1.0 - std.math.clamp(burns[i] / cfg.max_burn, 0, 1);
-            const gb = (1.0 - heat * 0.5) * char;
-            const col: c.SDL_FColor = .{ .r = char, .g = gb, .b = gb, .a = 1 };
-
-            const tile = if (f.scored) basketball_tile else std.math.clamp(@as(usize, levels[i]), 1, cfg.max_level) - 1;
-            const uv = self.tile_uv[tile];
-            const cx = cam.sx(lerp(pxs[i], xs[i], alpha));
-            const cy = cam.sy(lerp(pys[i], ys[i], alpha));
-            const a = lerp(pangs[i], angs[i], alpha) * rad_per_deg;
-            const r = rads[i] * cam.s;
-            const cs = @cos(a) * r;
-            const sn = @sin(a) * r;
-            // Corners (-,-) (+,-) (+,+) (-,+) rotated counter-clockwise on screen, like pygame.transform.rotate.
-            q.vert(cx - cs - sn, cy + sn - cs, col, uv[0], uv[1]);
-            q.vert(cx + cs - sn, cy - sn - cs, col, uv[2], uv[1]);
-            q.vert(cx + cs + sn, cy - sn + cs, col, uv[2], uv[3]);
-            q.vert(cx - cs + sn, cy + sn + cs, col, uv[0], uv[3]);
-            q.quadIndices();
+        if (sl.len == 0) return;
+        const out = try self.gfx.allocSprites(self.atlas, @intCast(sl.len));
+        const n_jobs: usize = if (sl.len >= 4096) 4 else 1;
+        const per = (sl.len + n_jobs - 1) / n_jobs;
+        var jobs: [4]BallJob = undefined;
+        var threads: [4]?std.Thread = @splat(null);
+        for (0..n_jobs) |j| {
+            const lo = @min(j * per, sl.len);
+            jobs[j] = .{ .sl = sl, .out = out, .lo = lo, .hi = @min(lo + per, sl.len), .alpha = alpha, .cam = cam, .tile_uv = &self.tile_uv };
         }
-        q.flush(self.sdl, self.atlas);
+        for (1..n_jobs) |j| threads[j] = std.Thread.spawn(.{}, BallJob.run, .{&jobs[j]}) catch null;
+        jobs[0].run();
+        for (1..n_jobs) |j| {
+            if (threads[j]) |th| th.join() else jobs[j].run();
+        }
     }
 
     fn drawParticles(self: *Renderer, w: *const world.World, alpha: f32, cam: Camera) !void {
         const t = &self.tris;
         const ps = w.particles.slice();
         const ash = w.ashes.slice();
-        try t.reserve(self.gpa, (ps.len + ash.len) * 4, (ps.len + ash.len) * 6);
+        try t.reserve(self.gpa, (ps.len + ash.len) * 6);
         const px = ps.items(.x);
         const py = ps.items(.y);
         const psz = ps.items(.size);
@@ -595,21 +678,20 @@ pub const Renderer = struct {
             const rr: u8 = @intFromFloat(@as(f32, @floatFromInt(red[i])) * fade);
             t.rect(cam.sx(lerp(apx[i], ax[i], alpha)) - d / 2, cam.sy(lerp(apy[i], ay[i], alpha)) - d / 2, d, d, rgb8(rr, 0, 0));
         }
-        t.flush(self.sdl, null);
+        try t.flush(self.gfx, null);
     }
 
     fn drawExplosions(self: *Renderer, w: *const world.World, cam: Camera) !void {
-        const q = &self.quads;
-        try q.reserve(self.gpa, w.explosions.items.len * 4, w.explosions.items.len * 6);
-        const white = fcolor(.{ .r = 1, .g = 1, .b = 1 });
+        const t = &self.tris;
+        try t.reserve(self.gpa, w.explosions.items.len * 6);
         for (w.explosions.items) |e| {
             const frame = e.age / expl_frame_ticks;
             if (frame >= expl_frames) continue;
             const f: f32 = @floatFromInt(frame);
             const sz = e.size * cam.s;
-            q.texRect(cam.sx(e.x) - sz / 2, cam.sy(e.y - 0.3 * e.size) - sz / 2, sz, sz, .{ f / expl_frames, 0, (f + 1) / expl_frames, 1 }, white);
+            t.texRect(cam.sx(e.x) - sz / 2, cam.sy(e.y - 0.3 * e.size) - sz / 2, sz, sz, .{ f / expl_frames, 0, (f + 1) / expl_frames, 1 }, .{ 1, 1, 1, 1 });
         }
-        q.flush(self.sdl, self.expl);
+        try t.flush(self.gfx, self.expl);
     }
 
     fn hudScale(self: *const Renderer) f32 {
@@ -620,10 +702,9 @@ pub const Renderer = struct {
     fn drawHud(self: *Renderer, w: *const world.World, hud: *const Hud) !void {
         const hs = self.hudScale();
         const t = &self.tris;
-        const q = &self.quads;
         const panel_x = (self.out_w / hs - 149) * hs;
         const panel_y = 15 * hs;
-        try t.reserve(self.gpa, 6 * Batch.round_rect_verts + 8, 6 * Batch.round_rect_idx + 12);
+        try t.reserve(self.gpa, 6 * Batch.round_rect_verts);
         t.roundRect(panel_x, panel_y, 135 * hs, 105 * hs, 12 * hs, rgb8(100, 100, 100));
         t.roundRect(panel_x + 2 * hs, panel_y + 2 * hs, 131 * hs, 101 * hs, 10 * hs, rgb8(20, 20, 20));
 
@@ -634,25 +715,9 @@ pub const Renderer = struct {
         const fill = 131 * hs * frac;
         if (fill >= 1) t.roundRect(panel_x + 2 * hs, bar_y + 2 * hs, fill, 16 * hs, 4 * hs, rgb8(40, 120, 255));
 
-        if (w.balls.len > 0) {
-            const sl = w.balls.slice();
-            const levels = sl.items(.level);
-            const flags = sl.items(.flags);
-            var best: ?usize = null;
-            for (0..sl.len) |i| {
-                if (!flags[i].alive) continue;
-                if (best == null or levels[i] > levels[best.?]) best = i;
-            }
-            if (best) |bi| {
-                const tile = if (flags[bi].scored) basketball_tile else std.math.clamp(@as(usize, levels[bi]), 1, cfg.max_level) - 1;
-                try q.reserve(self.gpa, 4, 6);
-                q.texRect(panel_x + 10 * hs, panel_y + 12 * hs, 80 * hs, 80 * hs, self.tile_uv[tile], fcolor(.{ .r = 1, .g = 1, .b = 1 }));
-            }
-        }
-
         if (hud.lasso.len >= 2) {
             const n = hud.lasso.len - 1;
-            try t.reserve(self.gpa, n * 4, n * 6);
+            try t.reserve(self.gpa, n * 6);
             const col: Color = .{ .r = 1, .g = 0, .b = 0, .a = std.math.clamp(hud.lasso_alpha, 0, 1) };
             const hw = 2.5 * hs;
             for (0..n) |i| {
@@ -669,28 +734,29 @@ pub const Renderer = struct {
                 const nx = -dy / l * hw;
                 const ny = dx / l * hw;
                 const fc = fcolor(col);
-                t.vert(x0 + nx, y0 + ny, fc, 0, 0);
-                t.vert(x1 + nx, y1 + ny, fc, 0, 0);
-                t.vert(x1 - nx, y1 - ny, fc, 0, 0);
-                t.vert(x0 - nx, y0 - ny, fc, 0, 0);
-                t.quadIndices();
+                t.quad(vtx(x0 + nx, y0 + ny, fc, 0, 0), vtx(x1 + nx, y1 + ny, fc, 0, 0), vtx(x1 - nx, y1 - ny, fc, 0, 0), vtx(x0 - nx, y0 - ny, fc, 0, 0));
             }
         }
-        t.flush(self.sdl, null);
-        q.flush(self.sdl, self.atlas);
+        try t.flush(self.gfx, null);
+
+        if (bestBall(w, hud)) |bb| {
+            const tile = if (bb.scored) basketball_tile else std.math.clamp(@as(usize, bb.level), 1, cfg.max_level) - 1;
+            try t.reserve(self.gpa, 6);
+            t.texRect(panel_x + 10 * hs, panel_y + 12 * hs, 80 * hs, 80 * hs, self.tile_uv[tile], .{ 1, 1, 1, 1 });
+            try t.flush(self.gfx, self.atlas);
+        }
     }
 
     fn text(self: *Renderer, x: f32, y: f32, scale: f32, col: Color, comptime fmt: []const u8, args: anytype) void {
         var buf: [160]u8 = undefined;
-        const s = std.mem.printSentinel(&buf, fmt, args, 0) catch return;
-        const hs = self.hudScale() * scale;
-        _ = c.SDL_SetRenderScale(self.sdl, hs, hs);
-        _ = c.SDL_SetRenderDrawColor(self.sdl, @intFromFloat(col.r * 255), @intFromFloat(col.g * 255), @intFromFloat(col.b * 255), 255);
-        _ = c.SDL_RenderDebugText(self.sdl, x / hs, y / hs, s.ptr);
+        const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
+        var out: [buf.len]Sprite = undefined;
+        const n = font.layout(&self.font_atlas, s, x, y, self.hudScale() * scale, fcolor(col), &out);
+        self.gfx.sprites(self.font_tex, out[0..n]) catch {};
     }
 
     fn textWidth(self: *const Renderer, scale: f32, len: usize) f32 {
-        return @as(f32, @floatFromInt(len)) * c.SDL_DEBUG_TEXT_FONT_CHARACTER_SIZE * scale * self.hudScale();
+        return font.textWidth(len, scale * self.hudScale());
     }
 
     fn drawText(self: *Renderer, w: *const world.World, hud: *const Hud) void {
@@ -708,7 +774,7 @@ pub const Renderer = struct {
             "Press [F] to toggle gravity.",
             "[N] toggle merging",
             "[P] perf overlay",
-            "[T] stress test: +1000 balls, merging off",
+            "[T] stress test: +100000 balls, merging off",
         };
         for (help) |line| {
             self.text(x, y, 1.5, white, "{s}", .{line});
@@ -725,22 +791,21 @@ pub const Renderer = struct {
             const grey = rgb8(190, 255, 190);
             self.text(x, y, 1.5, grey, "fps {d:.0}  tick {d:.2} ms  render {d:.2} ms", .{ p.fps, p.tick_ms, p.render_ms });
             y += lh;
-            self.text(x, y, 1.5, grey, "balls {d}  particles {d}  ashes {d}", .{ w.balls.len, w.particles.len, w.ashes.len });
+            if (hud.gpu) |gb| {
+                self.text(x, y, 1.5, grey, "GPU balls {d} (ids {d}, queued {d})  gravity {d:.2} ms  collide {d:.2} ms  merge+io {d:.2} ms", .{ gb.alive, gb.count, gb.queued, p.gpu_gravity_ms, p.gpu_collide_ms, p.gpu_game_ms });
+            } else {
+                self.text(x, y, 1.5, grey, "balls {d}  particles {d}  ashes {d}", .{ w.balls.len, w.particles.len, w.ashes.len });
+            }
             y += lh;
+            if (hud.gpu) |gb| {
+                self.text(x, y, 1.5, grey, "burning {d}  particles {d}  ashes {d}", .{ gb.burning, gb.particles, gb.ashes });
+                y += lh;
+            }
             self.text(x, y, 1.5, grey, "gravity: {s}  merging: {s}", .{ if (hud.mutual_gravity) "mutual" else "constant", if (hud.merging) "on" else "off" });
         }
 
         const panel_x = self.out_w - 149 * hs;
-        if (w.balls.len > 0) {
-            const sl = w.balls.slice();
-            const levels = sl.items(.level);
-            const flags = sl.items(.flags);
-            var best: u8 = 0;
-            for (0..sl.len) |i| if (flags[i].alive) {
-                best = @max(best, levels[i]);
-            };
-            if (best > 0) self.text(panel_x + 96 * hs, 15 * hs + 44 * hs, 2, white, "{d}", .{best});
-        }
+        if (bestBall(w, hud)) |bb| self.text(panel_x + 96 * hs, 15 * hs + 44 * hs, 2, white, "{d}", .{bb.level});
 
         var pb: [32]u8 = undefined;
         const bpc = std.fmt.bufPrint(&pb, "balls per click: {d}", .{hud.balls_per_click}) catch "";
@@ -759,6 +824,39 @@ pub const Renderer = struct {
             const s = std.fmt.bufPrint(&cb, "{d}", .{hud.countdown}) catch "";
             self.text((self.out_w - self.textWidth(6, s.len)) / 2, 100 * hs - 24 * hs, 6, rgb8(255, 0, 0), "{s}", .{s});
         }
-        _ = c.SDL_SetRenderScale(self.sdl, 1, 1);
     }
 };
+
+fn tileBuffer(g: *gfx.Gfx, uv: *const [tile_count][4]f32) !*c.SDL_GPUBuffer {
+    const size: u32 = @sizeOf(@TypeOf(uv.*));
+    const buf = c.SDL_CreateGPUBuffer(g.dev, &.{ .usage = c.SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ, .size = size }) orelse return error.GpuAlloc;
+    errdefer c.SDL_ReleaseGPUBuffer(g.dev, buf);
+    const tb = c.SDL_CreateGPUTransferBuffer(g.dev, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = size }) orelse return error.GpuAlloc;
+    defer c.SDL_ReleaseGPUTransferBuffer(g.dev, tb);
+    const m: [*]u8 = @ptrCast(c.SDL_MapGPUTransferBuffer(g.dev, tb, false) orelse return error.GpuAlloc);
+    @memcpy(m[0..size], std.mem.asBytes(uv));
+    c.SDL_UnmapGPUTransferBuffer(g.dev, tb);
+    const cmd = c.SDL_AcquireGPUCommandBuffer(g.dev) orelse return error.GpuAlloc;
+    const cp = c.SDL_BeginGPUCopyPass(cmd);
+    c.SDL_UploadToGPUBuffer(cp, &.{ .transfer_buffer = tb }, &.{ .buffer = buf, .size = size }, false);
+    c.SDL_EndGPUCopyPass(cp);
+    if (!c.SDL_SubmitGPUCommandBuffer(cmd)) return error.GpuAlloc;
+    return buf;
+}
+
+const BestBall = struct { level: u8, scored: bool };
+
+/// Highest-level live ball for the HUD; GPU balls report the max level from merge events.
+fn bestBall(w: *const world.World, hud: *const Hud) ?BestBall {
+    if (hud.gpu) |gb| return if (gb.alive > 0) .{ .level = gb.max_level, .scored = false } else null;
+    const sl = w.balls.slice();
+    const levels = sl.items(.level);
+    const flags = sl.items(.flags);
+    var best: ?usize = null;
+    for (0..sl.len) |i| {
+        if (!flags[i].alive) continue;
+        if (best == null or levels[i] > levels[best.?]) best = i;
+    }
+    const bi = best orelse return null;
+    return .{ .level = levels[bi], .scored = flags[bi].scored };
+}

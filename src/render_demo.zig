@@ -1,16 +1,20 @@
-//! Renders one synthetic frame to .scratch/frame.bmp and times Renderer.draw.
+//! Renders one synthetic frame to .scratch/frame.bmp and times Renderer.draw (CPU side).
 const std = @import("std");
 const c = @import("c");
 const world = @import("world.zig");
 const cfg = @import("config.zig");
 const render = @import("render.zig");
+const gfx = @import("gfx.zig");
 
 pub fn main() !void {
     if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SdlInit;
     defer c.SDL_Quit();
-    var window: ?*c.SDL_Window = null;
-    var sdl: ?*c.SDL_Renderer = null;
-    if (!c.SDL_CreateWindowAndRenderer("render-demo", 1029, 720, 0, &window, &sdl)) return error.SdlWindow;
+    const driver: []const u8 = if (c.SDL_GetCurrentVideoDriver()) |d| std.mem.span(d) else "";
+    const headless = std.mem.eql(u8, driver, "offscreen");
+    const window: ?*c.SDL_Window = if (headless) null else c.SDL_CreateWindow("render-demo", 1029, 720, 0);
+    defer if (window) |w| c.SDL_DestroyWindow(w);
+    var g = try gfx.Gfx.init(.{ .window = window, .width = 1029, .height = 720, .vsync = false });
+    defer g.deinit();
     const gpa = std.heap.smp_allocator;
 
     var w = world.World.init(gpa, 7);
@@ -89,7 +93,7 @@ pub fn main() !void {
         p.* = .{ .x = 1100 + 250 * @cos(a), .y = 800 + 200 * @sin(a) };
     }
 
-    var r = try render.Renderer.init(gpa, sdl.?);
+    var r = try render.Renderer.init(gpa, &g);
     defer r.deinit();
 
     const hud: render.Hud = .{
@@ -102,14 +106,16 @@ pub fn main() !void {
     };
 
     r.draw(&w, 1.0, &hud);
-    const surf = c.SDL_RenderReadPixels(sdl.?, null) orelse return error.ReadPixels;
-    defer c.SDL_DestroySurface(surf);
-    if (!c.SDL_SaveBMP(surf, ".scratch/frame.bmp")) return error.SaveBmp;
+    r.present(".scratch/frame.bmp");
 
     const iters = 300;
-    const t0 = c.SDL_GetPerformanceCounter();
-    for (0..iters) |i| r.draw(&w, @as(f32, @floatFromInt(i % 10)) / 10.0, &hud);
-    const t1 = c.SDL_GetPerformanceCounter();
-    const ms = @as(f64, @floatFromInt(t1 - t0)) * 1000.0 / @as(f64, @floatFromInt(c.SDL_GetPerformanceFrequency())) / iters;
-    std.debug.print("{d} balls: mean {d:.3} ms per draw() over {d} calls (CPU, no present/GPU sync)\n", .{ w.balls.len, ms, iters });
+    var total: u64 = 0;
+    for (0..iters) |i| {
+        const t0 = c.SDL_GetPerformanceCounter();
+        r.draw(&w, @as(f32, @floatFromInt(i % 10)) / 10.0, &hud);
+        total += c.SDL_GetPerformanceCounter() - t0;
+        r.present(null);
+    }
+    const ms = @as(f64, @floatFromInt(total)) * 1000.0 / @as(f64, @floatFromInt(c.SDL_GetPerformanceFrequency())) / iters;
+    std.debug.print("{d} balls: mean {d:.3} ms per draw() over {d} calls (CPU recording only, present excluded)\n", .{ w.balls.len, ms, iters });
 }

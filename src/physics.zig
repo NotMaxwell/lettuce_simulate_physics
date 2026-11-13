@@ -902,7 +902,7 @@ pub fn targetBounds(fill_area: f32) Rect {
     return .{ .x = (cfg.base_w - tw) / 2, .y = (cfg.base_h - th) / 2, .w = tw, .h = th };
 }
 
-fn easeBounds(cur: Rect, fill_area: f32) Rect {
+pub fn easeBounds(cur: Rect, fill_area: f32) Rect {
     const t = targetBounds(fill_area);
     const rate = if (t.w > cur.w) cfg.area_grow_rate else cfg.area_shrink_rate;
     var w = cur.w + (t.w - cur.w) * rate;
