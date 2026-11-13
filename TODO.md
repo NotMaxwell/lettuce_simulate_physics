@@ -65,8 +65,8 @@ Rough sizing for 2B (estimate, to be measured): lean layout ~20 B/body in 2D (40
 1M gives 5-30 s/tick on one 7800-class GPU: batch jobs of hours, not real time.
 
 Decisions for the user (block the phases marked):
-- D1 Gravity: keep 2D log potential, or 3D 1/r^2 (real matter; needs a 3D tree, more memory). Blocks 2+.
-- D2 Cluster: which system, which GPUs, is Vulkan usable on compute nodes (else a CUDA/OpenCL backend),
+- D1 Gravity: DECIDED 2026-11-13: 3D 1/r^2 for the sim (the game stays 2D). Design in progress.
+- D2 Cluster: Alabama Supercomputer Center (docs https://hpcdocs.asc.edu/, being researched); which system, which GPUs, is Vulkan usable on compute nodes (else a CUDA/OpenCL backend),
      scheduler (Slurm?), GPUs per job, walltime, storage quota. On a compute node:
      `nvidia-smi`, `vulkaninfo --summary`, `sinfo`. Blocks 10+.
 - D3 Multi-node communication: MPI is C, an exception to "if it can be Zig, it is Zig"; the
