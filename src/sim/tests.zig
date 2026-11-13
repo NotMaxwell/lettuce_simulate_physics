@@ -4,6 +4,7 @@ const galaxy = @import("galaxy");
 const sim = @import("sim.zig");
 const snap = @import("snapshot.zig");
 const snapper = @import("snapper.zig");
+test { _ = @import("ref3.zig"); }
 const render = @import("render.zig");
 
 fn device() !*c.SDL_GPUDevice {
