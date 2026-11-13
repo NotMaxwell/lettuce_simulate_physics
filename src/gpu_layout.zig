@@ -172,6 +172,25 @@ pub const Params3 = extern struct {
     eta: f32,
 };
 
+/// Uniform block of the 3D tree kick (src/sim/k3/walk.zig, slot 0).
+pub const WalkParams3 = extern struct {
+    n: u32,
+    /// First body of this dispatch and the number of bodies in it (chunked for the driver watchdog).
+    first: u32,
+    count: u32,
+    /// sim3_flag_store_accel, sim3_flag_potential.
+    flags: u32,
+    g: f32,
+    eps: f32,
+    eps2: f32,
+    kick: f32,
+    /// Length per position quantum: box_size / 2^32.
+    box_scale: f32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+};
+
 comptime {
     const std = @import("std");
     std.debug.assert(@sizeOf(Pos3) == 12);
@@ -180,4 +199,5 @@ comptime {
     std.debug.assert(@sizeOf(Node) == 32);
     std.debug.assert(@sizeOf(NodeQuad) == 24);
     std.debug.assert(@sizeOf(Params3) == 48);
+    std.debug.assert(@sizeOf(WalkParams3) == 48);
 }

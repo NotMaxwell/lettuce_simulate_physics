@@ -16,24 +16,7 @@ pub const Error = sim.Error;
 pub const Buffer = *c.SDL_GPUBuffer;
 const dispatch_x: u32 = 32768;
 
-/// Must match k3/walk.zig WalkParams3 field for field.
-pub const WalkParams3 = extern struct {
-    n: u32,
-    first: u32,
-    count: u32,
-    flags: u32,
-    g: f32,
-    eps: f32,
-    eps2: f32,
-    kick: f32,
-    box_scale: f32,
-    _pad0: u32 = 0,
-    _pad1: u32 = 0,
-    _pad2: u32 = 0,
-};
-
 comptime {
-    std.debug.assert(@sizeOf(WalkParams3) == 48);
     // ref3's arrays are uploaded byte for byte.
     std.debug.assert(@sizeOf(ref3.Node) == @sizeOf(L.Node) and @sizeOf(ref3.NodeQuad) == @sizeOf(L.NodeQuad));
     for (@typeInfo(L.Node).@"struct".field_names) |f| std.debug.assert(@offsetOf(L.Node, f) == @offsetOf(ref3.Node, f));
@@ -115,7 +98,7 @@ pub const Walk3 = struct {
         var first: u32 = 0;
         while (true) {
             const count = @min(w.chunk, k.n - first);
-            const p: WalkParams3 = .{
+            const p: L.WalkParams3 = .{
                 .n = k.n,
                 .first = first,
                 .count = count,
@@ -126,7 +109,7 @@ pub const Walk3 = struct {
                 .kick = k.kick,
                 .box_scale = k.box_scale,
             };
-            c.SDL_PushGPUComputeUniformData(cmd, 0, &p, @sizeOf(WalkParams3));
+            c.SDL_PushGPUComputeUniformData(cmd, 0, &p, @sizeOf(L.WalkParams3));
             const rw = [3]c.SDL_GPUStorageBufferReadWriteBinding{ .{ .buffer = b.vel }, .{ .buffer = b.amag }, .{ .buffer = b.pot } };
             const cp = c.SDL_BeginGPUComputePass(cmd, null, 0, &rw, rw.len);
             c.SDL_BindGPUComputePipeline(cp, w.pipes[pi]);

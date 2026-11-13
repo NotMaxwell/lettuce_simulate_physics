@@ -223,11 +223,9 @@ pub const Tree = struct {
             st.visits += 1;
             const r = [3]f64{ tp[0] - phys(n.com.x, t.box), tp[1] - phys(n.com.y, t.box), tp[2] - phys(n.com.z, t.box) };
             const r2 = r[0] * r[0] + r[1] * r[1] + r[2] * r[2];
-            // A node (leaf or cell) is never accepted inside 40 softening
-            // lengths, where its unsoftened field would differ from the softened pair sum by more than 1e-3.
-            if (r2 > n.open_r2 and r2 > 1600 * eps2) {
+            if (r2 > n.open_r2 and r2 > near_k * near_k * eps2) {
                 st.cells += 1;
-                cellAccel(&acc, r, r2, n.mass, t.quads[idx]);
+                cellAccel(&acc, r, r2, n.mass, t.quads[idx], eps2);
                 idx = n.skip;
             } else if (isLeaf(n)) {
                 const first = n.child & ~leaf_flag;
@@ -250,22 +248,31 @@ pub const Tree = struct {
     }
 };
 
-/// Far field of one cell; `r` is target minus com. The cell is unsoftened: it is only accepted far
-/// outside any softening length.
-fn cellAccel(acc: *Accel, r: [3]f64, r2: f64, m: f32, q: NodeQuad) void {
-    const ir2 = 1.0 / r2;
-    const ir = @sqrt(ir2);
-    const ir3 = ir2 * ir;
-    const ir5 = ir3 * ir2;
+/// Nodes closer than near_k softening lengths are never accepted. Measured (2 x 400-body clumps of
+/// size 0.2 eps, 0.5-40 eps apart): with no guard, cells inside a clump smaller than eps cost 4e-3
+/// at every separation; the worst case over separations is 1.0e-3 with a guard of 1 eps, 4.4e-4
+/// with 3 and 6e-5 with 4. A 1M Plummer cloud needs 948 pairs per body at eps 0.01 either way and
+/// 1147 (guard 3) or 1902 (guard 4) at eps 0.05.
+pub const near_k: f64 = 3;
+
+/// Far field of one node; `r` is target minus com. Monopole and quadrupole are both the Plummer-
+/// softened expansion, so a one-body node equals the direct pair term. Only the traceless part of
+/// the softened quadrupole is kept (the trace, sum m |x|^2, is not stored); it is the eps^2/s share,
+/// at most 10% of the quadrupole beyond near_k.
+fn cellAccel(acc: *Accel, r: [3]f64, r2: f64, m: f32, q: NodeQuad, eps2: f64) void {
     const mm: f64 = m;
+    const inv = 1.0 / @sqrt(r2 + eps2);
+    const inv2 = inv * inv;
+    const inv3 = inv2 * inv;
+    const inv5 = inv3 * inv2;
     const qr = [3]f64{
         q.xx * r[0] + q.xy * r[1] + q.xz * r[2],
         q.xy * r[0] + q.yy * r[1] + q.yz * r[2],
         q.xz * r[0] + q.yz * r[1] + q.zz * r[2],
     };
     const rqr = r[0] * qr[0] + r[1] * qr[1] + r[2] * qr[2];
-    for (0..3) |k| acc.a[k] += -mm * r[k] * ir3 + qr[k] * ir5 - 2.5 * rqr * r[k] * ir5 * ir2;
-    acc.pot += -mm * ir - 0.5 * rqr * ir5;
+    for (0..3) |k| acc.a[k] += -mm * r[k] * inv3 + qr[k] * inv5 - 2.5 * rqr * r[k] * inv5 * inv2;
+    acc.pot += -mm * inv - 0.5 * rqr * inv5;
 }
 
 const Moment = struct {
@@ -559,6 +566,11 @@ pub const ErrStats = struct { rms: f64, p99: f64, visits: f64, cells: f64, pairs
 
 /// Force error of the tree walk against direct sum on `targets` evenly spaced bodies.
 pub fn forceError(gpa: std.mem.Allocator, t: Tree, cloud_pos: []const Pos3, cloud_mass: []const f32, targets: usize) !ErrStats {
+    return forceErrorEps(gpa, t, cloud_pos, cloud_mass, targets, test_eps);
+}
+
+/// Like forceError at softening `eps`.
+pub fn forceErrorEps(gpa: std.mem.Allocator, t: Tree, cloud_pos: []const Pos3, cloud_mass: []const f32, targets: usize, eps: f64) !ErrStats {
     const n = cloud_pos.len;
     const inv = try gpa.alloc(u32, n);
     defer gpa.free(inv);
@@ -570,8 +582,8 @@ pub fn forceError(gpa: std.mem.Allocator, t: Tree, cloud_pos: []const Pos3, clou
     var sum2: f64 = 0;
     for (errs) |*e| {
         const i = rng.random().uintLessThan(usize, n);
-        const ex = directAt(cloud_pos, cloud_mass, t.box, cloud_pos[i], i, 1, test_eps);
-        const ap = t.walk(cloud_pos[i], inv[i], 1, test_eps, &st);
+        const ex = directAt(cloud_pos, cloud_mass, t.box, cloud_pos[i], i, 1, eps);
+        const ap = t.walk(cloud_pos[i], inv[i], 1, eps, &st);
         var d2: f64 = 0;
         var e2: f64 = 0;
         for (0..3) |c| {
@@ -627,6 +639,12 @@ test "ref3: 10k Plummer force error, tree shape and invariants" {
         });
         try testing.expect(e.rms <= c.rms_max);
         if (c.theta == 0.6) try testing.expect(e.p99 <= 5e-3);
+        // Softened nodes keep the error flat from eps far below the spacing to well above it.
+        if (c.theta == 0.6) for ([_]f64{ 0.01, 0.05 }) |eps| {
+            const es = try forceErrorEps(gpa, t, cloud.pos, cloud.mass, 1000, eps);
+            std.debug.print("ref3 10k theta=0.6 eps={d}: rms {e:.2} p99 {e:.2} pairs {d:.0}\n", .{ eps, es.rms, es.p99, es.pairs });
+            try testing.expect(es.rms <= 1e-3 and es.p99 <= 5e-3);
+        };
         try testing.expect(@as(f64, @floatFromInt(t.nodes.len)) / n <= 0.12);
         try testing.expectApproxEqRel(total, t.nodes[0].mass, 1e-6);
         try testing.expectEqual(@as(u32, n), nodeCount(t.nodes[0]));
@@ -732,7 +750,12 @@ test "ref3: prefix-cell criterion also meets the error targets" {
     try testing.expect(e.rms <= 1e-3);
 }
 
-test "ref3: two tight clumps a few softening lengths apart match direct sum" {
+test "ref3: two tight clumps 1 to 40 softening lengths apart match direct sum" {
+    for ([_]f64{ 1, 2, 3, 4, 6, 10, 40 }) |sep| try clumps(sep);
+}
+
+/// Two 400-body clumps of size 0.2 eps, `sep` eps apart: nodes accepted near and inside eps.
+fn clumps(sep: f64) !void {
     const gpa = testing.allocator;
     const eps = 1e-4;
     const per = 400;
@@ -741,7 +764,7 @@ test "ref3: two tight clumps a few softening lengths apart match direct sum" {
     var prng = std.Random.DefaultPrng.init(5);
     const r = prng.random();
     for (&pos, &mass, 0..) |*p, *m, i| {
-        const cx: f64 = if (i < per) 0.3 else 0.3 + 3 * eps;
+        const cx: f64 = if (i < per) 0.3 else 0.3 + sep * eps;
         const q = struct {
             fn f(c: f64, j: f64) u32 {
                 return @intFromFloat((c + (j - 0.5) * 2e-5) * 4294967296.0);

@@ -1,31 +1,14 @@
 //! Barnes-Hut tree kick (docs/sim3d.md, work package 5): one thread per body walks the radix tree
-//! along its ropes. A port of ref3.Tree.walk (the spec) to f32: same acceptance test, same 40-eps
-//! guard, same softened leaf pairs and traceless-quadrupole far field, so the interaction lists
-//! agree except where f32 and f64 round r^2 to opposite sides of open_r2.
+//! along its ropes. A port of ref3.Tree.walk (the spec) to f32: same acceptance test and 3-eps
+//! guard, same softened leaf pairs and Plummer-softened monopole + traceless quadrupole for accepted
+//! nodes, so the interaction lists agree except where f32 and f64 round r^2 to opposite sides of
+//! open_r2.
 //!
 //! Bodies are in Morton order (the leaves index them), so neighbouring threads walk nearly the same
 //! nodes. Each body sums its terms in one fixed order and nothing is shared between threads, so a
 //! rerun is bit-identical.
 const C = @import("common.zig");
 const L = C.L;
-
-/// Uniform block. Mirrored in src/sim/walk3.zig (the host cannot import a kernel file); proposed
-/// for gpu_layout.zig.
-pub const WalkParams3 = extern struct {
-    n: u32,
-    /// First body of this dispatch and the number of bodies in it (chunked for the driver watchdog).
-    first: u32,
-    count: u32,
-    flags: u32,
-    g: f32,
-    eps: f32,
-    eps2: f32,
-    kick: f32,
-    box_scale: f32,
-    _pad0: u32 = 0,
-    _pad1: u32 = 0,
-    _pad2: u32 = 0,
-};
 
 const pos = C.ro(L.Pos3, 0, "pos");
 const mass = C.ro(f32, 1, "mass");
@@ -34,7 +17,7 @@ const quads = C.ro(L.NodeQuad, 3, "quads");
 const vel = C.rw(L.Vel3, 0, "vel");
 const amag = C.rw(f32, 1, "amag");
 const pot = C.rw(f32, 2, "pot");
-const params = C.uniform(WalkParams3, "params");
+const params = C.uniform(L.WalkParams3, "params");
 
 const leaf_flag: u32 = 0x8000_0000;
 const end: u32 = 0xFFFF_FFFF;
@@ -56,8 +39,8 @@ inline fn walkBody(comptime gs: u32) void {
     const me = C.load(pos, i);
     const bs = params.box_scale;
     const eps2 = params.eps2;
-    // ref3: a node is never accepted inside 40 softening lengths.
-    const near2 = 1600 * eps2;
+    // ref3.near_k: a node is never accepted inside 3 softening lengths.
+    const near2 = 9 * eps2;
     var ax: f32 = 0;
     var ay: f32 = 0;
     var az: f32 = 0;
@@ -72,20 +55,20 @@ inline fn walkBody(comptime gs: u32) void {
         const r2 = rx * rx + ry * ry + rz * rz;
         if (r2 > nd.open_r2 and r2 > near2) {
             const q = C.load(quads, idx);
-            const ir2 = 1.0 / r2;
-            const ir = @sqrt(ir2);
-            const ir3 = ir2 * ir;
-            const ir5 = ir3 * ir2;
+            const inv = 1.0 / @sqrt(r2 + eps2);
+            const inv2 = inv * inv;
+            const inv3 = inv2 * inv;
+            const inv5 = inv3 * inv2;
             const qx = q.xx * rx + q.xy * ry + q.xz * rz;
             const qy = q.xy * rx + q.yy * ry + q.yz * rz;
             const qz = q.xz * rx + q.yz * ry + q.zz * rz;
             const rqr = rx * qx + ry * qy + rz * qz;
-            const mono = -nd.mass * ir3;
-            const quad_r = -2.5 * rqr * ir5 * ir2;
-            ax += mono * rx + qx * ir5 + quad_r * rx;
-            ay += mono * ry + qy * ir5 + quad_r * ry;
-            az += mono * rz + qz * ir5 + quad_r * rz;
-            phi += -nd.mass * ir - 0.5 * rqr * ir5;
+            const mono = -nd.mass * inv3;
+            const quad_r = -2.5 * rqr * inv5 * inv2;
+            ax += mono * rx + qx * inv5 + quad_r * rx;
+            ay += mono * ry + qy * inv5 + quad_r * ry;
+            az += mono * rz + qz * inv5 + quad_r * rz;
+            phi += -nd.mass * inv - 0.5 * rqr * inv5;
             idx = nd.skip;
         } else if (nd.child & leaf_flag != 0) {
             const first = nd.child & ~leaf_flag;

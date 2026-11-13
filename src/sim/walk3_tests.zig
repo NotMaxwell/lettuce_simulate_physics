@@ -114,6 +114,44 @@ fn summarise(errs: []f64) ErrSummary {
     return .{ .rms = @sqrt(sum2 / @as(f64, @floatFromInt(errs.len))), .p99 = errs[errs.len * 99 / 100], .max = errs[errs.len - 1] };
 }
 
+/// GPU forces at `eps` against f64 direct summation and against the ref3 walk of the same tree.
+fn checkAccuracy(gpa: std.mem.Allocator, rig: *Rig, tree: ref3.Tree, cloud: Cloud, eps: f32) !Rig.Out {
+    const n = cloud.pos.len;
+    const out = try rig.forces(gpa, eps);
+    errdefer out.deinit(gpa);
+
+    // Original order; sorted body s is original body perm[s].
+    const direct = try gpa.alloc(ref3.Accel, n);
+    defer gpa.free(direct);
+    ref3.directSum(cloud.pos, cloud.mass, cloud.box, 1, eps, direct);
+    const errs = try gpa.alloc(f64, n);
+    defer gpa.free(errs);
+    for (errs, out.acc, tree.perm) |*e, a, o| e.* = relErr(a, direct[o].a);
+    const vs_direct = summarise(errs);
+
+    // Only f32 arithmetic separates the GPU from the ref3 walk.
+    var pot_err: f64 = 0;
+    var amag_err: f64 = 0;
+    for (errs, out.acc, out.amag, out.pot, 0..) |*e, a, am, p, s| {
+        const ref = tree.walk(tree.pos[s], @intCast(s), 1, eps, null);
+        e.* = relErr(a, ref.a);
+        pot_err = @max(pot_err, @abs(p - ref.pot) / @abs(ref.pot));
+        const m = @sqrt(ref.a[0] * ref.a[0] + ref.a[1] * ref.a[1] + ref.a[2] * ref.a[2]);
+        amag_err = @max(amag_err, @abs(am - m) / m);
+    }
+    const vs_ref = summarise(errs);
+    std.debug.print("walk3 10k theta 0.6 eps {d}: vs direct rms {e:.3} p99 {e:.3} max {e:.3}; vs ref3 walk rms {e:.3} p99 {e:.3} max {e:.3}, pot max {e:.3}, |a| max {e:.3}\n", .{
+        eps, vs_direct.rms, vs_direct.p99, vs_direct.max, vs_ref.rms, vs_ref.p99, vs_ref.max, pot_err, amag_err,
+    });
+    try testing.expect(vs_direct.rms <= 1.2e-3);
+    try testing.expect(vs_direct.p99 <= 5e-3);
+    try testing.expect(vs_ref.rms <= 1e-5);
+    try testing.expect(vs_ref.p99 <= 2e-5);
+    try testing.expect(pot_err <= 1e-5);
+    try testing.expect(amag_err <= 1e-4);
+    return out;
+}
+
 test "walk3: 10k Plummer at theta 0.6 matches direct sum and the ref3 walk, reruns are bit-identical" {
     const dev = try device();
     defer c.SDL_DestroyGPUDevice(dev);
@@ -127,38 +165,9 @@ test "walk3: 10k Plummer at theta 0.6 matches direct sum and the ref3 walk, reru
     var rig = try Rig.init(dev, tree);
     defer rig.deinit();
 
-    const out = try rig.forces(gpa, eps);
+    for ([_]f32{ 0.01, 0.05 }) |e| (try checkAccuracy(gpa, &rig, tree, cloud, e)).deinit(gpa);
+    const out = try checkAccuracy(gpa, &rig, tree, cloud, eps);
     defer out.deinit(gpa);
-
-    // Against f64 direct summation (original order; sorted body s is original body perm[s]).
-    const direct = try gpa.alloc(ref3.Accel, n);
-    defer gpa.free(direct);
-    ref3.directSum(cloud.pos, cloud.mass, cloud.box, 1, eps, direct);
-    const errs = try gpa.alloc(f64, n);
-    defer gpa.free(errs);
-    for (errs, out.acc, tree.perm) |*e, a, o| e.* = relErr(a, direct[o].a);
-    const vs_direct = summarise(errs);
-
-    // Against the f64 ref3 walk of the same tree: only f32 arithmetic separates the two.
-    var pot_err: f64 = 0;
-    var amag_err: f64 = 0;
-    for (errs, out.acc, out.amag, out.pot, 0..) |*e, a, am, p, s| {
-        const ref = tree.walk(tree.pos[s], @intCast(s), 1, eps, null);
-        e.* = relErr(a, ref.a);
-        pot_err = @max(pot_err, @abs(p - ref.pot) / @abs(ref.pot));
-        const m = @sqrt(ref.a[0] * ref.a[0] + ref.a[1] * ref.a[1] + ref.a[2] * ref.a[2]);
-        amag_err = @max(amag_err, @abs(am - m) / m);
-    }
-    const vs_ref = summarise(errs);
-    std.debug.print("walk3 10k theta 0.6: vs direct rms {e:.3} p99 {e:.3} max {e:.3}; vs ref3 walk rms {e:.3} p99 {e:.3} max {e:.3}, pot max {e:.3}, |a| max {e:.3}\n", .{
-        vs_direct.rms, vs_direct.p99, vs_direct.max, vs_ref.rms, vs_ref.p99, vs_ref.max, pot_err, amag_err,
-    });
-    try testing.expect(vs_direct.rms <= 1.2e-3);
-    try testing.expect(vs_direct.p99 <= 5e-3);
-    try testing.expect(vs_ref.rms <= 1e-5);
-    try testing.expect(vs_ref.p99 <= 2e-5);
-    try testing.expect(pot_err <= 1e-5);
-    try testing.expect(amag_err <= 1e-4);
 
     // Reruns, other workgroup sizes and other chunkings give the same bits.
     for (walk3.group_sizes) |gs| for ([_]u32{ walk3.chunk_bodies, 999 }) |chunk| {
@@ -239,6 +248,15 @@ test "walk3: timing table (WALK3_BENCH=sizes)" {
             const ref = tree.walk(tree.pos[s], s, 1, eps, &st);
             worst = @max(worst, relErr(out.acc[s], ref.a));
         }
+        // GPU against f64 direct sum on a smaller sample (each target is O(N)).
+        var derrs: [400]f64 = undefined;
+        for (&derrs) |*e| {
+            const s = prng.random().uintLessThan(u32, n);
+            const o = tree.perm[s];
+            e.* = relErr(out.acc[s], ref3.directAt(cloud.pos, cloud.mass, cloud.box, cloud.pos[o], o, 1, eps).a);
+        }
+        const de = summarise(&derrs);
+        std.debug.print("  eps {d}: GPU vs direct (400 bodies) rms {e:.2} p99 {e:.2}\n", .{ eps, de.rms, de.p99 });
         const fs: f64 = samples;
         const visits = @as(f64, @floatFromInt(st.visits)) / fs;
         const inter = @as(f64, @floatFromInt(st.cells + st.pairs)) / fs;
@@ -364,6 +382,7 @@ test "walk3: 100k Plummer energy over 200 ticks with a CPU tree per tick (WALK3_
                 std.debug.print("walk3 energy: n={d} eps={d} dt={d} theta {d:.1}, {d} ticks: E0 {d:.6} E {d:.6} dE/E0 {e:.3}; 2K/|W| {d:.4} -> {d:.4}; CPU build {d:.1} ms/tick, GPU walk {d:.2} ms/tick\n", .{
                     n, eps, dt, theta, ticks, ez, e, (e - ez) / @abs(ez), 2 * e0.k / @abs(e0.w), 2 * k / @abs(pe), build_ms / @as(f64, @floatFromInt(ticks + 1)), walk_ms / @as(f64, @floatFromInt(ticks + 1)),
                 });
+                try testing.expect(@abs(e - ez) <= 1e-5 * @abs(ez));
             }
         }
     }
