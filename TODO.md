@@ -13,11 +13,10 @@
   `blockSum`), which may have been this. Needs a windowed retest on that machine.
 - Merges are capped at ~16k per tick by the event buffer (`max_events`).
 - Zig's SPIR-V backend omits the `Block` decoration (VUID-04680); `src/tools/spirv_fixup.zig` patches
-  it at build time (9d83558). Every shader passes `spirv-val --target-env vulkan1.2` except
-  `gravity_kernels`: a Function-storage variable holding a StorageBuffer pointer (needs
-  VariablePointersStorageBuffer; likely `atomicAdd`'s pointer argument). RADV accepts it.
-- Escaped bodies are clamped into the gravity tree box (correct moments; they feel the pull from the
-  box edge, not their true position). Fine for the game; the sim version needs a box that grows.
+  it at build time (9d83558). Every shader passes `spirv-val --target-env vulkan1.2`
+  (gravity_kernels fixed on the sim branch).
+- The game clamps escaped bodies into a fixed, loose gravity box (pull from the box edge). The sim's
+  GPU-computed tight box made 1M disk 6.8 ms/tick vs the game's 16 ms: try it in galaxy mode.
 
 ## Not yet ported to the GPU
 - Impact heat (the solver does not expose approach speed); ash-ash collisions.
@@ -74,21 +73,30 @@ Decisions for the user (block the phases marked):
      box, comoving coordinates, Zel'dovich ICs from a power spectrum). Blocks 15.
 
 Phase 0, groundwork (no decision needed, 2D for now):
-1. [ ] `src/sim/` + `zig build sim`: headless SDL_GPU device, no window or audio. CLI:
+1. [x] `src/sim/` + `zig build sim`: headless SDL_GPU device, no window or audio. CLI:
        `--n --ticks --scenario --dt --out <dir> --every <k> --bench`.
-2. [ ] Lean matter buffers: struct-of-arrays pos, vel, mass, nothing else; layout contract in
+2. [~] Lean matter buffers: struct-of-arrays pos, vel, mass, nothing else; layout contract in
        `gpu_layout.zig`. Dimension behind one comptime switch so D1 is a flag, not a rewrite.
-3. [ ] Gravity-only tick on the existing FMM with a symplectic kick-drift-kick (leapfrog)
-       integrator; no collisions or merging.
-4. [ ] Diagnostics by GPU reduction every k ticks: total energy, momentum, angular momentum,
-       f64 accumulation; printed and logged.
+       Today 56 B/body (pos 8, vel 8, BallBody 16 of which only mass is read, keys 8, sorted 16) plus
+       a fixed ~2.2 GB gravity pyramid at level 12. Next: separate f32 mass buffer (-12 B), `sorted`
+       without id (-4 B). Dimension switch not done yet.
+3. [x] Gravity-only tick on the existing FMM with a symplectic kick-drift-kick (leapfrog)
+       integrator; no collisions or merging. Tree box computed on the GPU every tick (no readback).
+       1M disk: |dE/E0| ~3e-5, dL/L0 ~5e-7 over 1000 ticks. At default dt, 200k `systems` and
+       `collision` drift dE/K0 2-8% in 400 ticks (close pairs): needs item 13 or a smaller dt.
+4. [x] Diagnostics by GPU reduction every k ticks: total energy, momentum, angular momentum,
+       f64 accumulation; printed. PE is exact up to ~46k bodies, a hashed sample above (drift only).
 5. [ ] Snapshot format: small header + raw struct-of-arrays chunks; written asynchronously from a
        staging buffer; restart from a snapshot (checkpoints, for walltime limits).
 6. [ ] Offline renderer: snapshot -> density image / frame sequence by GPU splatting
        (`zig build render-snap`), so cluster output can be viewed locally.
-7. [ ] Physics tests: two-body orbit period, equilibrium disk (2D) / Plummer sphere (3D) stays
+7. [~] Physics tests: two-body orbit period, equilibrium disk (2D) / Plummer sphere (3D) stays
        virialised, energy drift bound over 10k ticks, snapshot round-trip, restart is bit-identical.
-8. [ ] `--bench` prints per-pass GPU timestamps at 1M / 4M / 16M / 64M.
+       Done: two-body period, 2000-body disk drift over 2000 ticks.
+8. [x] `--bench` per-pass timings (blocking samples, not timestamps yet). RX 7800 XT, disk, ms/tick:
+       1M 6.8 · 4M 24 · 16M 110 · 64M 505 · 160M 942 · 200M 1431 · 220M 1723 (largest; 240M loses the
+       device after upload, ~15.7 GB needed vs ~15.1 free, VRAM overcommit suspected, unconfirmed).
+       Ticks are split into several submits at n >= 8M to stay under the driver watchdog.
 
 Phase 1, one GPU at scale (target 100M locally):
 9.  [ ] Memory audit: real bytes/body including tree and sort scratch; buffers past the per-binding
