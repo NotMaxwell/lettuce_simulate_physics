@@ -95,6 +95,8 @@ pub const scan_block: u32 = L.group_size * scan_per_thread;
 // Mirrors of config.zig values the kernels need (the shader modules cannot import config.zig,
 // which lives outside their module root).
 pub const bounce_stop: f32 = 0.3;
+// Must equal config.zig max_level. gpu_game/common.zig reads it from a config module that
+// build.zig provides only to those kernels; build_kernels.zig gives the gpu_sim kernels none.
 pub const max_level: u32 = 38;
 
 /// Inclusive cell range of the 3x3 block around `cell`, clipped to the grid.

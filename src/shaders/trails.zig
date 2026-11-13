@@ -48,13 +48,19 @@ export fn trailVs() callconv(.spirv_vertex) void {
     const m = meta.items[id];
     if (m & L.flag_alive == 0) return hide();
 
+    const pp = prev_pos.items[id];
+    const cp = pos.items[id];
+    const draw: L.Vec2 = .{ .x = pp.x + (cp.x - pp.x) * p.alpha, .y = pp.y + (cp.y - pp.y) * p.alpha };
+    // The newest sample is the post-tick position, which lies ahead of the interpolated ball while
+    // alpha < 1. Joining it to the ball would double back, so the head segment is dropped and the
+    // next one ends on the ball instead.
+    const newest = sample(id, 0);
+    const ahead = (newest.x - draw.x) * (cp.x - pp.x) + (newest.y - draw.y) * (cp.y - pp.y) > 0;
+    if (t == 0 and ahead) return hide();
     const older = sample(id, t);
     var newer: L.Vec2 = undefined;
-    if (t == 0) {
-        newer = .{
-            .x = prev_pos.items[id].x + (pos.items[id].x - prev_pos.items[id].x) * p.alpha,
-            .y = prev_pos.items[id].y + (pos.items[id].y - prev_pos.items[id].y) * p.alpha,
-        };
+    if (t == 0 or (t == 1 and ahead)) {
+        newer = draw;
     } else {
         newer = sample(id, t - 1);
     }

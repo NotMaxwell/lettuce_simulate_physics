@@ -278,6 +278,8 @@ pub const GpuWorld = struct {
     galaxy_g_mult: f32 = 1,
     galaxy_extent: f32 = 0,
     galaxy_centre: Vec2 = .{},
+    /// Bumped whenever the scene is replaced; renderers drop per-ball history (trails) on a change.
+    scene_epoch: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator, dev: *c.SDL_GPUDevice) Error!GpuWorld {
         const cap = L.max_balls;
@@ -445,6 +447,7 @@ pub const GpuWorld = struct {
     /// GPU buffers are not wiped: kernels only look at ids below `count`, and a spawn rewrites
     /// every field of its slot.
     fn clearBalls(gw: *GpuWorld, w: *world.World) void {
+        gw.scene_epoch +%= 1;
         gw.drain(w);
         @memset(gw.radius[0..gw.count], 0);
         gw.count = 0;
@@ -471,12 +474,13 @@ pub const GpuWorld = struct {
     /// Replaces the game with galaxy scenario `s` of about `n` bodies around the current play
     /// area's centre, in a large fixed play area. Bodies reach the GPU over the next ticks.
     pub fn loadGalaxy(gw: *GpuWorld, w: *world.World, s: galaxy.Scenario, n: u32) !void {
-        gw.clearBalls(w);
         const centre: Vec2 = .{ .x = w.bounds.x + w.bounds.w / 2, .y = w.bounds.y + w.bounds.h / 2 };
         var built = try galaxy.build(gw.gpa, w.prng.random(), s, n, centre);
         defer built.deinit(gw.gpa);
+        // Everything that can fail runs before the old world is cleared. clearBalls keeps capacity.
         try gw.pending.ensureUnusedCapacity(gw.gpa, built.bodies.len);
         try gw.pending_pos.ensureUnusedCapacity(gw.gpa, built.bodies.len);
+        gw.clearBalls(w);
         for (built.bodies) |b| try gw.queueBody(w, b.x, b.y, galaxy.toNewBall(b));
         w.bounds = galaxy.boundsFor(centre, built.extent);
         w.prev_bounds = w.bounds;
@@ -493,11 +497,23 @@ pub const GpuWorld = struct {
         return gw.galaxy_g_base * gw.galaxy_g_mult;
     }
 
+    /// Raises `galaxy_extent` (and the play area) when bodies lie beyond the gravity tree box, so
+    /// they keep their place in the tree instead of being clamped to its edge.
+    fn growToFit(gw: *GpuWorld, w: *world.World, bodies: []const galaxy.Body) void {
+        var far: f32 = 0;
+        for (bodies) |b| far = @max(far, @max(@abs(b.x - gw.galaxy_centre.x), @abs(b.y - gw.galaxy_centre.y)));
+        if (far <= galaxy_tree_reach * gw.galaxy_extent) return;
+        gw.galaxy_extent = far / galaxy_tree_reach * 1.1;
+        w.bounds = galaxy.boundsFor(gw.galaxy_centre, gw.galaxy_extent);
+        w.prev_bounds = w.bounds;
+    }
+
     /// One star system at (x, y), at rest, for the current gravity strength.
     pub fn spawnSystemAt(gw: *GpuWorld, w: *world.World, x: f32, y: f32) !void {
         var list: std.ArrayList(galaxy.Body) = .empty;
         defer list.deinit(gw.gpa);
         _ = try galaxy.system(gw.gpa, &list, w.prng.random(), .{ .x = x, .y = y }, .{}, gw.galaxyG());
+        gw.growToFit(w, list.items);
         for (list.items) |b| try gw.queueBody(w, b.x, b.y, galaxy.toNewBall(b));
     }
 
@@ -550,13 +566,13 @@ pub const GpuWorld = struct {
     /// `w.bounds`, and ages explosions. `w.balls` is not used.
     pub fn tick(gw: *GpuWorld, w: *world.World, in_req: Input) void {
         var in = in_req;
+        // Collision modes are a galaxy feature; the merge game is always solid.
+        if (!gw.galaxy_on) in.collide = .solid;
         const accrete = in.collide == .accrete;
         if (gw.galaxy_on) {
             in.mutual_gravity = true;
             in.random_explosions = false;
             in.merging = accrete;
-        } else if (accrete) {
-            in.merging = true;
         }
         w.events = w.pending_events;
         w.pending_events = .{};
@@ -680,8 +696,10 @@ pub const GpuWorld = struct {
     /// The region the gravity tree covers. Normally the play area; in galaxy mode the play area is
     /// much larger than the bodies (so walls are never met), and a tree over all of it would leave
     /// most leaf cells empty and the occupied ones crowded (1M disk: ~48 ms vs ~5 ms measured).
-    /// Bodies that stray outside the box are clamped into its edge cells, which costs them force
-    /// accuracy only.
+    /// Walls sit at 4x the extent or more, so bodies can leave the box. The gravity kernels clamp
+    /// every body's position into the box (scatterBalls), so an escapee acts as if at the box edge:
+    /// it gets an approximate force and cannot corrupt the multipoles. Spawns that land outside grow
+    /// the extent (growToFit).
     fn gravityBox(gw: *const GpuWorld, sp: L.SimParams) L.SimParams {
         if (!gw.galaxy_on) return sp;
         var box = sp;
@@ -712,7 +730,7 @@ pub const GpuWorld = struct {
                 (if (in.merging) L.sim_flag_merging else 0) |
                 (if (in.attract) L.sim_flag_attract else 0) |
                 (if (gw.galaxy_on) L.sim_flag_galaxy else 0) |
-                @as(u32, @intFromEnum(in.collide)) << L.sim_collide_shift,
+                @as(u32, @backingInt(in.collide)) << L.sim_collide_shift,
             .mouse_x = in.mouse.x,
             .mouse_y = in.mouse.y,
             .attraction_strength = cfg.attraction_strength,
@@ -1222,7 +1240,6 @@ const GalaxyDump = struct {
     }
 };
 
-
 test "gpu world: galaxy disk in ghost mode keeps its shape and angular momentum" {
     _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
     if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SkipZigTest;
@@ -1303,4 +1320,75 @@ test "gpu world: galaxy accretion merges bodies and conserves mass" {
     for (d1.pos, d1.meta) |p, mt| if (mt & L.flag_alive != 0) {
         try std.testing.expect(std.math.isFinite(p.x) and std.math.isFinite(p.y));
     };
+}
+
+const Escapee = union(enum) { none, far: f32, corner: f32 };
+
+/// Runs a 2000-body disk for a few ticks with an optional extra body of the given mass: `far` is
+/// outside the gravity tree box, `corner` sits on the box corner that a far body is clamped to.
+/// Returns every body's velocity; the extra body, if any, is last.
+fn escapeeRun(gpa: std.mem.Allocator, dev: *c.SDL_GPUDevice, esc: Escapee) ![]L.Vec2 {
+    var gw = try GpuWorld.init(gpa, dev);
+    defer gw.deinit();
+    gw.profile_every = 0;
+    var w = world.World.init(gpa, 21);
+    defer w.deinit();
+    try gw.loadGalaxy(&w, .disk, 2000);
+    const reach = galaxy_tree_reach * gw.galaxy_extent;
+    const centre = gw.galaxy_centre;
+    switch (esc) {
+        .none => {},
+        .far => |m| {
+            const far = 3.5 * gw.galaxy_extent;
+            try std.testing.expect(far > reach and far < w.bounds.w / 2);
+            try gw.queueBody(&w, centre.x + far, centre.y + far, galaxy.toNewBall(.{ .x = 0, .y = 0, .vx = 0, .vy = 0, .mass = m, .radius = 1.5 }));
+        },
+        .corner => |m| try gw.queueBody(&w, centre.x + reach, centre.y + reach, galaxy.toNewBall(.{ .x = 0, .y = 0, .vx = 0, .vy = 0, .mass = m, .radius = 1.5 })),
+    }
+    for (0..8) |_| gw.tick(&w, .{ .collide = .ghost });
+    gw.drain(&w);
+    const d = try GalaxyDump.read(gpa, &gw);
+    defer d.free(gpa);
+    try std.testing.expectEqual(@as(u32, if (esc == .none) 2001 else 2002), gw.alive);
+    return gpa.dupe(L.Vec2, d.vel);
+}
+
+/// Largest velocity difference over the first `a.len` bodies; fails on non-finite values.
+fn worstDiff(a: []const L.Vec2, b: []const L.Vec2) !f32 {
+    var worst: f32 = 0;
+    for (a, b[0..a.len]) |p, q| {
+        try std.testing.expect(std.math.isFinite(q.x) and std.math.isFinite(q.y));
+        worst = @max(worst, @max(@abs(p.x - q.x), @abs(p.y - q.y)));
+    }
+    return worst;
+}
+
+test "gpu world: a body outside the gravity box does not corrupt the others" {
+    _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SkipZigTest;
+    defer c.SDL_Quit();
+    const gfx = @import("gfx.zig");
+    var gpu = gfx.Gfx.init(.{ .window = null }) catch return error.SkipZigTest;
+    defer gpu.deinit();
+    const gpa = std.testing.allocator;
+    const none = try escapeeRun(gpa, gpu.dev, .none);
+    defer gpa.free(none);
+    const light = try escapeeRun(gpa, gpu.dev, .{ .far = 0.01 });
+    defer gpa.free(light);
+    const heavy_far = try escapeeRun(gpa, gpu.dev, .{ .far = 5 });
+    defer gpa.free(heavy_far);
+    const heavy_corner = try escapeeRun(gpa, gpu.dev, .{ .corner = 5 });
+    defer gpa.free(heavy_corner);
+
+    // A light escapee barely pulls on anyone (disk speeds are ~2.5).
+    const light_diff = try worstDiff(none, light);
+    // A heavy one acts as if at the box corner, so the disk must see the same as with a body there.
+    const heavy_diff = try worstDiff(none, heavy_far);
+    const clamp_diff = try worstDiff(heavy_corner[0..2001], heavy_far);
+    const e = light[none.len];
+    std.debug.print("escapee: light vs none {d:.6}, heavy far vs corner {d:.6} (heavy far vs none {d:.6}), escapee v ({d:.4}, {d:.4})\n", .{ light_diff, clamp_diff, heavy_diff, e.x, e.y });
+    try std.testing.expect(light_diff < 0.01);
+    try std.testing.expect(clamp_diff < 1e-4);
+    try std.testing.expect(std.math.isFinite(e.x) and std.math.isFinite(e.y));
+    try std.testing.expect(e.x < 0 and e.y < 0);
 }

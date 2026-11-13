@@ -78,7 +78,7 @@ pub const SimParams = extern struct {
 pub const sim_flag_mutual_gravity: u32 = 1 << 0;
 pub const sim_flag_merging: u32 = 1 << 1;
 pub const sim_flag_attract: u32 = 1 << 2;
-/// Galaxy mode: open-space play area (no wall piles, no hoop, no auto-growing bounds).
+/// Reserved: set in galaxy mode but read by no kernel yet. Keep the bit.
 pub const sim_flag_galaxy: u32 = 1 << 3;
 /// Collision response, two bits: solid (default solver), accrete (any touching pair merges,
 /// conserving mass and momentum), ghost (no contact forces; gravity softening only).

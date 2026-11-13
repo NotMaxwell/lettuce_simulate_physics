@@ -60,6 +60,8 @@ const Game = struct {
     collide_explicit: bool = false,
     /// Body count the galaxy keys load (0 = each scenario's default); set by --galaxy <name> <n>.
     galaxy_n: u32 = 0,
+    /// gw.scene_epoch last seen; a change drops the trail history.
+    trail_epoch: u32 = 0,
     muted: bool = false,
     show_perf: bool = true,
     won: bool = false,
@@ -218,6 +220,7 @@ const Game = struct {
             },
             c.SDLK_N => g.merging = !g.merging,
             c.SDLK_P => g.show_perf = !g.show_perf,
+            c.SDLK_R => g.renderer.trails = !g.renderer.trails,
             c.SDLK_T => g.stress(stress_count),
             c.SDLK_PLUS, c.SDLK_EQUALS, c.SDLK_KP_PLUS => g.balls_per_click += step,
             c.SDLK_MINUS, c.SDLK_KP_MINUS => g.balls_per_click = @max(1, g.balls_per_click -| step),
@@ -372,7 +375,12 @@ fn parseOptions(args: []const [:0]const u8) Options {
         } else if (std.mem.eql(u8, flag, "--autoplay")) {
             o.autoplay = std.mem.eql(u8, value, "on");
         } else if (std.mem.eql(u8, flag, "--galaxy")) {
-            o.galaxy = std.meta.stringToEnum(galaxy.Scenario, value);
+            o.galaxy = std.meta.stringToEnum(galaxy.Scenario, value) orelse {
+                std.debug.print("unknown galaxy scenario '{s}'; valid names:", .{value});
+                inline for (@typeInfo(galaxy.Scenario).@"enum".field_names) |name| std.debug.print(" {s}", .{name});
+                std.debug.print("\n", .{});
+                std.process.exit(2);
+            };
             // The body count is optional: only consumed when the next argument is a number.
             if (i + 2 < args.len) if (std.fmt.parseInt(u32, args[i + 2], 10)) |n| {
                 o.galaxy_n = n;
@@ -508,6 +516,10 @@ pub fn main(init: std.process.Init) !void {
             .gpu = gpuBalls(&gw, g.w.current_level),
             .galaxy = if (gw.galaxy_on) .{ .scenario = @tagName(gw.galaxy_scenario), .bodies = gw.alive, .collide = @tagName(g.collide), .g_mult = gw.galaxy_g_mult } else null,
         };
+        if (gw.scene_epoch != g.trail_epoch) {
+            g.trail_epoch = gw.scene_epoch;
+            g.renderer.clearTrails();
+        }
         const r0 = c.SDL_GetPerformanceCounter();
         if (g.follow_centre) g.renderer.follow(.{ .x = g.w.bounds.x + g.w.bounds.w / 2, .y = g.w.bounds.y + g.w.bounds.h / 2 });
         g.renderer.draw(&g.w, @floatCast(accumulator / tick_seconds), &hud);
@@ -554,7 +566,7 @@ fn autoplay(g: *Game, frame: u32) void {
         9 => g.onKey(c.SDLK_EQUALS, c.SDL_KMOD_CTRL, false),
         10 => g.onKey(c.SDLK_F, 0, false),
         11 => {
-            const keys = [_]c.SDL_Keycode{ c.SDLK_O, c.SDLK_1, c.SDLK_2, c.SDLK_3, c.SDLK_4, c.SDLK_X, c.SDLK_X, c.SDLK_LEFTBRACKET, c.SDLK_RIGHTBRACKET };
+            const keys = [_]c.SDL_Keycode{ c.SDLK_O, c.SDLK_1, c.SDLK_2, c.SDLK_3, c.SDLK_4, c.SDLK_X, c.SDLK_X, c.SDLK_R, c.SDLK_LEFTBRACKET, c.SDLK_RIGHTBRACKET };
             // Most draws are collide-mode and gravity keys; entering and leaving galaxy mode (which
             // reloads thousands of bodies) is rarer.
             if (r.uintLessThan(u8, 8) == 0) g.onKey(keys[r.uintLessThan(usize, keys.len)], 0, false);

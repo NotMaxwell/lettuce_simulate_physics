@@ -128,9 +128,13 @@ pub fn systemG() f32 {
     return v0 * v0 / 220;
 }
 
+/// Largest body radius: a massive core would otherwise be a disc tens of units wide, and in solid
+/// mode it would swallow the bodies orbiting near it.
+pub const max_body_radius: f32 = 10;
+
 /// Ball radius for a body of mass `m` (world units). Area grows with mass, as for accretion.
 pub fn radiusFor(m: f32) f32 {
-    return std.math.clamp(1.2 + 1.1 * @sqrt(m), 1.5, cfg.max_radius * 0.4);
+    return std.math.clamp(1.2 + 1.1 * @sqrt(m), 1.5, @min(max_body_radius, cfg.max_radius * 0.4));
 }
 
 /// Merge-game level (ball texture) for a body of mass `m`: heavier bodies get later textures.
@@ -347,4 +351,9 @@ test "moons start bound to their planet" {
         const rel = @sqrt((x.vx - p.vx) * (x.vx - p.vx) + (x.vy - p.vy) * (x.vy - p.vy));
         try std.testing.expect(rel <= @sqrt(g * p.mass) * 1.01);
     }
+}
+
+test "radius is capped for massive bodies" {
+    try std.testing.expectEqual(max_body_radius, radiusFor(1e6));
+    try std.testing.expect(radiusFor(1) < max_body_radius);
 }

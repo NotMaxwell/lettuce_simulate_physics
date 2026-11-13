@@ -65,8 +65,8 @@ export fn merge() callconv(c.kernel_cc) void {
     const vk = vel.v[keep];
     const vg = vel.v[gone];
     // Deviation (requested): the CPU/Python keep the survivor's position and velocity; here it
-    // moves to the mass-weighted centre with the pair's mass-weighted velocity. Mass itself stays
-    // the survivor's, as in the Python.
+    // moves to the mass-weighted centre with the pair's mass-weighted velocity. Mass stays
+    // the survivor's in the merge game (as in the Python) and is summed in accrete mode below.
     const inv = 1.0 / @max(mk + mg, 1e-6);
     pos.v[keep] = .{ .x = (pk.x * mk + pg.x * mg) * inv, .y = (pk.y * mk + pg.y * mg) * inv };
     vel.v[keep] = .{ .x = (vk.x * mk + vg.x * mg) * inv, .y = (vk.y * mk + vg.y * mg) * inv };

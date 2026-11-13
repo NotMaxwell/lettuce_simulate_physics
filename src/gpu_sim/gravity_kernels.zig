@@ -216,8 +216,10 @@ export fn scatterBalls() callconv(kernel_cc) void {
     const p = &pos.v[i];
     // Field-wise: whole-struct loads/stores of buffer structs make Zig emit OpCopyLogical (SPIR-V 1.4) in a 1.0 module.
     const dst = &sorted.v[cellStart(k.cell) + k.rank];
-    dst.x = p.x;
-    dst.y = p.y;
+    // Clamped into the tree box: a body far outside would otherwise give |w| >> 1 in leafMultipoles
+    // and order-6 moments ~ m*w^5 that corrupt every far field. It acts as if at the box edge.
+    dst.x = @min(@max(p.x, params.origin_x), params.origin_x + params.root_size);
+    dst.y = @min(@max(p.y, params.origin_y), params.origin_y + params.root_size);
     dst.m = body.v[i].mass;
     dst.id = i;
 }

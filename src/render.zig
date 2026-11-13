@@ -303,7 +303,6 @@ fn maskCircle(tile: []u8) void {
     }
 }
 
-
 fn texFromPixels(g: *gfx.Gfx, px: []const u8, w: usize, h: usize) !gfx.Texture {
     return g.uploadTexture(px, @intCast(w), @intCast(h), false);
 }
@@ -882,7 +881,7 @@ pub const Renderer = struct {
             "[X] collision mode: solid / accrete / ghost",
             "[ and ] weaken / strengthen gravity",
             "[O] back to the normal game   [G + LEFT DRAG] attract   [C] follow   [HOME] reset view",
-            "[P] perf overlay   [M] mute",
+            "[P] perf overlay   [M] mute   [R] trails",
         };
         if (hud.galaxy) |gh| {
             self.text(x, y, 2, rgb8(160, 200, 255), "GALAXY: {s}  bodies {d}  collide {s}  g x{d:.2}", .{ gh.scenario, gh.bodies, gh.collide, gh.g_mult });
@@ -897,7 +896,7 @@ pub const Renderer = struct {
             "Hold [G + LEFT CLICK] and drag to attract balls to your mouse.",
             "Press [F] to toggle gravity.",
             "[N] toggle merging",
-            "[P] perf overlay",
+            "[P] perf overlay   [R] trails",
             "[T] stress test: +100000 balls, merging off",
         };
         const lines: []const [:0]const u8 = if (hud.galaxy != null) &galaxy_help else &help;
