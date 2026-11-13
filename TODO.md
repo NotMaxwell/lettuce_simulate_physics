@@ -86,17 +86,23 @@ Phase 0, groundwork (no decision needed, 2D for now):
        `collision` drift dE/K0 2-8% in 400 ticks (close pairs): needs item 13 or a smaller dt.
 4. [x] Diagnostics by GPU reduction every k ticks: total energy, momentum, angular momentum,
        f64 accumulation; printed. PE is exact up to ~46k bodies, a hashed sample above (drift only).
-5. [ ] Snapshot format: small header + raw struct-of-arrays chunks; written asynchronously from a
+5. [x] Snapshot format: small header + raw struct-of-arrays chunks; written asynchronously from a
        staging buffer; restart from a snapshot (checkpoints, for walltime limits).
-6. [ ] Offline renderer: snapshot -> density image / frame sequence by GPU splatting
+6. [x] Offline renderer: snapshot -> density image / frame sequence by GPU splatting
        (`zig build render-snap`), so cluster output can be viewed locally.
 7. [~] Physics tests: two-body orbit period, equilibrium disk (2D) / Plummer sphere (3D) stays
        virialised, energy drift bound over 10k ticks, snapshot round-trip, restart is bit-identical.
-       Done: two-body period, 2000-body disk drift over 2000 ticks.
+       Done: two-body period, 2000-body disk drift over 2000 ticks, snapshot round-trip, truncated
+       snapshot rejected, restart vs continuous within 2e-3 (not bit-identical: float atomics in
+       the gravity solver make two identical runs differ; exact repeatability needs a fixed-order
+       gravity sum), render smoke test. Saturating splat untested; snapshots/render untested at 100M+.
 8. [x] `--bench` per-pass timings (blocking samples, not timestamps yet). RX 7800 XT, disk, ms/tick:
        1M 6.8 · 4M 24 · 16M 110 · 64M 505 · 160M 942 · 200M 1431 · 220M 1723 (largest; 240M loses the
        device after upload, ~15.7 GB needed vs ~15.1 free, VRAM overcommit suspected, unconfirmed).
        Ticks are split into several submits at n >= 8M to stay under the driver watchdog.
+
+Snapshots: 256 B header + planar f32 pos/vel/mass (4096-aligned) + footer, written to .tmp then
+renamed; ~1% overhead (async, chunked). `zig build render-snap -- <snaps> --out DIR --log`.
 
 Phase 1, one GPU at scale (target 100M locally):
 9.  [ ] Memory audit: real bytes/body including tree and sort scratch; buffers past the per-binding
