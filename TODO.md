@@ -16,6 +16,11 @@
   if not, strip it down to the helpers.
 
 ## Bugs
+- Reported: the window closes instantly during merging (user, windowed, release build). Not
+  reproduced: 42k frames of `--autoplay on` (random clicks, grabs, ignites, lassos) in release and
+  debug builds, and 1k-1M `--stress N --merge on` runs, all exit cleanly. Two windowed autoplay runs
+  exited with code 0 on their own (looks like a quit, not a crash); a third ran until killed. Next
+  step: capture a debug-build run of the failing session (`zig build -Doptimize=debug run`).
 - Merges are capped at ~16k per tick by the event buffer (`max_events`).
 
 ## Not yet ported to the GPU

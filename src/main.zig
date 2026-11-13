@@ -24,6 +24,9 @@ const Options = struct {
     /// Start every Nth spawned ball alight (0 = none), for verifying fire headlessly.
     ignite: u32 = 0,
     fire: bool = true,
+    /// Random clicks, grabs, ignites, lassos and key presses every few frames, for hunting
+    /// crashes in interactive paths headlessly.
+    autoplay: bool = false,
 };
 
 const Game = struct {
@@ -249,6 +252,8 @@ fn parseOptions(args: []const [:0]const u8) Options {
             o.fire = !std.mem.eql(u8, value, "off");
         } else if (std.mem.eql(u8, flag, "--merge")) {
             o.merge = std.mem.eql(u8, value, "on");
+        } else if (std.mem.eql(u8, flag, "--autoplay")) {
+            o.autoplay = std.mem.eql(u8, value, "on");
         }
     }
     return o;
@@ -324,7 +329,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        g.mouse = g.mouseWorld();
+        if (opts.autoplay) autoplay(&g, frame) else g.mouse = g.mouseWorld();
 
         const now = c.SDL_GetPerformanceCounter();
         const frame_seconds = seconds(now - last);
@@ -378,4 +383,33 @@ pub fn main(init: std.process.Init) !void {
 test {
     _ = gpu_world;
     _ = world;
+}
+
+fn autoplay(g: *Game, frame: u32) void {
+    if (frame % 6 != 0) return;
+    const r = g.w.prng.random();
+    const b = g.w.bounds;
+    g.mouse = .{ .x = b.x + r.float(f32) * b.w, .y = b.y + r.float(f32) * b.h };
+    switch (r.uintLessThan(u8, 12)) {
+        0...3 => {
+            g.onMouseDown(c.SDL_BUTTON_LEFT, g.mouse);
+            g.onMouseUp(c.SDL_BUTTON_LEFT);
+        },
+        4, 5 => g.onMouseDown(c.SDL_BUTTON_LEFT, g.mouse), // held: grab follows the mouse until a later release
+        6 => g.onMouseUp(c.SDL_BUTTON_LEFT),
+        7 => g.onMouseDown(c.SDL_BUTTON_RIGHT, g.mouse),
+        8 => {
+            g.lasso_active = true;
+            g.lasso.clearRetainingCapacity();
+            const rad = 50 + r.float(f32) * 300;
+            for (0..12) |k| {
+                const a = @as(f32, @floatFromInt(k)) * std.math.tau / 12.0;
+                g.lasso.append(g.gpa, .{ .x = g.mouse.x + @cos(a) * rad, .y = g.mouse.y + @sin(a) * rad }) catch {};
+            }
+            g.onMouseUp(c.SDL_BUTTON_LEFT);
+        },
+        9 => g.onKey(c.SDLK_EQUALS, c.SDL_KMOD_CTRL),
+        10 => g.onKey(c.SDLK_F, 0),
+        else => {},
+    }
 }
