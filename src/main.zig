@@ -15,6 +15,9 @@ const tick_seconds: f64 = 1.0 / @as(f64, cfg.tick_hz);
 /// Catch-up cap: after a long stall, drop simulation time instead of spiralling.
 const max_ticks_per_frame = 4;
 const stress_count = 100_000;
+/// Every this many frames (while the perf overlay is on) the GPU is drained and one frame is drawn
+/// and waited on alone, to time rendering; SDL_GPU has no timestamp queries.
+const render_sample_every = 60;
 
 const Options = struct {
     /// Exit after this many frames (0 = run until closed). For headless verification.
@@ -465,12 +468,21 @@ pub fn main(init: std.process.Init) !void {
     g.collide_explicit = opts.collide != null;
     g.galaxy_n = opts.galaxy_n;
     g.renderer.zoom = std.math.clamp(opts.zoom, render.Renderer.zoom_min, render.Renderer.zoom_max);
-    if (opts.galaxy) |s| g.enterGalaxy(s);
+    if (opts.galaxy) |s| {
+        g.enterGalaxy(s);
+        // --zoom is relative to the galaxy fit, so one value gives the same view at any body count.
+        g.renderer.zoom = std.math.clamp(g.renderer.zoom * opts.zoom, render.Renderer.zoom_min, render.Renderer.zoom_max);
+    }
 
     var last = c.SDL_GetPerformanceCounter();
     var accumulator: f64 = 0;
     var frame: u32 = 0;
     var running = true;
+    // Means over the second half of a --frames run (uploads done, caches warm).
+    var steady_frame_s: f64 = 0;
+    var steady_frames: u32 = 0;
+    var steady_render_ms: f64 = 0;
+    var steady_render_n: u32 = 0;
 
     while (running) : (frame += 1) {
         var event: c.SDL_Event = undefined;
@@ -501,6 +513,11 @@ pub fn main(init: std.process.Init) !void {
         const now = c.SDL_GetPerformanceCounter();
         const frame_seconds = seconds(now - last);
         last = now;
+        const steady = opts.frames > 0 and frame >= opts.frames / 2;
+        if (steady) {
+            steady_frame_s += frame_seconds;
+            steady_frames += 1;
+        }
         g.perf.fps = smooth(g.perf.fps, @floatCast(1.0 / @max(frame_seconds, 1e-6)));
         // Headless verification runs advance exactly one tick per frame so results do not depend on wall time.
         accumulator += if (opts.frames > 0) tick_seconds else @min(frame_seconds, tick_seconds * max_ticks_per_frame);
@@ -539,14 +556,25 @@ pub fn main(init: std.process.Init) !void {
             g.trail_epoch = gw.scene_epoch;
             g.renderer.clearTrails();
         }
+        const sample_render = g.show_perf and frame % render_sample_every == render_sample_every / 2;
+        if (sample_render) _ = c.SDL_WaitForGPUIdle(gpu.dev);
         const r0 = c.SDL_GetPerformanceCounter();
         if (g.follow_centre) g.renderer.follow(.{ .x = g.w.bounds.x + g.w.bounds.w / 2, .y = g.w.bounds.y + g.w.bounds.h / 2 });
         g.renderer.draw(&g.w, @floatCast(accumulator / tick_seconds), &hud);
         g.perf.render_ms = smooth(g.perf.render_ms, @floatCast(seconds(c.SDL_GetPerformanceCounter() - r0) * 1000));
 
         const done = opts.frames > 0 and frame + 1 >= opts.frames;
-        g.renderer.present(if (done) if (opts.screenshot) |path| path.ptr else null else null);
+        g.renderer.presentWait(if (done) if (opts.screenshot) |path| path.ptr else null else null, sample_render);
+        if (sample_render) {
+            const ms: f32 = @floatCast(seconds(c.SDL_GetPerformanceCounter() - r0) * 1000);
+            g.perf.gpu_render_ms = ms;
+            if (steady) {
+                steady_render_ms += ms;
+                steady_render_n += 1;
+            }
+        }
         if (done) {
+            std.debug.print("steady (2nd half): frame_ms={d:.3} render_gpu_ms={d:.3} (samples {d})\n", .{ steady_frame_s * 1000 / @as(f64, @floatFromInt(@max(steady_frames, 1))), steady_render_ms / @as(f64, @floatFromInt(@max(steady_render_n, 1))), steady_render_n });
             std.debug.print("frames={d} balls={d} ids={d} queued={d} max_level={d} merges={d} fps={d:.1} tick_ms={d:.3} render_ms={d:.3} gpu_gravity_ms={d:.3} gpu_collide_ms={d:.3} gpu_game_ms={d:.3} (samples {d}) burning={d} particles={d} ashes={d}\n", .{ frame + 1, gw.alive, gw.count, gw.pendingSpawns(), g.w.current_level, g.merges_total, g.perf.fps, g.perf.tick_ms, g.perf.render_ms, g.perf.gpu_gravity_ms, g.perf.gpu_collide_ms, g.perf.gpu_game_ms, gw.profile.samples, gw.stats.burning, gw.stats.particles, gw.stats.ashes });
             running = false;
             if (opts.check) {

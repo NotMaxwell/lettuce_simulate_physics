@@ -11,7 +11,10 @@ const font = @import("font.zig");
 pub const Perf = struct {
     fps: f32 = 0,
     tick_ms: f32 = 0,
+    /// CPU time to record the frame.
     render_ms: f32 = 0,
+    /// GPU time of one frame drawn alone (blocking sample, see main.zig render_sample_every).
+    gpu_render_ms: f32 = 0,
     /// GPU stage times from gpu_world's blocking samples (0 = no GPU world).
     gpu_gravity_ms: f32 = 0,
     gpu_collide_ms: f32 = 0,
@@ -421,7 +424,9 @@ pub const Renderer = struct {
     }
 
     pub const zoom_min: f32 = 0.05;
-    pub const zoom_max: f32 = 20;
+    /// Galaxy play areas are many times the bodies' extent, so the fit view needs a deep zoom to
+    /// reach single bodies.
+    pub const zoom_max: f32 = 2000;
 
     /// Makes `p` the base of the view focus (call every frame to track it). Pan is kept as an offset.
     pub fn follow(self: *Renderer, p: world.Vec2) void {
@@ -472,7 +477,12 @@ pub const Renderer = struct {
     }
 
     pub fn present(self: *Renderer, screenshot: ?[*:0]const u8) void {
-        self.gfx.end(.{ .screenshot = screenshot }) catch |e| std.log.err("present failed: {s}", .{@errorName(e)});
+        self.presentWait(screenshot, false);
+    }
+
+    /// `present`, optionally blocking until the GPU has finished the frame.
+    pub fn presentWait(self: *Renderer, screenshot: ?[*:0]const u8, wait: bool) void {
+        self.gfx.end(.{ .screenshot = screenshot, .wait = wait }) catch |e| std.log.err("present failed: {s}", .{@errorName(e)});
     }
 
     fn drawInner(self: *Renderer, w: *const world.World, alpha: f32, hud: *const Hud) !void {
@@ -704,7 +714,7 @@ pub const Renderer = struct {
             y += lh * 0.5;
             const p = hud.perf;
             const grey = rgb8(190, 255, 190);
-            self.text(x, y, 1.5, grey, "fps {d:.0}  tick {d:.2} ms  render {d:.2} ms", .{ p.fps, p.tick_ms, p.render_ms });
+            self.text(x, y, 1.5, grey, "fps {d:.0}  tick {d:.2} ms  render {d:.2} ms (GPU {d:.2} ms)", .{ p.fps, p.tick_ms, p.render_ms, p.gpu_render_ms });
             y += lh;
             if (hud.gpu) |gb| {
                 self.text(x, y, 1.5, grey, "GPU balls {d} (ids {d}, queued {d})  gravity {d:.2} ms  collide {d:.2} ms  merge+io {d:.2} ms", .{ gb.alive, gb.count, gb.queued, p.gpu_gravity_ms, p.gpu_collide_ms, p.gpu_game_ms });
