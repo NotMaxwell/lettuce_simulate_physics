@@ -219,3 +219,126 @@ test "sim3: render-snap of a 3D snapshot gives a PNG with lit pixels" {
     for (px[0..@intCast(w * hgt * 3)]) |v| lit += @intFromBool(v != 0);
     try std.testing.expect(lit > 300);
 }
+
+fn treeSim(dev: *c.SDL_GPUDevice, gpa: std.mem.Allocator, n: u32, method: sim3.Method, node_div: u32) !sim3.Sim3 {
+    var prng = std.Random.DefaultPrng.init(9);
+    const bodies = try ic3.plummer(gpa, prng.random(), n, .{});
+    defer gpa.free(bodies);
+    var s = try sim3.Sim3.init(dev, .{ .n = n, .eps = 0.02, .dt = 0.01, .box = ic3.fitBox(bodies, 4), .method = method, .node_div = node_div });
+    errdefer s.deinit();
+    try s.upload(bodies);
+    return s;
+}
+
+fn readState(gpa: std.mem.Allocator, s: *sim3.Sim3) !struct { pos: []L.Pos3, vel: []L.Vel3 } {
+    const pos = try gpa.alloc(L.Pos3, s.cfg.n);
+    errdefer gpa.free(pos);
+    const vel = try gpa.alloc(L.Vel3, s.cfg.n);
+    try s.read(L.Pos3, s.pos, pos);
+    try s.read(L.Vel3, s.vel, vel);
+    return .{ .pos = pos, .vel = vel };
+}
+
+test "sim3 tree: first-tick acceleration of 10k Plummer matches direct at theta 0.6" {
+    const dev = try device();
+    defer c.SDL_DestroyGPUDevice(dev);
+    const gpa = std.testing.allocator;
+    const n = 10_000;
+    var d = try treeSim(dev, gpa, n, .direct, 4);
+    defer d.deinit();
+    var t = try treeSim(dev, gpa, n, .tree, 4);
+    defer t.deinit();
+    const ad = try gpa.alloc(L.Vel3, n);
+    defer gpa.free(ad);
+    const at = try gpa.alloc(L.Vel3, n);
+    defer gpa.free(at);
+    const pd = try gpa.alloc(L.Pos3, n);
+    defer gpa.free(pd);
+    const pt = try gpa.alloc(L.Pos3, n);
+    defer gpa.free(pt);
+    try d.read(L.Pos3, d.pos, pd);
+    try d.accelerations(ad);
+    try t.accelerations(at);
+    // The tree sim reorders its bodies; match them up by exact quantised position.
+    try t.read(L.Pos3, t.pos, pt);
+    var index: std.AutoHashMap(L.Pos3, u32) = .init(gpa);
+    defer index.deinit();
+    for (pd, 0..) |p, i| try index.put(p, @intCast(i));
+    var sum_sq: f64 = 0;
+    for (pt, at) |p, a| {
+        const b = ad[index.get(p).?];
+        const dx = [3]f64{ a.x - b.x, a.y - b.y, a.z - b.z };
+        const r = [3]f64{ b.x, b.y, b.z };
+        sum_sq += (dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2]) / (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+    }
+    const rms = @sqrt(sum_sq / n);
+    std.debug.print("sim3 tree vs direct first-tick rms {e:.3}\n", .{rms});
+    try std.testing.expect(rms <= 1.2e-3);
+}
+
+test "sim3 tree: 20k Plummer reruns are bit-identical over 50 ticks" {
+    const dev = try device();
+    defer c.SDL_DestroyGPUDevice(dev);
+    const gpa = std.testing.allocator;
+    var a = try treeSim(dev, gpa, 20_000, .tree, 4);
+    defer a.deinit();
+    var b = try treeSim(dev, gpa, 20_000, .tree, 4);
+    defer b.deinit();
+    try a.run(50);
+    try b.run(50);
+    const sa = try readState(gpa, &a);
+    defer gpa.free(sa.pos);
+    defer gpa.free(sa.vel);
+    const sb = try readState(gpa, &b);
+    defer gpa.free(sb.pos);
+    defer gpa.free(sb.vel);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(sa.pos), std.mem.sliceAsBytes(sb.pos));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(sa.vel), std.mem.sliceAsBytes(sb.vel));
+}
+
+test "sim3 tree: a restarted run is bit-identical to the continuous run" {
+    const dev = try device();
+    defer c.SDL_DestroyGPUDevice(dev);
+    const gpa = std.testing.allocator;
+    _ = c.SDL_CreateDirectory(".scratch");
+    const n = 5000;
+    const path = ".scratch/test3_tree_restart.snap";
+    var a = try treeSim(dev, gpa, n, .tree, 4);
+    defer a.deinit();
+    try a.run(40);
+    try takeSnapshot(gpa, &a, path);
+    try a.run(40);
+
+    const io = try snap.open(path);
+    defer _ = c.SDL_CloseIO(io);
+    const h = try snap.readHeader(io);
+    var b = try sim3.Sim3.init(dev, .{ .n = n, .g = h.g, .eps = h.softening, .dt = h.dt, .box = .{ .size = h.box_size }, .method = .tree });
+    defer b.deinit();
+    try b.restore(gpa, io, &h);
+    try b.run(40);
+    try std.testing.expectEqual(a.tick_no, b.tick_no);
+    const sa = try readState(gpa, &a);
+    defer gpa.free(sa.pos);
+    defer gpa.free(sa.vel);
+    const sb = try readState(gpa, &b);
+    defer gpa.free(sb.pos);
+    defer gpa.free(sb.vel);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(sa.pos), std.mem.sliceAsBytes(sb.pos));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(sa.vel), std.mem.sliceAsBytes(sb.vel));
+}
+
+test "sim3 tree: node overflow regrows the tree and the run continues with real forces" {
+    const dev = try device();
+    defer c.SDL_DestroyGPUDevice(dev);
+    const gpa = std.testing.allocator;
+    var s = try treeSim(dev, gpa, 20_000, .tree, 200);
+    defer s.deinit();
+    try s.run(10);
+    try std.testing.expect(s.regrows >= 1);
+    try std.testing.expect(s.overflow_ticks >= 1);
+    const before = s.overflow_ticks;
+    try s.run(10);
+    try std.testing.expectEqual(before, s.overflow_ticks);
+    const d = try s.measure();
+    try std.testing.expect(@abs(d.virial() - 1) <= 0.1);
+}

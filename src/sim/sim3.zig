@@ -1,6 +1,11 @@
 //! 3D matter simulation on the GPU: Newtonian 1/r^2 gravity (Plummer softened) with a global
-//! kick-drift-kick leapfrog. Force is direct summation for now (k3/direct.zig); the tree comes later
-//! (docs/sim3d.md). Positions are u32 box fractions, so the resolution is box_size / 2^32 everywhere.
+//! kick-drift-kick leapfrog. Force is direct summation (k3/direct.zig) or Barnes-Hut (Sort3, Tree3,
+//! Walk3; docs/sim3d.md). Positions are u32 box fractions, so the resolution is box_size / 2^32 everywhere.
+//!
+//! Tree method: every force evaluation first sorts pos/vel/mass into Morton order in place, so the
+//! bodies live in sorted order and snapshots store them that way (the stable sort makes restart
+//! bit-identical, ties included). |a| and the potential only matter right after a walk, so they live
+//! in the sort's SortRec buffers, which are idle by then (8 B/body saved).
 //!
 //! Time stepping is the 2D sim's (sim.zig): between ticks `vel` is the half-step velocity and
 //! `half_pending` is false; `measure` applies the missing half kick to get synchronous velocities.
@@ -18,14 +23,23 @@ const ic3 = @import("ic3");
 const sim = @import("sim.zig");
 const snap = @import("snapshot.zig");
 const snapper = @import("snapper.zig");
+const Sort3 = @import("sort3.zig").Sort3;
+const tree3 = @import("tree3.zig");
+const Tree3 = tree3.Tree3;
+const Walk3 = @import("walk3.zig").Walk3;
 
 const direct_spv = @embedFile("k3_direct.spv");
 const step_spv = @embedFile("k3_step.spv");
 
-pub const Error = sim.Error;
+pub const Error = sim.Error || error{ GpuAcquire, ScratchTooSmall };
 const Buffer = *c.SDL_GPUBuffer;
+const Cmd = *c.SDL_GPUCommandBuffer;
 
 pub const Boundary = enum { open, periodic };
+pub const Method = enum { direct, tree };
+
+/// `--method auto` takes direct summation up to this many bodies.
+pub const auto_tree_max_direct: u32 = 50_000;
 
 pub const Config = struct {
     n: u32,
@@ -37,6 +51,12 @@ pub const Config = struct {
     boundary: Boundary = .open,
     /// Time-step accuracy parameter for the rung histogram.
     eta: f32 = 0.02,
+    method: Method = .direct,
+    /// Opening angle of the tree method.
+    theta: f32 = 0.6,
+    /// Tree node capacity is n / node_div (the design's N/4; the measured need is 0.09N). A larger
+    /// divisor exists to exercise the overflow path.
+    node_div: u32 = 4,
 };
 
 pub const rung_bins = 16;
@@ -93,14 +113,39 @@ pub const Sim3 = struct {
     diag_groups: u32,
     tick_no: u64 = 0,
     half_pending: bool = true,
+    /// Tree method only.
+    sort: ?Sort3 = null,
+    tree: ?Tree3 = null,
+    walk: ?Walk3 = null,
+    /// Per in-flight tick, the tree status words (leaves, nodes, overflow, depth) copied at the end
+    /// of its force evaluation; read once that tick's fence has passed.
+    status_tb: ?*c.SDL_GPUTransferBuffer = null,
+    status_slot: u32 = 0,
+    overflow_pending: bool = false,
+    /// Ticks whose tree overflowed (they had zero force) and how many times the tree was regrown.
+    overflow_ticks: u64 = 0,
+    regrows: u32 = 0,
+
+    const status_slots = 4;
+    const status_words = 4;
 
     pub fn init(dev: *c.SDL_GPUDevice, cfg: Config) Error!Sim3 {
         if (cfg.n < 1 or cfg.n > 1 << 28 or !(cfg.eps > 0) or !(cfg.box.size > 0)) return error.OutOfRange;
+        // The walk assumes an open box (no minimum-image wrap).
+        if (cfg.method == .tree and (cfg.boundary == .periodic or !(cfg.theta > 0) or cfg.node_div == 0)) return error.OutOfRange;
         var s: Sim3 = undefined;
         s.dev = dev;
         s.cfg = cfg;
         s.tick_no = 0;
         s.half_pending = true;
+        s.sort = null;
+        s.tree = null;
+        s.walk = null;
+        s.status_tb = null;
+        s.status_slot = 0;
+        s.overflow_pending = false;
+        s.overflow_ticks = 0;
+        s.regrows = 0;
         const n: u64 = cfg.n;
         s.pos = try makeBuffer(dev, n * @sizeOf(L.Pos3));
         errdefer c.SDL_ReleaseGPUBuffer(dev, s.pos);
@@ -108,10 +153,26 @@ pub const Sim3 = struct {
         errdefer c.SDL_ReleaseGPUBuffer(dev, s.vel);
         s.mass = try makeBuffer(dev, n * 4);
         errdefer c.SDL_ReleaseGPUBuffer(dev, s.mass);
-        s.amag = try makeBuffer(dev, n * 4);
-        errdefer c.SDL_ReleaseGPUBuffer(dev, s.amag);
-        s.pot = try makeBuffer(dev, n * 4);
-        errdefer c.SDL_ReleaseGPUBuffer(dev, s.pot);
+        if (cfg.method == .tree) {
+            s.sort = try Sort3.init(dev, cfg.n);
+            errdefer s.sort.?.deinit();
+            s.amag = s.sort.?.recs[0];
+            s.pot = s.sort.?.recs[1];
+            s.tree = try s.buildTree(s.cfg.n / cfg.node_div);
+            errdefer s.tree.?.deinit();
+            s.walk = try Walk3.init(dev);
+            errdefer s.walk.?.deinit();
+            s.status_tb = c.SDL_CreateGPUTransferBuffer(dev, &.{
+                .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD,
+                .size = status_slots * status_words * 4,
+            }) orelse return error.GpuBuffer;
+        } else {
+            s.amag = try makeBuffer(dev, n * 4);
+            errdefer c.SDL_ReleaseGPUBuffer(dev, s.amag);
+            s.pot = try makeBuffer(dev, n * 4);
+            errdefer c.SDL_ReleaseGPUBuffer(dev, s.pot);
+        }
+        errdefer if (s.status_tb) |tb| c.SDL_ReleaseGPUTransferBuffer(dev, tb);
         s.diag_groups = ((cfg.n + diag_per_thread - 1) / diag_per_thread + L.group_size - 1) / L.group_size;
         s.diag_buf = try makeBuffer(dev, @as(u64, s.diag_groups) * diag_stride * 4);
         errdefer c.SDL_ReleaseGPUBuffer(dev, s.diag_buf);
@@ -154,13 +215,37 @@ pub const Sim3 = struct {
 
     pub fn deinit(s: *Sim3) void {
         c.SDL_ReleaseGPUTransferBuffer(s.dev, s.download);
-        for ([_]Buffer{ s.pos, s.vel, s.mass, s.amag, s.pot, s.diag_buf, s.bins }) |b| c.SDL_ReleaseGPUBuffer(s.dev, b);
+        for ([_]Buffer{ s.pos, s.vel, s.mass, s.diag_buf, s.bins }) |b| c.SDL_ReleaseGPUBuffer(s.dev, b);
+        if (s.sort) |*x| x.deinit() else for ([_]Buffer{ s.amag, s.pot }) |b| c.SDL_ReleaseGPUBuffer(s.dev, b);
+        if (s.tree) |*x| x.deinit();
+        if (s.walk) |*x| x.deinit();
+        if (s.status_tb) |tb| c.SDL_ReleaseGPUTransferBuffer(s.dev, tb);
         for (s.pipes) |p| c.SDL_ReleaseGPUComputePipeline(s.dev, p);
         s.* = undefined;
     }
 
-    pub fn bytesPerBody() u64 {
-        return @sizeOf(L.Pos3) + @sizeOf(L.Vel3) + 3 * 4;
+    /// Device bytes per body of the solver state (the small diagnostics buffers excluded).
+    pub fn bytesPerBody(s: *const Sim3) f64 {
+        var b: f64 = @sizeOf(L.Pos3) + @sizeOf(L.Vel3) + 4;
+        if (s.sort != null) {
+            b += Sort3.bytesPerBody() + s.tree.?.bytesPerBody();
+        } else b += 8;
+        return b;
+    }
+
+    /// Tree on the sort's idle SortRec copy, or on its own scratch when that is too small (tiny n,
+    /// or a regrow past what the borrowed scratch holds).
+    fn buildTree(s: *Sim3, node_cap: u32) Error!Tree3 {
+        const sort = &s.sort.?;
+        const cap = std.math.clamp(node_cap, 1, 2 * s.cfg.n);
+        return Tree3.initWith(s.dev, s.cfg.n, .{
+            .node_cap = cap,
+            .scratch = sort.scratch(),
+            .scratch_bytes = @as(u64, s.cfg.n) * @sizeOf(L.SortRec),
+        }) catch |err| switch (err) {
+            error.ScratchTooSmall => Tree3.initWith(s.dev, s.cfg.n, .{ .node_cap = cap }),
+            else => err,
+        };
     }
 
     /// Quantum count of a world coordinate; clamped into the open domain, wrapped when periodic.
@@ -315,8 +400,85 @@ pub const Sim3 = struct {
         s.pass(cmd, .drift, s.params(0, 0, 0), &.{}, &.{ s.pos, s.vel }, s.cfg.n);
     }
 
-    pub fn recordTick(s: *Sim3, cmd0: *c.SDL_GPUCommandBuffer) Error!*c.SDL_GPUCommandBuffer {
-        const cmd = try s.recordKick(cmd0, if (s.half_pending) 0.5 else 1.0, 0);
+    /// Sort + tree build for the current positions (tree method).
+    fn recordSortTree(s: *Sim3, cmd0: Cmd) Error!Cmd {
+        const sort = &s.sort.?;
+        const cmd = try sort.record(cmd0, .{ .pos = s.pos, .vel = s.vel, .mass = s.mass }, s.cfg.n);
+        try s.recordTreeBuild(cmd);
+        return cmd;
+    }
+
+    fn recordTreeBuild(s: *Sim3, cmd: Cmd) Error!void {
+        try s.tree.?.record(cmd, .{ .pos = s.pos, .mass = s.mass, .keys = s.sort.?.sorted() }, s.cfg.n, .{ .theta = s.cfg.theta, .box_size = s.cfg.box.size });
+    }
+
+    fn recordWalk(s: *Sim3, cmd: Cmd, factor: f32, flags: u32) Error!Cmd {
+        const tree = &s.tree.?;
+        return s.walk.?.record(cmd, .{
+            .pos = s.pos,
+            .mass = s.mass,
+            .nodes = tree.nodes,
+            .quads = tree.quads,
+            .vel = s.vel,
+            .amag = s.amag,
+            .pot = s.pot,
+        }, .{
+            .n = s.cfg.n,
+            .g = s.cfg.g,
+            .eps = s.cfg.eps,
+            .kick = s.cfg.dt * factor,
+            .box_scale = @floatCast(s.cfg.box.size / 0x1p32),
+            .flags = flags,
+        });
+    }
+
+    fn recordStatusCopy(s: *Sim3, cmd: Cmd) void {
+        const cp = c.SDL_BeginGPUCopyPass(cmd);
+        c.SDL_DownloadFromGPUBuffer(cp, &.{
+            .buffer = s.tree.?.statusBuffer(),
+            .offset = 4 * tree3.status_leaves,
+            .size = status_words * 4,
+        }, &.{ .transfer_buffer = s.status_tb.?, .offset = s.status_slot * status_words * 4 });
+        c.SDL_EndGPUCopyPass(cp);
+    }
+
+    /// Records vel += factor * dt * a(pos) by the configured method. The tree method reorders the
+    /// bodies first. The returned command buffer may not be `cmd0` (see recordKick, Sort3.record).
+    fn recordForce(s: *Sim3, cmd0: Cmd, factor: f32, flags: u32) Error!Cmd {
+        if (s.cfg.method == .direct) return s.recordKick(cmd0, factor, flags);
+        var cmd = try s.recordSortTree(cmd0);
+        cmd = try s.recordWalk(cmd, factor, flags);
+        s.recordStatusCopy(cmd);
+        return cmd;
+    }
+
+    /// Reads the status of the tick that used `slot` (its fence has passed) and flags an overflow.
+    fn noteStatus(s: *Sim3, slot: usize) void {
+        const tb = s.status_tb orelse return;
+        const w: [*]const u32 = @ptrCast(@alignCast(c.SDL_MapGPUTransferBuffer(s.dev, tb, false) orelse return));
+        defer c.SDL_UnmapGPUTransferBuffer(s.dev, tb);
+        if (w[slot * status_words + 2] != 0) {
+            s.overflow_pending = true;
+            s.overflow_ticks += 1;
+        }
+    }
+
+    /// Replaces the tree by one with more nodes, once every command buffer using it has finished.
+    /// Ticks whose build overflowed have had zero force; there is no way to redo them.
+    fn regrow(s: *Sim3) Error!void {
+        s.overflow_pending = false;
+        const st = try s.tree.?.readStatus();
+        const old = s.tree.?.node_cap;
+        const want: u32 = @intCast(@min(@as(u64, s.cfg.n) * 2, @max(@as(u64, old) * 2, @as(u64, st.nodes) + st.nodes / 8)));
+        std.debug.print("sim3: tree overflow at tick {d}: {d} nodes needed, capacity {d}; regrowing to {d} ({d} ticks so far had zero force)\n", .{ s.tick_no, st.nodes, old, want, s.overflow_ticks });
+        s.tree.?.deinit();
+        s.tree = null;
+        s.tree = try s.buildTree(want);
+        s.regrows += 1;
+    }
+
+    pub fn recordTick(s: *Sim3, cmd0: Cmd) Error!Cmd {
+        const cmd = try s.recordForce(cmd0, if (s.half_pending) 0.5 else 1.0, 0);
         s.half_pending = false;
         s.recordDrift(cmd);
         s.tick_no += 1;
@@ -325,27 +487,37 @@ pub const Sim3 = struct {
 
     /// Runs `ticks` ticks, a few in flight when each is short; returns when done.
     pub fn run(s: *Sim3, ticks: u64) Error!void {
-        const depth: usize = if (s.cfg.n > whole_kick_max) 1 else 4;
-        var fences: [4]?*c.SDL_GPUFence = @splat(null);
+        const depth: usize = if (s.cfg.n > whole_kick_max) 1 else status_slots;
+        var fences: [status_slots]?*c.SDL_GPUFence = @splat(null);
         for (0..ticks) |k| {
             const slot = k % depth;
-            if (fences[slot]) |f| waitRelease(s.dev, f);
+            if (fences[slot]) |f| {
+                waitRelease(s.dev, f);
+                fences[slot] = null;
+                s.noteStatus(slot);
+            }
+            if (s.overflow_pending) {
+                s.drain(&fences);
+                try s.regrow();
+            }
+            s.status_slot = @intCast(slot);
             const cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
             const last = try s.recordTick(cmd);
             fences[slot] = c.SDL_SubmitGPUCommandBufferAndAcquireFence(last) orelse return error.GpuSubmit;
         }
-        for (&fences) |*f| if (f.*) |ff| {
+        s.drain(&fences);
+        if (s.overflow_pending) try s.regrow();
+    }
+
+    fn drain(s: *Sim3, fences: *[status_slots]?*c.SDL_GPUFence) void {
+        for (fences, 0..) |*f, slot| if (f.*) |ff| {
             waitRelease(s.dev, ff);
             f.* = null;
+            s.noteStatus(slot);
         };
     }
 
-    /// Diagnostics at synchronous velocities (blocking). The force pass that completes the pending
-    /// half kick also yields the potentials and |a|; with nothing pending it runs with a zero kick.
-    pub fn measure(s: *Sim3) Error!Diag3 {
-        var cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
-        cmd = try s.recordKick(cmd, if (s.half_pending) 0 else 0.5, L.sim3_flag_potential);
-        s.half_pending = true;
+    fn recordDiag(s: *Sim3, cmd: Cmd) void {
         const p = s.params(0, 0, 0);
         s.pass(cmd, .rungsClear, p, &.{}, &.{s.bins}, rung_bins);
         s.pass(cmd, .rungs, p, &.{s.amag}, &.{s.bins}, s.cfg.n);
@@ -355,7 +527,20 @@ pub const Sim3 = struct {
         c.SDL_DownloadFromGPUBuffer(cp, &.{ .buffer = s.diag_buf, .size = diag_bytes }, &.{ .transfer_buffer = s.download, .offset = 0 });
         c.SDL_DownloadFromGPUBuffer(cp, &.{ .buffer = s.bins, .size = rung_bins * 4 }, &.{ .transfer_buffer = s.download, .offset = diag_bytes });
         c.SDL_EndGPUCopyPass(cp);
+    }
+
+    /// Diagnostics at synchronous velocities (blocking). The force pass that completes the pending
+    /// half kick also yields the potentials and |a|; with nothing pending it runs with a zero kick.
+    pub fn measure(s: *Sim3) Error!Diag3 {
+        var cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
+        s.status_slot = 0;
+        cmd = try s.recordForce(cmd, if (s.half_pending) 0 else 0.5, L.sim3_flag_potential);
+        s.half_pending = true;
+        s.recordDiag(cmd);
         try submitWait(s.dev, cmd);
+        s.noteStatus(0);
+        if (s.overflow_pending) try s.regrow();
+        const diag_bytes = s.diag_groups * diag_stride * 4;
         const m: [*]const u8 = @ptrCast(c.SDL_MapGPUTransferBuffer(s.dev, s.download, false) orelse return error.GpuBuffer);
         defer c.SDL_UnmapGPUTransferBuffer(s.dev, s.download);
         const f: [*]const f32 = @ptrCast(@alignCast(m));
@@ -397,31 +582,59 @@ pub const Sim3 = struct {
     /// use it before the first tick or for force tests.
     pub fn accelerations(s: *Sim3, out: []L.Vel3) Error!void {
         const cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
-        const last = try s.recordKick(cmd, 0, L.sim3_flag_store_accel);
+        const last = try s.recordForce(cmd, 0, L.sim3_flag_store_accel);
         try submitWait(s.dev, last);
         try s.read(L.Vel3, s.vel, out);
     }
 
-    pub const PassTimes = struct { kick: f64, drift: f64, diag: f64 };
+    /// ms of each pass (kick = the whole force evaluation of the direct method; walk_pot is a walk
+    /// that also writes potentials, as on diagnostic ticks).
+    pub const PassTimes = struct { sort: f64 = 0, tree: f64 = 0, walk: f64 = 0, walk_pot: f64 = 0, kick: f64 = 0, drift: f64 = 0, diag: f64 = 0 };
 
     /// Blocking per-pass times in ms: the minimum of `reps` samples after one warm-up (the GPU is shared).
     pub fn timePasses(s: *Sim3, reps: u32) Error!PassTimes {
-        var best = PassTimes{ .kick = std.math.inf(f64), .drift = std.math.inf(f64), .diag = std.math.inf(f64) };
+        var best = PassTimes{};
+        inline for (@typeInfo(PassTimes).@"struct".field_names) |f| @field(best, f) = std.math.inf(f64);
         for (0..reps + 1) |k| {
+            var t: PassTimes = .{};
+            if (s.cfg.method == .tree) {
+                var cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
+                var t0 = c.SDL_GetPerformanceCounter();
+                cmd = try s.sort.?.record(cmd, .{ .pos = s.pos, .vel = s.vel, .mass = s.mass }, s.cfg.n);
+                try submitWait(s.dev, cmd);
+                t.sort = sim.msSince(t0);
+                cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
+                t0 = c.SDL_GetPerformanceCounter();
+                try s.recordTreeBuild(cmd);
+                try submitWait(s.dev, cmd);
+                t.tree = sim.msSince(t0);
+                for ([2]u32{ 0, L.sim3_flag_potential }) |flags| {
+                    cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
+                    t0 = c.SDL_GetPerformanceCounter();
+                    cmd = try s.recordWalk(cmd, 1, flags);
+                    try submitWait(s.dev, cmd);
+                    if (flags == 0) t.walk = sim.msSince(t0) else t.walk_pot = sim.msSince(t0);
+                }
+            } else {
+                var cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
+                const t0 = c.SDL_GetPerformanceCounter();
+                cmd = try s.recordKick(cmd, 1, 0);
+                try submitWait(s.dev, cmd);
+                t.kick = sim.msSince(t0);
+            }
             var cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
             var t0 = c.SDL_GetPerformanceCounter();
-            cmd = try s.recordKick(cmd, 1, 0);
-            try submitWait(s.dev, cmd);
-            const tk = sim.msSince(t0);
-            cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
-            t0 = c.SDL_GetPerformanceCounter();
             s.recordDrift(cmd);
             try submitWait(s.dev, cmd);
-            const td = sim.msSince(t0);
-            if (k > 0) {
-                best.kick = @min(best.kick, tk);
-                best.drift = @min(best.drift, td);
-            }
+            t.drift = sim.msSince(t0);
+            cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
+            t0 = c.SDL_GetPerformanceCounter();
+            s.recordDiag(cmd);
+            try submitWait(s.dev, cmd);
+            t.diag = sim.msSince(t0);
+            if (k > 0) inline for (@typeInfo(PassTimes).@"struct".field_names) |f| {
+                @field(best, f) = @min(@field(best, f), @field(t, f));
+            };
         }
         return best;
     }
@@ -431,7 +644,7 @@ fn syncHook(ctx: *anyopaque, cmd: *c.SDL_GPUCommandBuffer) *c.SDL_GPUCommandBuff
     const s: *Sim3 = @ptrCast(@alignCast(ctx));
     if (s.half_pending) return cmd;
     s.half_pending = true;
-    return s.recordKick(cmd, 0.5, 0) catch @panic("sim3: half kick before snapshot failed");
+    return s.recordForce(cmd, 0.5, 0) catch @panic("sim3: half kick before snapshot failed");
 }
 
 fn headerHook(ctx: *anyopaque, seed: u64, scenario: u32) snap.Header {
@@ -481,7 +694,7 @@ pub const Options = struct {
     margin: f64 = 4,
     boundary: Boundary = .open,
     bench: bool = false,
-    /// Accepted for the tree solver; direct summation ignores it.
+    method: enum { auto, direct, tree } = .auto,
     theta: f32 = 0.6,
     out: ?[:0]const u8 = null,
     every_snap: u64 = 0,
@@ -490,8 +703,8 @@ pub const Options = struct {
 
 const usage =
     \\usage: sim --dim 3 [--ic plummer|kepler|uniform] [--n N] [--ticks K] [--dt F] [--every K] [--seed U64]
-    \\               [--eps LEN] [--ecc E] [--margin M] [--boundary open|periodic] [--method direct]
-    \\               [--theta F (ignored)] [--bench]
+    \\               [--eps LEN] [--ecc E] [--margin M] [--boundary open|periodic] [--method auto|direct|tree]
+    \\               [--theta F] [--bench]
     \\               [--out DIR --every-snap K] [--restart FILE]   (restart: n, g, eps, dt, box, boundary come from the file; --ticks = further ticks)
     \\
 ;
@@ -533,7 +746,7 @@ fn parse(args: []const [:0]const u8) !Options {
         } else if (std.mem.eql(u8, a, "--boundary")) {
             o.boundary = std.meta.stringToEnum(Boundary, v) orelse return error.BadBoundary;
         } else if (std.mem.eql(u8, a, "--method")) {
-            if (!std.mem.eql(u8, v, "direct")) return error.BadMethod;
+            o.method = std.meta.stringToEnum(@TypeOf(o.method), v) orelse return error.BadMethod;
         } else if (std.mem.eql(u8, a, "--out")) {
             o.out = v;
         } else if (std.mem.eql(u8, a, "--every-snap")) {
@@ -576,7 +789,7 @@ pub fn main(gpa: std.mem.Allocator, args: []const [:0]const u8) !void {
         header = try snap.readHeader(io);
         if (header.dim != 3) return error.BadHeader;
         const b: Boundary = @fromBackingInt(@intCast(@backingInt(@as(snap.Boundary, @fromBackingInt(@intCast(header.boundary))))));
-        cfg = .{ .n = @intCast(header.n), .g = header.g, .eps = header.softening, .dt = header.dt, .box = .{ .size = header.box_size }, .boundary = b };
+        cfg = .{ .n = @intCast(header.n), .g = header.g, .eps = header.softening, .dt = header.dt, .box = .{ .size = header.box_size }, .boundary = b, .theta = o.theta };
         std.debug.print("restart from {s}: {d} bodies at tick {d}\n", .{ path, header.n, header.tick });
     } else {
         var prng = std.Random.DefaultPrng.init(o.seed);
@@ -590,16 +803,23 @@ pub fn main(gpa: std.mem.Allocator, args: []const [:0]const u8) !void {
                 break :blk try gpa.dupe(ic3.Body3, &pair);
             },
         };
-        cfg = .{ .n = @intCast(bodies.len), .eps = o.eps, .dt = dt, .box = ic3.fitBox(bodies, o.margin), .boundary = o.boundary };
+        cfg = .{ .n = @intCast(bodies.len), .eps = o.eps, .dt = dt, .box = ic3.fitBox(bodies, o.margin), .boundary = o.boundary, .theta = o.theta };
     }
     const n = cfg.n;
+    cfg.method = switch (o.method) {
+        .direct => .direct,
+        .tree => .tree,
+        .auto => if (n > auto_tree_max_direct and cfg.boundary == .open) Method.tree else Method.direct,
+    };
     var s = Sim3.init(dev, cfg) catch |err| {
         std.debug.print("sim3 init failed for n={d}: {s} ({s})\n", .{ n, @errorName(err), c.SDL_GetError() });
         return err;
     };
     defer s.deinit();
     if (restart_io) |io| try s.restore(gpa, io, &header) else try s.upload(bodies);
-    std.debug.print("{s}: {d} bodies, box {d:.4} (quantum {e:.2}), eps {d}, dt {d}, {d} B/body\n", .{ @tagName(o.ic), n, cfg.box.size, cfg.box.size / 0x1p32, cfg.eps, cfg.dt, Sim3.bytesPerBody() });
+    gpa.free(bodies);
+    bodies = &.{};
+    std.debug.print("{s}: {d} bodies, {s} (theta {d}), box {d:.4} (quantum {e:.2}), eps {d}, dt {d}, {d:.1} B/body\n", .{ @tagName(o.ic), n, @tagName(cfg.method), cfg.theta, cfg.box.size, cfg.box.size / 0x1p32, cfg.eps, cfg.dt, s.bytesPerBody() });
     if (o.bench) return bench(&s, o);
 
     var sn: ?*snapper.Snapper = null;
@@ -658,5 +878,12 @@ fn bench(s: *Sim3, o: Options) !void {
         best = @min(best, sim.msSince(t) / @as(f64, @floatFromInt(ticks)));
     }
     const pt = try s.timePasses(3);
-    std.debug.print("bench n={d}: pipelined {d:.3} ms/tick (min of 3 runs of {d} ticks); blocking kick {d:.3}, drift {d:.3}\n", .{ s.cfg.n, best, ticks, pt.kick, pt.drift });
+    std.debug.print("bench n={d} {s}: pipelined {d:.3} ms/tick (min of 3 runs of {d} ticks), {d:.1} B/body\n", .{ s.cfg.n, @tagName(s.cfg.method), best, ticks, s.bytesPerBody() });
+    if (s.cfg.method == .tree) {
+        std.debug.print("  blocking ms (min of 3): sort {d:.3}  tree {d:.3}  walk {d:.3}  drift {d:.3}  diag {d:.3}  (walk with potential {d:.3}; sum of tick passes {d:.3})\n", .{ pt.sort, pt.tree, pt.walk, pt.drift, pt.diag, pt.walk_pot, pt.sort + pt.tree + pt.walk + pt.drift });
+        const st = try s.tree.?.readStatus();
+        std.debug.print("  tree: {d} leaves, {d} nodes ({d:.3} per body), capacity {d}, depth {d}, regrows {d}\n", .{ st.leaves, st.nodes, @as(f64, @floatFromInt(st.nodes)) / @as(f64, @floatFromInt(s.cfg.n)), s.tree.?.node_cap, st.max_depth, s.regrows });
+    } else {
+        std.debug.print("  blocking ms (min of 3): kick {d:.3}  drift {d:.3}  diag {d:.3}\n", .{ pt.kick, pt.drift, pt.diag });
+    }
 }
