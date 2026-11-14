@@ -470,7 +470,7 @@ pub const Sim3 = struct {
         const st = try s.tree.?.readStatus();
         const old = s.tree.?.node_cap;
         const want: u32 = @intCast(@min(@as(u64, s.cfg.n) * 2, @max(@as(u64, old) * 2, @as(u64, st.nodes) + st.nodes / 8)));
-        std.log.warn("sim3: tree overflow at tick {d}: {d} nodes needed, capacity {d}; regrowing to {d} ({d} ticks so far had zero force)", .{ s.tick_no, st.nodes, old, want, s.overflow_ticks });
+        std.debug.print("sim3: tree overflow at tick {d}: {d} nodes needed, capacity {d}; regrowing to {d} ({d} ticks so far had zero force)\n", .{ s.tick_no, st.nodes, old, want, s.overflow_ticks });
         s.tree.?.deinit();
         s.tree = null;
         s.tree = try s.buildTree(want);
@@ -582,7 +582,7 @@ pub const Sim3 = struct {
     /// use it before the first tick or for force tests.
     pub fn accelerations(s: *Sim3, out: []L.Vel3) Error!void {
         const cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
-        const last = try s.recordKick(cmd, 0, L.sim3_flag_store_accel);
+        const last = try s.recordForce(cmd, 0, L.sim3_flag_store_accel);
         try submitWait(s.dev, last);
         try s.read(L.Vel3, s.vel, out);
     }
