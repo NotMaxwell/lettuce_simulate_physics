@@ -44,6 +44,9 @@ const layouts = std.enums.EnumArray(Kernel, Layout).init(.{
 });
 
 const scan_block: u32 = L.group_size * 4; // matches common.scan_block
+/// Most grid cells (dead-ball cell and sentinel included) whose first scan level fits in one
+/// dispatch row; above it `prepare` coarsens the grid instead.
+pub const max_cells: u32 = L.dispatch_x * scan_block - 2;
 const ScanParams = extern struct { n: u32, _pad0: u32 = 0, _pad1: u32 = 0, _pad2: u32 = 0 };
 const ColorParams = extern struct { color_x: u32, color_y: u32, iteration: u32, rest_speed: f32, elastic: u32, _pad0: u32 = 0, _pad1: u32 = 0, _pad2: u32 = 0 };
 
@@ -54,6 +57,8 @@ pub const Sim = struct {
     capacity: u32,
     /// Most grid cells the cell buffers hold; `prepare` grows the cell size to stay within it.
     cell_capacity: u32,
+    /// Total size of the buffers below.
+    bytes: u64,
     /// true: ball-ball impulses perfectly elastic like the CPU/Python; false: restitution is the
     /// pair's mean retention.
     elastic: bool = true,
@@ -94,11 +99,12 @@ pub const Sim = struct {
     pipes: std.enums.EnumArray(Kernel, *c.SDL_GPUComputePipeline),
 
     pub fn init(dev: *c.SDL_GPUDevice, capacity: u32, cell_capacity: u32) Error!Sim {
-        std.debug.assert(capacity <= L.max_balls);
+        std.debug.assert(capacity <= L.max_balls_limit);
         var s: Sim = undefined;
         s.dev = dev;
         s.capacity = capacity;
-        s.cell_capacity = cell_capacity;
+        // The first scan level is one workgroup per scan_block cells and reads workgroup_id.x only.
+        s.cell_capacity = @min(cell_capacity, max_cells);
         s.elastic = true;
         s.iterations = 1;
         s.rest_speed = 2;
@@ -107,27 +113,28 @@ pub const Sim = struct {
         s.fx_buf = null;
         const n = capacity;
         // +2: the dead-ball cell and the end sentinel of the last real cell's row range.
-        const ncount = cell_capacity + 2;
+        const ncount = s.cell_capacity + 2;
         const nsum1 = divCeil(ncount, scan_block);
         const nsum2 = divCeil(nsum1, scan_block);
         std.debug.assert(nsum2 <= scan_block);
-        s.pos = try buffer(dev, n * @sizeOf(L.BallPos));
-        s.prev_pos = try buffer(dev, n * @sizeOf(L.BallPrevPos));
-        s.vel = try buffer(dev, n * @sizeOf(L.BallVel));
-        s.body = try buffer(dev, n * @sizeOf(L.BallBody));
-        s.state = try buffer(dev, n * @sizeOf(L.BallState));
-        s.meta = try buffer(dev, n * @sizeOf(L.BallMeta));
-        s.events = try buffer(dev, L.max_events * @sizeOf(L.Event));
-        s.counts = try buffer(dev, ncount * 4);
-        s.sums1 = try buffer(dev, nsum1 * 4);
-        s.sums2 = try buffer(dev, nsum2 * 4);
-        s.sums3 = try buffer(dev, 16);
-        s.ball_cell = try buffer(dev, n * 4);
-        s.ball_slot = try buffer(dev, n * 4);
-        s.sorted_id = try buffer(dev, n * 4);
-        s.s_vel = try buffer(dev, n * @sizeOf(L.Vec2));
-        s.s_spin = try buffer(dev, n * 4);
-        s.s_prm = try buffer(dev, n * 16);
+        s.bytes = 0;
+        s.pos = try s.alloc(n * @sizeOf(L.BallPos));
+        s.prev_pos = try s.alloc(n * @sizeOf(L.BallPrevPos));
+        s.vel = try s.alloc(n * @sizeOf(L.BallVel));
+        s.body = try s.alloc(n * @sizeOf(L.BallBody));
+        s.state = try s.alloc(n * @sizeOf(L.BallState));
+        s.meta = try s.alloc(n * @sizeOf(L.BallMeta));
+        s.events = try s.alloc(L.max_events * @sizeOf(L.Event));
+        s.counts = try s.alloc(ncount * 4);
+        s.sums1 = try s.alloc(nsum1 * 4);
+        s.sums2 = try s.alloc(nsum2 * 4);
+        s.sums3 = try s.alloc(16);
+        s.ball_cell = try s.alloc(n * 4);
+        s.ball_slot = try s.alloc(n * 4);
+        s.sorted_id = try s.alloc(n * 4);
+        s.s_vel = try s.alloc(n * @sizeOf(L.Vec2));
+        s.s_spin = try s.alloc(n * 4);
+        s.s_prm = try s.alloc(n * 16);
 
         const kernels = comptime std.enums.values(Kernel);
         var infos: [kernels.len]c.SDL_GPUComputePipelineCreateInfo = undefined;
@@ -267,6 +274,11 @@ pub const Sim = struct {
         };
     }
 
+    fn alloc(s: *Sim, size: u32) Error!Buffer {
+        s.bytes += size;
+        return buffer(s.dev, size);
+    }
+
     fn push(_: *Sim, cmd: *c.SDL_GPUCommandBuffer, slot: u32, data: anytype) void {
         c.SDL_PushGPUComputeUniformData(cmd, slot, data, @sizeOf(@TypeOf(data.*)));
     }
@@ -282,7 +294,8 @@ pub const Sim = struct {
         const cp = c.SDL_BeginGPUComputePass(cmd, null, 0, &binds, @intCast(rw.len));
         c.SDL_BindGPUComputePipeline(cp, s.pipes.get(k));
         if (ro.len > 0) c.SDL_BindGPUComputeStorageBuffers(cp, 0, @ptrCast(ro.ptr), @intCast(ro.len));
-        c.SDL_DispatchGPUCompute(cp, groups, 1, 1);
+        const grid = L.dispatchGrid(groups);
+        c.SDL_DispatchGPUCompute(cp, grid[0], grid[1], 1);
         c.SDL_EndGPUComputePass(cp);
     }
 

@@ -77,6 +77,8 @@ pub const Pool = struct {
     meta: Buffer,
     cap: u32,
 
+    const bytes_per_entry: u32 = 2 * @sizeOf(L.Vec2) + @sizeOf(L.BallBody) + @sizeOf(L.BallState) + @sizeOf(L.BallHeat) + 4;
+
     fn init(dev: *c.SDL_GPUDevice, cap: u32) Error!Pool {
         return .{
             .pos = try buffer(dev, cap * @sizeOf(L.Vec2), true),
@@ -126,8 +128,14 @@ comptime {
     std.debug.assert(@sizeOf(SpawnRec) == 48);
 }
 
-/// New balls uploaded per tick; a 1M stress fill takes 16 ticks.
-pub const spawn_batch: u32 = 1 << 16;
+/// New balls uploaded per tick at the default capacity (a 1M stress fill takes 16 ticks). Larger
+/// worlds scale it up (`spawnBatchFor`) so a full load still takes about 16 ticks.
+const spawn_batch_min: u32 = 1 << 16;
+const spawn_batch_max: u32 = 1 << 20;
+
+fn spawnBatchFor(cap: u32) u32 {
+    return std.math.clamp(cap / 16, spawn_batch_min, spawn_batch_max);
+}
 const max_poly: u32 = 4096;
 const max_blasts: u32 = 256;
 /// Game events per tick; the whole list is read back every tick (out_bytes). Merges are
@@ -278,6 +286,13 @@ pub const GpuWorld = struct {
     write_slot: u32 = 0,
     in_flight: u32 = 0,
 
+    /// Ball slots on the GPU (runtime choice, see `initCap`).
+    capacity: u32,
+    /// Spawn records uploaded per tick at most.
+    spawn_batch: u32,
+    /// Bytes of every GPU buffer the world and its solvers created (fire pools, scratch and
+    /// readback included).
+    gpu_bytes: u64 = 0,
     /// Ball ids in use: every id below this is either alive or in `free`.
     count: u32 = 0,
     alive: u32 = 0,
@@ -333,7 +348,14 @@ pub const GpuWorld = struct {
     diag_now: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, dev: *c.SDL_GPUDevice) Error!GpuWorld {
-        const cap = L.max_balls;
+        return initCap(gpa, dev, L.default_max_balls);
+    }
+
+    /// A world of `cap` ball slots (at most L.max_balls_limit). GPU memory grows linearly with it;
+    /// see `gpu_bytes` for the total.
+    pub fn initCap(gpa: std.mem.Allocator, dev: *c.SDL_GPUDevice, cap_in: u32) Error!GpuWorld {
+        const cap = std.math.clamp(cap_in, 1, L.max_balls_limit);
+        const batch = spawnBatchFor(cap);
         var sim = try gs.Sim.init(dev, cap, 2 * cap);
         errdefer sim.deinit();
         var grav = Gravity.init(dev, cap) catch return error.GpuSetupFailed;
@@ -343,6 +365,8 @@ pub const GpuWorld = struct {
             .dev = dev,
             .sim = sim,
             .grav = grav,
+            .capacity = cap,
+            .spawn_batch = batch,
             .heat = try buffer(dev, cap * @sizeOf(L.BallHeat), true),
             .tmp = try buffer(dev, cap * 4, false),
             .fx = try buffer(dev, fx_bytes, false),
@@ -354,16 +378,20 @@ pub const GpuWorld = struct {
             .ash_next = try buffer(dev, ash_pool_cap * 4, false),
             .out = try buffer(dev, out_bytes, false),
             .pick_buf = try buffer(dev, 16, false),
-            .spawn_buf = try buffer(dev, spawn_batch * @sizeOf(SpawnRec), false),
+            .spawn_buf = try buffer(dev, batch * @sizeOf(SpawnRec), false),
             .poly_buf = try buffer(dev, max_poly * @sizeOf(L.Vec2), false),
             .blast_buf = try buffer(dev, max_blasts * @sizeOf(Blast), false),
-            .upload_tb = c.SDL_CreateGPUTransferBuffer(dev, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = uploadBytes() }) orelse return error.GpuSetupFailed,
+            .upload_tb = c.SDL_CreateGPUTransferBuffer(dev, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = uploadBytes(batch) }) orelse return error.GpuSetupFailed,
             .pick_tb = c.SDL_CreateGPUTransferBuffer(dev, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD, .size = 16 }) orelse return error.GpuSetupFailed,
             .pipes = undefined,
             .slots = undefined,
             .radius = try gpa.alloc(f32, cap),
         };
         @memset(gw.radius, 0);
+        const per_ball: u64 = @sizeOf(L.BallHeat) + 4 + 4; // heat, tmp, claim
+        const pools: u64 = @as(u64, fire_pool_cap + ash_pool_cap) * Pool.bytes_per_entry + 4 * @as(u64, ash_table + ash_pool_cap);
+        const fixed: u64 = fx_bytes + 16 + out_bytes + 16 + @as(u64, batch) * @sizeOf(SpawnRec) + max_poly * @sizeOf(L.Vec2) + max_blasts * @sizeOf(Blast);
+        gw.gpu_bytes = gw.sim.bytes + gw.grav.bytes + per_ball * cap + pools + fixed;
         gw.sim.heat_buf = gw.heat;
         gw.sim.fx_buf = gw.fx;
         for (&gw.slots) |*s| s.* = .{ .tb = c.SDL_CreateGPUTransferBuffer(dev, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD, .size = download_bytes }) orelse return error.GpuSetupFailed };
@@ -419,8 +447,8 @@ pub const GpuWorld = struct {
         gw.lasso_poly.deinit(gw.gpa);
     }
 
-    fn uploadBytes() u32 {
-        return spawn_batch * @sizeOf(SpawnRec) + max_poly * @sizeOf(L.Vec2) + max_blasts * @sizeOf(Blast);
+    fn uploadBytes(batch: u32) u32 {
+        return batch * @sizeOf(SpawnRec) + max_poly * @sizeOf(L.Vec2) + max_blasts * @sizeOf(Blast);
     }
 
     fn zeroBuffer(gw: *GpuWorld, buf: Buffer, size: u32) Error!void {
@@ -464,7 +492,7 @@ pub const GpuWorld = struct {
     }
 
     /// Queues one ball with world.spawnBall's random properties; it reaches the GPU on a later
-    /// tick (at most spawn_batch per tick). Its area counts towards the play area immediately.
+    /// tick (at most `spawn_batch` per tick). Its area counts towards the play area immediately.
     pub fn queueBall(gw: *GpuWorld, w: *world.World, x: f32, y: f32) !void {
         const nb = world.randomBall(w.prng.random(), w.current_level);
         try gw.pending.append(gw.gpa, nb);
@@ -890,9 +918,9 @@ pub const GpuWorld = struct {
         const up: [*]u8 = @ptrCast(c.SDL_MapGPUTransferBuffer(gw.dev, gw.upload_tb, true) orelse return gpuFail("SDL_MapGPUTransferBuffer (upload)"));
         const recs: [*]SpawnRec = @ptrCast(@alignCast(up));
         var n_spawn: u32 = 0;
-        while (n_spawn < spawn_batch and gw.pending_head < gw.pending.items.len) {
+        while (n_spawn < gw.spawn_batch and gw.pending_head < gw.pending.items.len) {
             const id = gw.free.pop() orelse blk: {
-                if (gw.count == L.max_balls) break;
+                if (gw.count == gw.capacity) break;
                 gw.count += 1;
                 break :blk gw.count - 1;
             };
@@ -923,13 +951,13 @@ pub const GpuWorld = struct {
             gw.pending_head = 0;
         }
         // Balls that found no slot (capacity full) are dropped; their area is given back.
-        if (gw.count == L.max_balls and gw.free.items.len == 0 and gw.pendingSpawns() > 0) {
+        if (gw.count == gw.capacity and gw.free.items.len == 0 and gw.pendingSpawns() > 0) {
             for (gw.pending.items[gw.pending_head..]) |nb| gw.total_area -= std.math.pi * nb.radius * nb.radius;
             gw.pending.clearRetainingCapacity();
             gw.pending_pos.clearRetainingCapacity();
             gw.pending_head = 0;
         }
-        const poly_off = spawn_batch * @sizeOf(SpawnRec);
+        const poly_off = gw.spawn_batch * @sizeOf(SpawnRec);
         const blast_off = poly_off + max_poly * @sizeOf(L.Vec2);
         const n_poly: u32 = if (gw.lasso_req) @intCast(gw.lasso_poly.items.len) else 0;
         if (n_poly > 0) @memcpy(@as([*]Vec2, @ptrCast(@alignCast(up + poly_off)))[0..n_poly], gw.lasso_poly.items);
@@ -1173,7 +1201,8 @@ pub const GpuWorld = struct {
         const cp = c.SDL_BeginGPUComputePass(cmd, null, 0, &binds, @intCast(rw.len));
         c.SDL_BindGPUComputePipeline(cp, gw.pipes.get(k));
         c.SDL_BindGPUComputeStorageBuffers(cp, 0, @ptrCast(ro.ptr), @intCast(ro.len));
-        c.SDL_DispatchGPUCompute(cp, groups, 1, 1);
+        const grid = L.dispatchGrid(groups);
+        c.SDL_DispatchGPUCompute(cp, grid[0], grid[1], 1);
         c.SDL_EndGPUComputePass(cp);
     }
 };
@@ -1304,6 +1333,49 @@ test "gpu world: spawn, merge, pick/grab/release, lasso, explosion" {
     gw.drain(&w);
     try std.testing.expectEqual(@as(u32, 3), gw.count);
     try std.testing.expectEqual(@as(u32, 2), gw.alive);
+}
+
+test "gpu world: balls past one dispatch row (2D dispatch) are simulated" {
+    _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SkipZigTest;
+    defer c.SDL_Quit();
+    const gfx = @import("gfx.zig");
+    var gpu = gfx.Gfx.init(.{ .window = null }) catch return error.SkipZigTest;
+    defer gpu.deinit();
+    const gpa = std.testing.allocator;
+    const n: u32 = L.dispatch_x * L.group_size + 5000;
+    // About 2.5 GB of GPU memory; a smaller device skips.
+    var gw = GpuWorld.initCap(gpa, gpu.dev, n) catch return error.SkipZigTest;
+    defer gw.deinit();
+    gw.profile_every = 0;
+    var w = world.World.init(gpa, 91);
+    defer w.deinit();
+    const in: Input = .{ .mutual_gravity = false, .merging = false, .random_explosions = false };
+
+    try gw.pending.ensureTotalCapacity(gpa, n);
+    try gw.pending_pos.ensureTotalCapacity(gpa, n);
+    for (0..n) |_| try gw.queueBall(&w, 0, 0);
+    gw.snapBounds(&w);
+    const r = w.prng.random();
+    const b = w.bounds;
+    for (gw.pending_pos.items, gw.pending.items) |*p, *nb| {
+        const m = nb.radius + cfg.wall;
+        p.* = .{ .x = b.x + m + r.float(f32) * (b.w - 2 * m), .y = b.y + m + r.float(f32) * (b.h - 2 * m) };
+        nb.vx = 1;
+        nb.vy = 0;
+        nb.gravity = 0;
+    }
+    var start: [4]Vec2 = undefined;
+    @memcpy(&start, gw.pending_pos.items[n - 4 ..]);
+    while (gw.pendingSpawns() > 0) gw.tick(&w, in);
+    for (0..4) |_| gw.tick(&w, in);
+    gw.drain(&w);
+    try std.testing.expectEqual(n, gw.alive);
+    // The last ids (all in the second dispatch row) have moved, so integrate and finish reached
+    // them; contacts in the random fill may have pushed them any way, so only the distance counts.
+    var pos: [4]L.Vec2 = undefined;
+    try gw.sim.download(n - 4, .{ .pos = &pos });
+    for (pos, start) |p, s| try std.testing.expect(@abs(p.x - s.x) + @abs(p.y - s.y) > 0.5);
 }
 
 test "gpu world: conduction ignites a neighbour, burning balls emit particles and burn out" {

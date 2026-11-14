@@ -43,6 +43,8 @@ const Options = struct {
     elastic: bool = true,
     /// Print a full state sanity readback after the last frame.
     check: bool = false,
+    /// GPU ball capacity (--max-balls); null = the default, raised to fit a --galaxy body count.
+    max_balls: ?u32 = null,
 };
 
 const Game = struct {
@@ -407,6 +409,8 @@ fn parseOptions(args: []const [:0]const u8) Options {
             o.elastic = !std.mem.eql(u8, value, "off");
         } else if (std.mem.eql(u8, flag, "--check")) {
             o.check = std.mem.eql(u8, value, "on");
+        } else if (std.mem.eql(u8, flag, "--max-balls")) {
+            o.max_balls = std.fmt.parseInt(u32, value, 10) catch null;
         } else if (std.mem.eql(u8, flag, "--collide")) {
             o.collide = std.meta.stringToEnum(L.CollideMode, value);
         }
@@ -443,8 +447,15 @@ pub fn main(init: std.process.Init) !void {
     });
     defer gpu.deinit();
 
-    var gw = try gpu_world.GpuWorld.init(gpa, gpu.dev);
+    // Room for star systems spawned by clicks on top of a --galaxy load.
+    const galaxy_cap = if (opts.galaxy != null) opts.galaxy_n +| (1 << 16) else 0;
+    const capacity = opts.max_balls orelse @max(L.default_max_balls, galaxy_cap);
+    var gw = gpu_world.GpuWorld.initCap(gpa, gpu.dev, capacity) catch |e| {
+        std.debug.print("GPU world for {d} balls failed: {s}\n", .{ capacity, @errorName(e) });
+        return e;
+    };
     defer gw.deinit();
+    std.debug.print("capacity {d} balls: {d} MiB of GPU buffers, {d:.1} bytes/ball\n", .{ gw.capacity, gw.gpu_bytes >> 20, @as(f64, @floatFromInt(gw.gpu_bytes)) / @as(f64, @floatFromInt(gw.capacity)) });
 
     var g: Game = .{
         .gpa = gpa,
