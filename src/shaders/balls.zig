@@ -23,6 +23,13 @@ pub const Params = extern struct {
     max_burn: f32,
     /// Highest ball level; tile table index `tile_count - 1` is the basketball.
     max_level: f32,
+    /// ballVs: 1 = instance k draws ball list[k] (culled, LOD-split list from ball_cull.zig),
+    /// 0 = instance k draws ball k.
+    use_list: u32,
+    /// pointVs: vertex k draws ball list[list_top - k].
+    list_top: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
 };
 
 const V2Buf = extern struct { items: @SpirvType(.{ .runtime_array = L.Vec2 }) };
@@ -43,6 +50,7 @@ const state = sb(StateBuf, "state", 3);
 const heat_buf = sb(HeatBuf, "heat", 4);
 const meta = sb(MetaBuf, "meta", 5);
 const tiles = sb(TileBuf, "tiles", 6);
+const list = sb(MetaBuf, "list", 7);
 const p = @extern(*addrspace(.uniform) const Params, .{ .name = "p", .decoration = .{ .descriptor = .{ .set = 1, .binding = 0 } } });
 
 const out_uv = @extern(*addrspace(.output) @Vector(2, f32), .{ .name = "out_uv", .decoration = .{ .location = 0 } });
@@ -60,8 +68,41 @@ inline fn lerp(a: f32, b: f32, t: f32) f32 {
     return a + (b - a) * t;
 }
 
+/// Tile table index of a ball (the basketball once scored).
+inline fn tileOf(m: u32) u32 {
+    var level: f32 = @floatFromInt(m & 0xff);
+    level = @min(@max(level, 1.0), p.max_level);
+    return if (m & L.flag_scored != 0) @as(u32, @intFromFloat(p.max_level)) else @as(u32, @intFromFloat(level)) - 1;
+}
+
+/// Heat and char tint multiplied with the texel.
+inline fn tint(h: L.BallHeat) Vec4 {
+    const heat = @min(@max((h.temp - p.room_temp) / (p.ignition_temp - p.room_temp), 0.0), 1.0);
+    const char = 1.0 - @min(@max(h.burn / p.max_burn, 0.0), 1.0);
+    const gb = (1.0 - heat * 0.5) * char;
+    return .{ char, gb, gb, 1.0 };
+}
+
+/// A ball under cull_common.point_px on screen, as one pixel: the colour at its tile centre, which
+/// is what the sprite path's shrunken texture window sampled at that size.
+export fn pointVs() callconv(.spirv_vertex) void {
+    const id = list.items[p.list_top - spirv.vertex_index];
+    const m = meta.items[id];
+    const a = p.alpha;
+    const wx = lerp(prev_pos.items[id].x, pos.items[id].x, a);
+    const wy = lerp(prev_pos.items[id].y, pos.items[id].y, a);
+    const px = p.ox + (wx - p.bx) * p.scale;
+    const py = p.oy + (wy - p.by) * p.scale;
+    spirv.position_out.* = .{ px / p.view_w * 2.0 - 1.0, 1.0 - py / p.view_h * 2.0, 0.0, 1.0 };
+    // Vulkan leaves the size of a point undefined unless the shader writes it.
+    spirv.point_size_out.* = 1.0;
+    const uv = tiles.items[tileOf(m)];
+    out_uv.* = .{ (uv[0] + uv[2]) * 0.5, (uv[1] + uv[3]) * 0.5 };
+    out_color.* = tint(heat_buf.items[id]);
+}
+
 export fn ballVs() callconv(.spirv_vertex) void {
-    const id = spirv.instance_index;
+    const id = if (p.use_list != 0) list.items[spirv.instance_index] else spirv.instance_index;
     const m = meta.items[id];
     if (m & L.flag_alive == 0) {
         spirv.position_out.* = .{ 0, 0, 0, 1 };
@@ -97,10 +138,7 @@ export fn ballVs() callconv(.spirv_vertex) void {
     const py = p.oy + (wy - p.by) * p.scale - lx * sn + ly * cs;
     spirv.position_out.* = .{ px / p.view_w * 2.0 - 1.0, 1.0 - py / p.view_h * 2.0, 0.0, 1.0 };
 
-    var level: f32 = @floatFromInt(m & 0xff);
-    level = @min(@max(level, 1.0), p.max_level);
-    const tile: u32 = if (m & L.flag_scored != 0) @as(u32, @intFromFloat(p.max_level)) else @as(u32, @intFromFloat(level)) - 1;
-    const uv = tiles.items[tile];
+    const uv = tiles.items[tileOf(m)];
     var uv0 = uv[0];
     var uv1 = uv[1];
     var uv2 = uv[2];
@@ -124,8 +162,5 @@ export fn ballVs() callconv(.spirv_vertex) void {
         out_color.* = .{ h.temp, h.burn, h._pad0, h._pad1 };
         return;
     }
-    const heat = @min(@max((h.temp - p.room_temp) / (p.ignition_temp - p.room_temp), 0.0), 1.0);
-    const char = 1.0 - @min(@max(h.burn / p.max_burn, 0.0), 1.0);
-    const gb = (1.0 - heat * 0.5) * char;
-    out_color.* = .{ char, gb, gb, 1.0 };
+    out_color.* = tint(h);
 }

@@ -478,6 +478,14 @@ pub const GpuWorld = struct {
         return .{ .pos = gw.sim.pos, .prev_pos = gw.sim.prev_pos, .body = gw.sim.body, .state = gw.sim.state, .heat = gw.heat, .meta = gw.sim.meta };
     }
 
+    /// A u32-per-ball buffer the renderer may overwrite between ticks (gfx.BallPass.lod_list): the
+    /// solver's ball_cell, which each tick's integrate pass rewrites before anything reads it and
+    /// which no pass reads after the tick, so the cull list costs no memory of its own (4 B/ball,
+    /// 320 MB at 80M balls).
+    pub fn renderScratch(gw: *const GpuWorld) Buffer {
+        return gw.sim.ball_cell;
+    }
+
     /// Ring slots worth drawing for each pool: the emitted high-water mark (counters are about two
     /// ticks old, so a margin covers what has been emitted since).
     pub fn poolDrawCounts(gw: *const GpuWorld) struct { fire: u32, ash: u32 } {

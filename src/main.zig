@@ -45,7 +45,12 @@ const Options = struct {
     check: bool = false,
     /// GPU ball capacity (--max-balls); null = the default, raised to fit a --galaxy body count.
     max_balls: ?u32 = null,
+    /// GPU culling and points for sub-pixel balls. `compare` also saves the last frame drawn
+    /// without them to `<screenshot>.lodoff.bmp` (same state, no tick between), for A/B checks.
+    lod: Lod = .on,
 };
+
+const Lod = enum { on, off, compare };
 
 const Game = struct {
     gpa: std.mem.Allocator,
@@ -239,6 +244,7 @@ const Game = struct {
             c.SDLK_N => g.merging = !g.merging,
             c.SDLK_P => g.show_perf = !g.show_perf,
             c.SDLK_R => g.renderer.trails = !g.renderer.trails,
+            c.SDLK_L => g.renderer.lod = !g.renderer.lod,
             c.SDLK_T => g.stress(stress_count),
             c.SDLK_PLUS, c.SDLK_EQUALS, c.SDLK_KP_PLUS => g.balls_per_click += step,
             c.SDLK_MINUS, c.SDLK_KP_MINUS => g.balls_per_click = @max(1, g.balls_per_click -| step),
@@ -357,6 +363,7 @@ fn gpuBalls(gw: *const gpu_world.GpuWorld, max_level: u8) render.GpuBalls {
         .fire = poolView(&gw.fire, draw.fire),
         .ash = poolView(&gw.ash, draw.ash),
         .pool_tiles = gw.pool_tiles,
+        .lod_list = gw.renderScratch(),
         .burning = gw.stats.burning,
         .particles = gw.stats.particles,
         .ashes = gw.stats.ashes,
@@ -409,6 +416,8 @@ fn parseOptions(args: []const [:0]const u8) Options {
             o.elastic = !std.mem.eql(u8, value, "off");
         } else if (std.mem.eql(u8, flag, "--check")) {
             o.check = std.mem.eql(u8, value, "on");
+        } else if (std.mem.eql(u8, flag, "--lod")) {
+            o.lod = std.meta.stringToEnum(Lod, value) orelse .on;
         } else if (std.mem.eql(u8, flag, "--max-balls")) {
             o.max_balls = std.fmt.parseInt(u32, value, 10) catch null;
         } else if (std.mem.eql(u8, flag, "--collide")) {
@@ -479,6 +488,7 @@ pub fn main(init: std.process.Init) !void {
     g.collide_explicit = opts.collide != null;
     g.galaxy_n = opts.galaxy_n;
     g.renderer.zoom = std.math.clamp(opts.zoom, render.Renderer.zoom_min, render.Renderer.zoom_max);
+    g.renderer.lod = opts.lod != .off;
     if (opts.galaxy) |s| {
         g.enterGalaxy(s);
         // --zoom is relative to the galaxy fit, so one value gives the same view at any body count.
@@ -584,6 +594,12 @@ pub fn main(init: std.process.Init) !void {
                 steady_render_n += 1;
             }
         }
+        if (done and opts.lod == .compare) if (opts.screenshot) |path| {
+            const off_path = try std.fmt.allocPrintSentinel(init.arena.allocator(), "{s}.lodoff.bmp", .{path}, 0);
+            g.renderer.lod = false;
+            g.renderer.draw(&g.w, @floatCast(accumulator / tick_seconds), &hud);
+            g.renderer.presentWait(off_path.ptr, false);
+        };
         if (done) {
             std.debug.print("steady (2nd half): frame_ms={d:.3} render_gpu_ms={d:.3} (samples {d})\n", .{ steady_frame_s * 1000 / @as(f64, @floatFromInt(@max(steady_frames, 1))), steady_render_ms / @as(f64, @floatFromInt(@max(steady_render_n, 1))), steady_render_n });
             std.debug.print("frames={d} balls={d} ids={d} queued={d} max_level={d} merges={d} fps={d:.1} tick_ms={d:.3} render_ms={d:.3} gpu_gravity_ms={d:.3} gpu_collide_ms={d:.3} gpu_game_ms={d:.3} (samples {d}) burning={d} particles={d} ashes={d}\n", .{ frame + 1, gw.alive, gw.count, gw.pendingSpawns(), g.w.current_level, g.merges_total, g.perf.fps, g.perf.tick_ms, g.perf.render_ms, g.perf.gpu_gravity_ms, g.perf.gpu_collide_ms, g.perf.gpu_game_ms, gw.profile.samples, gw.stats.burning, gw.stats.particles, gw.stats.ashes });

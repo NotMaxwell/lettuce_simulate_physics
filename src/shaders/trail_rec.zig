@@ -5,6 +5,12 @@ const spirv = std.spirv;
 const L = @import("gpu_layout");
 const T = @import("trail_common.zig");
 
+// The ball cull kernels share this compute module because shader modules are listed in build.zig
+// (lead-owned); they would be their own module otherwise.
+comptime {
+    _ = @import("ball_cull.zig");
+}
+
 const Pos = extern struct { v: @SpirvType(.{ .runtime_array = L.Vec2 }) };
 const Meta = extern struct { v: @SpirvType(.{ .runtime_array = L.BallMeta }) };
 
