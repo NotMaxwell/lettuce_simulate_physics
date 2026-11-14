@@ -489,6 +489,7 @@ pub const Sim3 = struct {
     pub fn run(s: *Sim3, ticks: u64) Error!void {
         const depth: usize = if (s.cfg.n > whole_kick_max) 1 else status_slots;
         var fences: [status_slots]?*c.SDL_GPUFence = @splat(null);
+        errdefer s.drain(&fences);
         for (0..ticks) |k| {
             const slot = k % depth;
             if (fences[slot]) |f| {
@@ -532,14 +533,21 @@ pub const Sim3 = struct {
     /// Diagnostics at synchronous velocities (blocking). The force pass that completes the pending
     /// half kick also yields the potentials and |a|; with nothing pending it runs with a zero kick.
     pub fn measure(s: *Sim3) Error!Diag3 {
-        var cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
-        s.status_slot = 0;
-        cmd = try s.recordForce(cmd, if (s.half_pending) 0 else 0.5, L.sim3_flag_potential);
+        const factor: f32 = if (s.half_pending) 0 else 0.5;
         s.half_pending = true;
-        s.recordDiag(cmd);
-        try submitWait(s.dev, cmd);
-        s.noteStatus(0);
-        if (s.overflow_pending) try s.regrow();
+        // An overflowed build gives zero force, hence no kick and a wrong potential. The state is
+        // unchanged by it, so the evaluation is repeated after the regrow (a node capacity of 2n
+        // cannot overflow, which bounds the loop).
+        for (0..4) |_| {
+            var cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
+            s.status_slot = 0;
+            cmd = try s.recordForce(cmd, factor, L.sim3_flag_potential);
+            s.recordDiag(cmd);
+            try submitWait(s.dev, cmd);
+            s.noteStatus(0);
+            if (!s.overflow_pending) break;
+            try s.regrow();
+        }
         const diag_bytes = s.diag_groups * diag_stride * 4;
         const m: [*]const u8 = @ptrCast(c.SDL_MapGPUTransferBuffer(s.dev, s.download, false) orelse return error.GpuBuffer);
         defer c.SDL_UnmapGPUTransferBuffer(s.dev, s.download);

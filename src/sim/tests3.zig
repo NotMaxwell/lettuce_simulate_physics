@@ -342,3 +342,14 @@ test "sim3 tree: node overflow regrows the tree and the run continues with real 
     const d = try s.measure();
     try std.testing.expect(@abs(d.virial() - 1) <= 0.1);
 }
+
+test "sim3 tree: a measurement whose tree overflows is repeated after the regrow" {
+    const dev = try device();
+    defer c.SDL_DestroyGPUDevice(dev);
+    const gpa = std.testing.allocator;
+    var s = try treeSim(dev, gpa, 20_000, .tree, 200);
+    defer s.deinit();
+    const d = try s.measure();
+    try std.testing.expectEqual(@as(u32, 1), s.regrows);
+    try std.testing.expect(@abs(d.virial() - 1) <= 0.1);
+}
