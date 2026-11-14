@@ -23,13 +23,13 @@ comptime {
     for (@typeInfo(L.NodeQuad).@"struct".field_names) |f| std.debug.assert(@offsetOf(L.NodeQuad, f) == @offsetOf(ref3.NodeQuad, f));
 }
 
-/// Workgroup sizes with an entry point in k3/walk.zig (`walk<size>`).
+/// Workgroup sizes with an entry point in k3/walk.zig (`walk<size>`), ascending.
 pub const group_sizes = [_]u32{ 64, 128, 256, 512, 1024 };
 
 /// Measured on an RX 7800 XT (walk3_tests timing table): 1024 is 12% faster than 256 from 1M bodies
 /// up, presumably because a workgroup's Morton-adjacent bodies share one CU's cache; at 100k the
 /// big groups leave CUs idle and 256 wins.
-pub fn autoGroupSize(n: u32) u32 {
+pub fn preferredGroupSize(n: u32) u32 {
     return if (n >= 1 << 19) 1024 else 256;
 }
 
@@ -52,15 +52,20 @@ pub const Bindings = struct { pos: Buffer, mass: Buffer, nodes: Buffer, quads: B
 
 pub const Walk3 = struct {
     dev: *c.SDL_GPUDevice,
-    pipes: [group_sizes.len]*c.SDL_GPUComputePipeline,
+    /// Null where the device refused that workgroup size.
+    pipes: [group_sizes.len]?*c.SDL_GPUComputePipeline,
     /// 0 picks autoGroupSize(n).
     group_size: u32 = 0,
     chunk: u32 = chunk_bodies,
 
+    /// SDL_GPU exposes no device limits (maxComputeWorkGroupSize/Invocations), so each size is
+    /// created on its own and the ones the driver accepts are kept. Vulkan guarantees 128
+    /// invocations; larger sizes rely on the driver rejecting what it cannot run.
     pub fn init(dev: *c.SDL_GPUDevice) Error!Walk3 {
-        var infos: [group_sizes.len]c.SDL_GPUComputePipelineCreateInfo = undefined;
-        inline for (group_sizes, &infos) |gs, *info| {
-            info.* = .{
+        var w: Walk3 = .{ .dev = dev, .pipes = @splat(null) };
+        var any = false;
+        inline for (group_sizes, &w.pipes) |gs, *p| {
+            p.* = c.SDL_CreateGPUComputePipeline(dev, &.{
                 .code_size = walk_spv.len,
                 .code = walk_spv.ptr,
                 .entrypoint = std.fmt.comptimePrint("walk{d}", .{gs}),
@@ -71,18 +76,32 @@ pub const Walk3 = struct {
                 .threadcount_x = gs,
                 .threadcount_y = 1,
                 .threadcount_z = 1,
-            };
+            });
+            if (p.* == null) std.log.warn("walk3: workgroup size {d} unavailable: {s}", .{ gs, c.SDL_GetError() }) else any = true;
         }
-        var made: [group_sizes.len]?*c.SDL_GPUComputePipeline = undefined;
-        if (!@import("gpu_sim").createComputePipelines(dev, &infos, &made)) return error.GpuPipeline;
-        var w: Walk3 = .{ .dev = dev, .pipes = undefined };
-        for (&w.pipes, made) |*p, m| p.* = m.?;
+        if (!any) return error.GpuPipeline;
         return w;
     }
 
     pub fn deinit(w: *Walk3) void {
-        for (w.pipes) |p| c.SDL_ReleaseGPUComputePipeline(w.dev, p);
+        for (w.pipes) |p| if (p) |q| c.SDL_ReleaseGPUComputePipeline(w.dev, q);
         w.* = undefined;
+    }
+
+    pub fn available(w: *const Walk3, gs: u32) bool {
+        for (group_sizes, w.pipes) |s, p| if (s == gs) return p != null;
+        return false;
+    }
+
+    /// preferredGroupSize(n), or the largest available size below it, or the smallest available.
+    pub fn autoGroupSize(w: *const Walk3, n: u32) u32 {
+        const want = preferredGroupSize(n);
+        var best: u32 = 0;
+        for (group_sizes, w.pipes) |s, p| {
+            if (p == null) continue;
+            if (best == 0 or s <= want) best = s;
+        }
+        return best;
     }
 
     /// Records the kick of bodies [0, k.n) into `cmd0`, one chunk of `w.chunk` bodies per command
@@ -90,9 +109,9 @@ pub const Walk3 = struct {
     /// ranges and later passes are ordered after them by SDL_GPU's pass barriers); the returned
     /// command buffer holds the last chunk and is the caller's to submit.
     pub fn record(w: *Walk3, cmd0: *c.SDL_GPUCommandBuffer, b: Bindings, k: Kick) Error!*c.SDL_GPUCommandBuffer {
-        const gs = if (w.group_size == 0) autoGroupSize(k.n) else w.group_size;
-        const pi = for (group_sizes, 0..) |s, i| {
-            if (s == gs) break i;
+        const gs = if (w.group_size == 0) w.autoGroupSize(k.n) else w.group_size;
+        const pipe = for (group_sizes, w.pipes) |s, p| {
+            if (s == gs) break p orelse return error.OutOfRange;
         } else return error.OutOfRange;
         var cmd = cmd0;
         var first: u32 = 0;
@@ -112,7 +131,7 @@ pub const Walk3 = struct {
             c.SDL_PushGPUComputeUniformData(cmd, 0, &p, @sizeOf(L.WalkParams3));
             const rw = [3]c.SDL_GPUStorageBufferReadWriteBinding{ .{ .buffer = b.vel }, .{ .buffer = b.amag }, .{ .buffer = b.pot } };
             const cp = c.SDL_BeginGPUComputePass(cmd, null, 0, &rw, rw.len);
-            c.SDL_BindGPUComputePipeline(cp, w.pipes[pi]);
+            c.SDL_BindGPUComputePipeline(cp, pipe);
             const ro = [4]?*c.SDL_GPUBuffer{ b.pos, b.mass, b.nodes, b.quads };
             c.SDL_BindGPUComputeStorageBuffers(cp, 0, &ro, ro.len);
             const groups = (count + gs - 1) / gs;

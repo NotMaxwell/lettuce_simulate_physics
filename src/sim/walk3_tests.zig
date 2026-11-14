@@ -171,6 +171,7 @@ test "walk3: 10k Plummer at theta 0.6 matches direct sum and the ref3 walk, reru
 
     // Reruns, other workgroup sizes and other chunkings give the same bits.
     for (walk3.group_sizes) |gs| for ([_]u32{ walk3.chunk_bodies, 999 }) |chunk| {
+        if (!rig.w.available(gs)) continue;
         rig.w.group_size = gs;
         rig.w.chunk = chunk;
         const again = try rig.forces(gpa, eps);
@@ -215,6 +216,63 @@ fn timeWalk(rig: *Rig, eps: f32, reps: u32) !f64 {
         if (k > 0) best = @min(best, ms);
     }
     return best;
+}
+
+test "walk3: two tight clumps 0.5 to 40 softening lengths apart match direct sum" {
+    const dev = try device();
+    defer c.SDL_DestroyGPUDevice(dev);
+    const gpa = testing.allocator;
+    // ref3's clump test geometry: 2 x 400 unit masses in cubes of side 0.2 eps.
+    const eps = 1e-4;
+    const per = 400;
+    for ([_]f64{ 0.5, 1, 3, 4, 10, 40 }) |sep| {
+        var pos: [2 * per]ref3.Pos3 = undefined;
+        var mass: [2 * per]f32 = undefined;
+        var prng = std.Random.DefaultPrng.init(5);
+        const r = prng.random();
+        for (&pos, &mass, 0..) |*p, *m, i| {
+            const cx: f64 = if (i < per) 0.3 else 0.3 + sep * eps;
+            const q = struct {
+                fn f(cc: f64, j: f64) u32 {
+                    return @intFromFloat((cc + (j - 0.5) * 2e-5) * 4294967296.0);
+                }
+            }.f;
+            p.* = .{ .x = q(cx, r.float(f64)), .y = q(0.5, r.float(f64)), .z = q(0.5, r.float(f64)) };
+            m.* = 1;
+        }
+        const tree = try ref3.build(gpa, &pos, &mass, .{ .box = 1, .theta = 0.6 });
+        defer tree.deinit(gpa);
+        var rig = try Rig.init(dev, tree);
+        defer rig.deinit();
+        const out = try rig.forces(gpa, eps);
+        defer out.deinit(gpa);
+        var worst: f64 = 0;
+        for (out.acc, tree.perm) |a, o| worst = @max(worst, relErr(a, ref3.directAt(&pos, &mass, 1, pos[o], o, 1, eps).a));
+        std.debug.print("walk3 clumps {d} eps apart: max rel error vs direct {e:.2}\n", .{ sep, worst });
+        try testing.expect(worst < 1e-3);
+    }
+}
+
+test "walk3: auto group size clamps to the sizes the device accepted" {
+    const dev = try device();
+    defer c.SDL_DestroyGPUDevice(dev);
+    var w = try walk3.Walk3.init(dev);
+    defer w.deinit();
+    // A copy with sizes knocked out, as a device with smaller limits would leave it (not released).
+    var v = w;
+    try testing.expectEqual(@as(u32, 256), v.autoGroupSize(1000));
+    v.pipes[4] = null;
+    try testing.expectEqual(@as(u32, 512), v.autoGroupSize(1 << 20));
+    v.pipes[3] = null;
+    v.pipes[2] = null;
+    try testing.expectEqual(@as(u32, 128), v.autoGroupSize(1000));
+    v.pipes[0] = null;
+    v.pipes[1] = null;
+    v.pipes[2] = w.pipes[2];
+    try testing.expectEqual(@as(u32, 256), v.autoGroupSize(1 << 20));
+    v.pipes[2] = null;
+    v.pipes[4] = w.pipes[4];
+    try testing.expectEqual(@as(u32, 1024), v.autoGroupSize(1000));
 }
 
 test "walk3: timing table (WALK3_BENCH=sizes)" {
@@ -264,6 +322,7 @@ test "walk3: timing table (WALK3_BENCH=sizes)" {
             n, build_ms, @as(f64, @floatFromInt(tree.nodes.len)) / @as(f64, @floatFromInt(n)), visits, @as(f64, @floatFromInt(st.cells)) / fs, @as(f64, @floatFromInt(st.pairs)) / fs, worst,
         });
         for (walk3.group_sizes) |gs| {
+            if (!rig.w.available(gs)) continue;
             rig.w.group_size = gs;
             const ms = try timeWalk(&rig, eps, 5);
             const nf: f64 = @floatFromInt(n);
@@ -272,7 +331,7 @@ test "walk3: timing table (WALK3_BENCH=sizes)" {
             });
         }
         // One unchunked dispatch of more than 32768 groups exercises the 2D group index.
-        if (n > 32768 * 64) {
+        if (n > 32768 * 64 and rig.w.available(64)) {
             rig.w.group_size = 64;
             rig.w.chunk = n;
             const whole = try rig.forces(gpa, eps);
@@ -287,23 +346,33 @@ test "walk3: timing table (WALK3_BENCH=sizes)" {
 
 test "walk3: 100k Plummer energy over 200 ticks with a CPU tree per tick (WALK3_ENERGY=1)" {
     _ = envSet("WALK3_ENERGY") orelse return error.SkipZigTest;
-    const dev = try device();
-    defer c.SDL_DestroyGPUDevice(dev);
-    const gpa = std.heap.smp_allocator;
     const n: u32 = if (envSet("WALK3_ENERGY_N")) |s| try std.fmt.parseInt(u32, s, 10) else 100_000;
     const ticks: u32 = if (envSet("WALK3_ENERGY_TICKS")) |s| try std.fmt.parseInt(u32, s, 10) else 200;
     const eps: f32 = if (envSet("WALK3_ENERGY_EPS")) |s| try std.fmt.parseFloat(f32, s) else 0.01;
+    try testing.expect(@abs(try energyRun(n, ticks, eps)) <= 1e-5);
+}
+
+test "walk3: 10k Plummer energy over 50 ticks with a CPU tree per tick" {
+    // Measured: tree 6.8e-6; direct sum on the same bodies (`zig build sim -- --dim 3 --n 10000
+    // --ticks 50`) -1.1e-5, i.e. leapfrog truncation dominates. 5e-5 is 4x the integrator error and
+    // 7x the tree run.
+    const de = try energyRun(10_000, 50, 0.01);
+    try testing.expect(@abs(de) <= 5e-5);
+}
+
+/// dE/E0 of a Plummer sphere (the sim.s seed 1, margin 4, dt 0.01, theta 0.6) integrated with a
+/// kick-drift-kick leapfrog, the tree rebuilt on the CPU by ref3 every tick.
+fn energyRun(n: u32, ticks: u32, eps: f32) !f64 {
+    const dev = try device();
+    defer c.SDL_DestroyGPUDevice(dev);
+    const gpa = std.heap.smp_allocator;
     const dt: f32 = 0.01;
     const theta = 0.6;
-    // The sim.s seed and eps, so `zig build sim -- --dim 3 --n 100000 --ticks 200` is a direct-sum
-    // baseline for the same bodies. The box is computed here (an origin-centred cube, 4x the extent)
-    // rather than taken from ic3, whose Box is changing on gpu-physics.
+    // Same bodies and box as `zig build sim -- --dim 3 --n N --ticks K`, the direct-sum baseline.
     var prng = std.Random.DefaultPrng.init(1);
     const bodies = try ic3.plummer(gpa, prng.random(), n, .{});
     defer gpa.free(bodies);
-    var extent: f64 = 0;
-    for (bodies) |b| extent = @max(extent, @abs(b.x), @abs(b.y), @abs(b.z));
-    const box_size = 8 * extent;
+    const box_size = ic3.fitBox(bodies, 4).size;
     const pos = try gpa.alloc(ref3.Pos3, n);
     defer gpa.free(pos);
     const vel = try gpa.alloc(L.Vel3, n);
@@ -344,6 +413,7 @@ test "walk3: 100k Plummer energy over 200 ticks with a CPU tree per tick (WALK3_
     var walk_ms: f64 = 0;
     var build_ms: f64 = 0;
     // Kick-drift-kick; tick 0 is the opening half kick, the last tick ends with a half kick.
+    var result: f64 = 0;
     for (0..ticks + 1) |t| {
         if (t > 0) for (pos, vel) |*p, v| {
             p.* = .{ .x = drift(p.x, v.x * drift_q), .y = drift(p.y, v.y * drift_q), .z = drift(p.z, v.z * drift_q) };
@@ -382,10 +452,11 @@ test "walk3: 100k Plummer energy over 200 ticks with a CPU tree per tick (WALK3_
                 std.debug.print("walk3 energy: n={d} eps={d} dt={d} theta {d:.1}, {d} ticks: E0 {d:.6} E {d:.6} dE/E0 {e:.3}; 2K/|W| {d:.4} -> {d:.4}; CPU build {d:.1} ms/tick, GPU walk {d:.2} ms/tick\n", .{
                     n, eps, dt, theta, ticks, ez, e, (e - ez) / @abs(ez), 2 * e0.k / @abs(e0.w), 2 * k / @abs(pe), build_ms / @as(f64, @floatFromInt(ticks + 1)), walk_ms / @as(f64, @floatFromInt(ticks + 1)),
                 });
-                try testing.expect(@abs(e - ez) <= 1e-5 * @abs(ez));
+                result = (e - ez) / @abs(ez);
             }
         }
     }
+    return result;
 }
 
 fn kinetic(vel: []const L.Vel3, mass: []const f32) f64 {
