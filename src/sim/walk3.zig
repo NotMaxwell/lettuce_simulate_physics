@@ -2,8 +2,12 @@
 //! tree built on the CPU by ref3.build (the GPU build, work package 4, must produce the same bytes).
 //!
 //! Bindings, in order. Read-only: pos (sorted), mass (sorted), nodes, quads, tree3 status words.
-//! Read-write: vel, amag, pot (all three per sorted body). Flags are gpu_layout's sim3_flag_*: store_accel writes the
-//! acceleration into vel instead of kicking, potential fills pot.
+//! Read-write: vel, amag, pot (all three per sorted body). Flags are gpu_layout's sim3_flag_*:
+//! store_accel writes the acceleration into vel instead of kicking, potential fills pot.
+//!
+//! Two walks (Mode): the group walk (default, ref3.Tree.walkGroups) and the per-body walk
+//! (ref3.Tree.walk). Both are pure functions of the tree and the bodies; the group walk's results
+//! depend on group_bodies but not on chunking.
 const std = @import("std");
 const c = @import("c");
 const L = @import("gpu_layout");
