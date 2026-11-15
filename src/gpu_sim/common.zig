@@ -30,8 +30,9 @@ pub const Params = L.SimParams;
 
 pub const params = uniform(Params, 0, "params");
 
+/// Flat thread id of a dispatch that may be 2D (gpu_layout dispatch_x); y is 0 below that size.
 pub inline fn gid() u32 {
-    return spirv.global_invocation_id[0];
+    return spirv.global_invocation_id[0] + spirv.global_invocation_id[1] * (L.dispatch_x * L.group_size);
 }
 
 pub inline fn lid() u32 {

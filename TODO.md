@@ -55,10 +55,17 @@ Today (RX 7800 XT): 1M balls 2.39 ms/tick with gravity, 1.48 ms without; 100k 0.
 galaxy disk 1M 13.8 ms/tick (gravity 12.7).
 1. [ ] Profile per pass at 1M/4M/16M (GPU timestamps, not blocking samples) and publish the table
        in the perf overlay and `zig build bench`.
-2. [ ] Raise `max_balls` (1 << 20 today) to what VRAM allows; find the real per-ball byte cost.
+2. [x] Runtime capacity `--max-balls N` (default 1 << 20), 2D dispatch above 32768 groups
+       (2026-11-15). Galaxy disk runs at 80M on the RX 7800 XT (16.08 of 16.37 GB, as reported by
+       the agent; 96M spills). Per-pass GPU timestamps (item 1) not done. A bad `--max-balls` exits 2;
+       a value above the limit (268435455) warns and is clamped.
 3. [ ] Kernel work: fuse passes, Morton/Hilbert ordering for locality, indirect dispatch sized on
        the GPU, no per-tick CPU readback that scales with N.
-4. [ ] Rendering at scale: point sprites / density splatting for sub-pixel bodies, LOD, culling.
+4. [x] GPU culling and points for sub-pixel balls (`--lod`, key L), 2026-11-15. render_gpu ms,
+       before -> after, min of 3: 1M zoom 1 0.96 -> 0.43, zoom 300 0.69 -> 0.33; 80M zoom 1
+       68.4 -> 29.6, zoom 300 39.2 -> 15.0. Bench 100k unchanged (0.442 ms/tick). Points draw
+       before sprites; a sub-pixel ball centred just off-screen can lose its edge dot. Only
+       checked headless. Density splatting not done.
 
 ## Sim version: headless matter simulation (`zig build sim`)
 End goal: simulate small-universe matter, ~1-2B bodies, on the Alabama supercomputer (student
@@ -75,8 +82,12 @@ Decisions for the user (block the phases marked):
      KDK, diagnostics, snapshots (`--dim 3`); WP1 ref3 CPU reference; WP3 GPU sort (1M 2.0 ms, 16M
      33 ms); WP4 GPU tree build (1M 2.0 ms, 16M 12.7 ms, 14 B/body + sort scratch); WP5 GPU walk
      (θ=0.6: 1M 48 ms, 16M 857 ms; softened monopole+quad, 3-eps guard); WP6 snapshot v2 +
-     projection. In progress: `--method tree` integration (branch s3-integrate). Not started: WP7
-     CUDA/PTX backend (waiting on cluster info), WP8 scale table.
+     projection; `--method tree` (sort, tree build, walk every tick; auto = tree above 50k bodies,
+     overflow regrow, restart bit-identical; 1M Plummer 1000 ticks |dE/E0| 2.9e-6). Tree ms/tick
+     on the RX 7800 XT: 1M 63 · 4M 237 · 16M 1065 · 64M 6498 · 128M 20148 · 228M 57419; 66.5 B/body,
+     248M runs, 256M loses the device (VRAM suspected, unconfirmed). The walk is 98% of the tick and
+     its cost per body rises from 62 ns (1M) to 250 ns (228M). In progress: walk optimisation
+     (branch walk-opt). Not started: WP7 CUDA/PTX backend (waiting on cluster info).
 - D2 Cluster: Alabama Supercomputer Center (docs https://hpcdocs.asc.edu/, being researched); which system, which GPUs, is Vulkan usable on compute nodes (else a CUDA/OpenCL backend),
      scheduler (Slurm?), GPUs per job, walltime, storage quota. On a compute node:
      `nvidia-smi`, `vulkaninfo --summary`, `sinfo`. Blocks 10+.

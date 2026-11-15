@@ -58,6 +58,8 @@ pub const Gravity = struct {
     /// Submit the command buffer in pieces (box+bin, tree build, evaluate) so no single submission
     /// nears the driver's job watchdog at 100M+ bodies. Only `applyAutoBox` honours it.
     split_submit: bool = false,
+    /// Total size of the solver's own buffers (the caller's pos/body/vel excluded).
+    bytes: u64 = 0,
 
     pub fn init(device: *c.SDL_GPUDevice, capacity: u32) Error!Gravity {
         var g: Gravity = undefined;
@@ -65,6 +67,9 @@ pub const Gravity = struct {
         g.capacity = @min(capacity, max_capacity);
         g.max_leaf_level = @min(K.max_level, leafLevelFor(g.capacity, 1.0, K.max_level) + 1);
         g.last_leaf_level = 0;
+        // `undefined` above does not apply the field defaults.
+        g.last_samples = 0;
+        g.split_submit = false;
         const names = @typeInfo(Kernel).@"enum".field_names;
         var infos: [names.len]c.SDL_GPUComputePipelineCreateInfo = undefined;
         inline for (names, &infos) |name, *info| {
@@ -98,6 +103,8 @@ pub const Gravity = struct {
         errdefer c.SDL_ReleaseGPUBuffer(device, g.mpole);
         g.local_slots = pyramid * K.order;
         g.local = try makeBuffer(device, pyramid * K.order * @sizeOf(L.Vec2));
+        g.bytes = @as(u64, g.box_word + K.diag_result_offset + K.diag_result_words) * 4 +
+            @as(u64, g.capacity) * scratch_bytes_per_body + 2 * @as(u64, pyramid) * K.order * @sizeOf(L.Vec2);
         return g;
     }
 

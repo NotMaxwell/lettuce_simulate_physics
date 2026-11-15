@@ -11,7 +11,10 @@ const font = @import("font.zig");
 pub const Perf = struct {
     fps: f32 = 0,
     tick_ms: f32 = 0,
+    /// CPU time to record the frame.
     render_ms: f32 = 0,
+    /// GPU time of one frame drawn alone (blocking sample, see main.zig render_sample_every).
+    gpu_render_ms: f32 = 0,
     /// GPU stage times from gpu_world's blocking samples (0 = no GPU world).
     gpu_gravity_ms: f32 = 0,
     gpu_collide_ms: f32 = 0,
@@ -47,6 +50,9 @@ pub const GpuBalls = struct {
     ash: ?GpuPool = null,
     /// One-entry tile table for the pools (uv 0..1 over the white texture).
     pool_tiles: ?*c.SDL_GPUBuffer = null,
+    /// Scratch the ball draw may use for its culled id list (gfx.BallPass.lod_list); null draws
+    /// every id as a sprite.
+    lod_list: ?*c.SDL_GPUBuffer = null,
     /// Counters from the GPU fire system (about two ticks old).
     burning: u32 = 0,
     particles: u32 = 0,
@@ -328,6 +334,8 @@ pub const Renderer = struct {
     tris: Batch = .{},
     /// GPU-ball trails (shown before the balls); toggled by the caller.
     trails: bool = false,
+    /// GPU culling and points for sub-pixel balls (false: every id as a sprite, the old path).
+    lod: bool = true,
     trails_was_on: bool = false,
     trail_last_tick: ?u64 = null,
     cam: Camera = .{},
@@ -421,7 +429,9 @@ pub const Renderer = struct {
     }
 
     pub const zoom_min: f32 = 0.05;
-    pub const zoom_max: f32 = 20;
+    /// Galaxy play areas are many times the bodies' extent, so the fit view needs a deep zoom to
+    /// reach single bodies.
+    pub const zoom_max: f32 = 2000;
 
     /// Makes `p` the base of the view focus (call every frame to track it). Pan is kept as an offset.
     pub fn follow(self: *Renderer, p: world.Vec2) void {
@@ -472,7 +482,12 @@ pub const Renderer = struct {
     }
 
     pub fn present(self: *Renderer, screenshot: ?[*:0]const u8) void {
-        self.gfx.end(.{ .screenshot = screenshot }) catch |e| std.log.err("present failed: {s}", .{@errorName(e)});
+        self.presentWait(screenshot, false);
+    }
+
+    /// `present`, optionally blocking until the GPU has finished the frame.
+    pub fn presentWait(self: *Renderer, screenshot: ?[*:0]const u8, wait: bool) void {
+        self.gfx.end(.{ .screenshot = screenshot, .wait = wait }) catch |e| std.log.err("present failed: {s}", .{@errorName(e)});
     }
 
     fn drawInner(self: *Renderer, w: *const world.World, alpha: f32, hud: *const Hud) !void {
@@ -522,6 +537,7 @@ pub const Renderer = struct {
                 .count = gb.count,
                 .alpha = alpha,
                 .cam = .{ .scale = cam.s, .ox = cam.ox, .oy = cam.oy, .bx = cam.bx, .by = cam.by },
+                .lod_list = if (self.lod) gb.lod_list else null,
             });
         }
         if (hud.gpu) |gb| {
@@ -658,7 +674,7 @@ pub const Renderer = struct {
             "[X] collision mode: solid / accrete / ghost",
             "[ and ] weaken / strengthen gravity",
             "[O] back to the normal game   [G + LEFT DRAG] attract   [C] follow   [HOME] reset view",
-            "[P] perf overlay   [M] mute   [R] trails",
+            "[P] perf overlay   [M] mute   [R] trails   [L] GPU culling + points",
         };
         if (hud.galaxy) |gh| {
             self.text(x, y, 2, rgb8(160, 200, 255), "GALAXY: {s}  bodies {d}  collide {s}  g x{d:.2}", .{ gh.scenario, gh.bodies, gh.collide, gh.g_mult });
@@ -687,7 +703,7 @@ pub const Renderer = struct {
             "Hold [G + LEFT CLICK] and drag to attract balls to your mouse.",
             "Press [F] to toggle gravity.",
             "[N] toggle merging",
-            "[P] perf overlay   [R] trails",
+            "[P] perf overlay   [R] trails   [L] GPU culling + points",
             "[T] stress test: +100000 balls, merging off",
         };
         const lines: []const [:0]const u8 = if (hud.galaxy != null) &galaxy_help else &help;
@@ -704,7 +720,7 @@ pub const Renderer = struct {
             y += lh * 0.5;
             const p = hud.perf;
             const grey = rgb8(190, 255, 190);
-            self.text(x, y, 1.5, grey, "fps {d:.0}  tick {d:.2} ms  render {d:.2} ms", .{ p.fps, p.tick_ms, p.render_ms });
+            self.text(x, y, 1.5, grey, "fps {d:.0}  tick {d:.2} ms  render {d:.2} ms (GPU {d:.2} ms)", .{ p.fps, p.tick_ms, p.render_ms, p.gpu_render_ms });
             y += lh;
             if (hud.gpu) |gb| {
                 self.text(x, y, 1.5, grey, "GPU balls {d} (ids {d}, queued {d})  gravity {d:.2} ms  collide {d:.2} ms  merge+io {d:.2} ms", .{ gb.alive, gb.count, gb.queued, p.gpu_gravity_ms, p.gpu_collide_ms, p.gpu_game_ms });
@@ -716,7 +732,7 @@ pub const Renderer = struct {
                 self.text(x, y, 1.5, grey, "burning {d}  particles {d}  ashes {d}", .{ gb.burning, gb.particles, gb.ashes });
                 y += lh;
             }
-            self.text(x, y, 1.5, grey, "gravity: {s}  merging: {s}", .{ if (hud.mutual_gravity) "mutual" else "constant", if (hud.merging) "on" else "off" });
+            self.text(x, y, 1.5, grey, "gravity: {s}  merging: {s}  culling + points: {s}", .{ if (hud.mutual_gravity) "mutual" else "constant", if (hud.merging) "on" else "off", if (self.lod) "on" else "off" });
         }
 
         const panel_x = self.out_w - 149 * hs;

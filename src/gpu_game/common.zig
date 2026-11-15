@@ -78,8 +78,9 @@ pub const Blast = extern struct { x: f32, y: f32, blast: f32, force: f32 };
 
 pub const kernel_cc: std.builtin.CallingConvention = .{ .spirv_kernel = .{ .x = L.group_size, .y = 1, .z = 1 } };
 
+/// Flat thread id of a dispatch that may be 2D (gpu_layout dispatch_x); y is 0 below that size.
 pub inline fn gid() u32 {
-    return spirv.global_invocation_id[0];
+    return spirv.global_invocation_id[0] + spirv.global_invocation_id[1] * (L.dispatch_x * L.group_size);
 }
 
 // Zig's SPIR-V backend has no @atomicRmw/@cmpxchg lowering yet, so these are inline asm.

@@ -15,6 +15,9 @@ const tick_seconds: f64 = 1.0 / @as(f64, cfg.tick_hz);
 /// Catch-up cap: after a long stall, drop simulation time instead of spiralling.
 const max_ticks_per_frame = 4;
 const stress_count = 100_000;
+/// Every this many frames (while the perf overlay is on) the GPU is drained and one frame is drawn
+/// and waited on alone, to time rendering; SDL_GPU has no timestamp queries.
+const render_sample_every = 60;
 
 const Options = struct {
     /// Exit after this many frames (0 = run until closed). For headless verification.
@@ -40,7 +43,14 @@ const Options = struct {
     elastic: bool = true,
     /// Print a full state sanity readback after the last frame.
     check: bool = false,
+    /// GPU ball capacity (--max-balls); null = the default, raised to fit a --galaxy body count.
+    max_balls: ?u32 = null,
+    /// GPU culling and points for sub-pixel balls. `compare` also saves the last frame drawn
+    /// without them to `<screenshot>.lodoff.bmp` (same state, no tick between), for A/B checks.
+    lod: Lod = .on,
 };
+
+const Lod = enum { on, off, compare };
 
 const Game = struct {
     gpa: std.mem.Allocator,
@@ -234,6 +244,7 @@ const Game = struct {
             c.SDLK_N => g.merging = !g.merging,
             c.SDLK_P => g.show_perf = !g.show_perf,
             c.SDLK_R => g.renderer.trails = !g.renderer.trails,
+            c.SDLK_L => g.renderer.lod = !g.renderer.lod,
             c.SDLK_T => g.stress(stress_count),
             c.SDLK_PLUS, c.SDLK_EQUALS, c.SDLK_KP_PLUS => g.balls_per_click += step,
             c.SDLK_MINUS, c.SDLK_KP_MINUS => g.balls_per_click = @max(1, g.balls_per_click -| step),
@@ -352,6 +363,7 @@ fn gpuBalls(gw: *const gpu_world.GpuWorld, max_level: u8) render.GpuBalls {
         .fire = poolView(&gw.fire, draw.fire),
         .ash = poolView(&gw.ash, draw.ash),
         .pool_tiles = gw.pool_tiles,
+        .lod_list = gw.renderScratch(),
         .burning = gw.stats.burning,
         .particles = gw.stats.particles,
         .ashes = gw.stats.ashes,
@@ -404,6 +416,13 @@ fn parseOptions(args: []const [:0]const u8) Options {
             o.elastic = !std.mem.eql(u8, value, "off");
         } else if (std.mem.eql(u8, flag, "--check")) {
             o.check = std.mem.eql(u8, value, "on");
+        } else if (std.mem.eql(u8, flag, "--lod")) {
+            o.lod = std.meta.stringToEnum(Lod, value) orelse .on;
+        } else if (std.mem.eql(u8, flag, "--max-balls")) {
+            o.max_balls = std.fmt.parseInt(u32, value, 10) catch {
+                std.debug.print("invalid --max-balls '{s}': expected an integer from 0 to {d}\n", .{ value, std.math.maxInt(u32) });
+                std.process.exit(2);
+            };
         } else if (std.mem.eql(u8, flag, "--collide")) {
             o.collide = std.meta.stringToEnum(L.CollideMode, value);
         }
@@ -440,8 +459,15 @@ pub fn main(init: std.process.Init) !void {
     });
     defer gpu.deinit();
 
-    var gw = try gpu_world.GpuWorld.init(gpa, gpu.dev);
+    // Room for star systems spawned by clicks on top of a --galaxy load.
+    const galaxy_cap = if (opts.galaxy != null) opts.galaxy_n +| (1 << 16) else 0;
+    const capacity = opts.max_balls orelse @max(L.default_max_balls, galaxy_cap);
+    var gw = gpu_world.GpuWorld.initCap(gpa, gpu.dev, capacity) catch |e| {
+        std.debug.print("GPU world for {d} balls failed: {s}\n", .{ capacity, @errorName(e) });
+        return e;
+    };
     defer gw.deinit();
+    std.debug.print("capacity {d} balls: {d} MiB of GPU buffers, {d:.1} bytes/ball\n", .{ gw.capacity, gw.gpu_bytes >> 20, @as(f64, @floatFromInt(gw.gpu_bytes)) / @as(f64, @floatFromInt(gw.capacity)) });
 
     var g: Game = .{
         .gpa = gpa,
@@ -465,12 +491,22 @@ pub fn main(init: std.process.Init) !void {
     g.collide_explicit = opts.collide != null;
     g.galaxy_n = opts.galaxy_n;
     g.renderer.zoom = std.math.clamp(opts.zoom, render.Renderer.zoom_min, render.Renderer.zoom_max);
-    if (opts.galaxy) |s| g.enterGalaxy(s);
+    g.renderer.lod = opts.lod != .off;
+    if (opts.galaxy) |s| {
+        g.enterGalaxy(s);
+        // --zoom is relative to the galaxy fit, so one value gives the same view at any body count.
+        g.renderer.zoom = std.math.clamp(g.renderer.zoom * opts.zoom, render.Renderer.zoom_min, render.Renderer.zoom_max);
+    }
 
     var last = c.SDL_GetPerformanceCounter();
     var accumulator: f64 = 0;
     var frame: u32 = 0;
     var running = true;
+    // Means over the second half of a --frames run (uploads done, caches warm).
+    var steady_frame_s: f64 = 0;
+    var steady_frames: u32 = 0;
+    var steady_render_ms: f64 = 0;
+    var steady_render_n: u32 = 0;
 
     while (running) : (frame += 1) {
         var event: c.SDL_Event = undefined;
@@ -501,6 +537,11 @@ pub fn main(init: std.process.Init) !void {
         const now = c.SDL_GetPerformanceCounter();
         const frame_seconds = seconds(now - last);
         last = now;
+        const steady = opts.frames > 0 and frame >= opts.frames / 2;
+        if (steady) {
+            steady_frame_s += frame_seconds;
+            steady_frames += 1;
+        }
         g.perf.fps = smooth(g.perf.fps, @floatCast(1.0 / @max(frame_seconds, 1e-6)));
         // Headless verification runs advance exactly one tick per frame so results do not depend on wall time.
         accumulator += if (opts.frames > 0) tick_seconds else @min(frame_seconds, tick_seconds * max_ticks_per_frame);
@@ -539,14 +580,31 @@ pub fn main(init: std.process.Init) !void {
             g.trail_epoch = gw.scene_epoch;
             g.renderer.clearTrails();
         }
+        const sample_render = g.show_perf and frame % render_sample_every == render_sample_every / 2;
+        if (sample_render) _ = c.SDL_WaitForGPUIdle(gpu.dev);
         const r0 = c.SDL_GetPerformanceCounter();
         if (g.follow_centre) g.renderer.follow(.{ .x = g.w.bounds.x + g.w.bounds.w / 2, .y = g.w.bounds.y + g.w.bounds.h / 2 });
         g.renderer.draw(&g.w, @floatCast(accumulator / tick_seconds), &hud);
         g.perf.render_ms = smooth(g.perf.render_ms, @floatCast(seconds(c.SDL_GetPerformanceCounter() - r0) * 1000));
 
         const done = opts.frames > 0 and frame + 1 >= opts.frames;
-        g.renderer.present(if (done) if (opts.screenshot) |path| path.ptr else null else null);
+        g.renderer.presentWait(if (done) if (opts.screenshot) |path| path.ptr else null else null, sample_render);
+        if (sample_render) {
+            const ms: f32 = @floatCast(seconds(c.SDL_GetPerformanceCounter() - r0) * 1000);
+            g.perf.gpu_render_ms = ms;
+            if (steady) {
+                steady_render_ms += ms;
+                steady_render_n += 1;
+            }
+        }
+        if (done and opts.lod == .compare) if (opts.screenshot) |path| {
+            const off_path = try std.fmt.allocPrintSentinel(init.arena.allocator(), "{s}.lodoff.bmp", .{path}, 0);
+            g.renderer.lod = false;
+            g.renderer.draw(&g.w, @floatCast(accumulator / tick_seconds), &hud);
+            g.renderer.presentWait(off_path.ptr, false);
+        };
         if (done) {
+            std.debug.print("steady (2nd half): frame_ms={d:.3} render_gpu_ms={d:.3} (samples {d})\n", .{ steady_frame_s * 1000 / @as(f64, @floatFromInt(@max(steady_frames, 1))), steady_render_ms / @as(f64, @floatFromInt(@max(steady_render_n, 1))), steady_render_n });
             std.debug.print("frames={d} balls={d} ids={d} queued={d} max_level={d} merges={d} fps={d:.1} tick_ms={d:.3} render_ms={d:.3} gpu_gravity_ms={d:.3} gpu_collide_ms={d:.3} gpu_game_ms={d:.3} (samples {d}) burning={d} particles={d} ashes={d}\n", .{ frame + 1, gw.alive, gw.count, gw.pendingSpawns(), g.w.current_level, g.merges_total, g.perf.fps, g.perf.tick_ms, g.perf.render_ms, g.perf.gpu_gravity_ms, g.perf.gpu_collide_ms, g.perf.gpu_game_ms, gw.profile.samples, gw.stats.burning, gw.stats.particles, gw.stats.ashes });
             running = false;
             if (opts.check) {
