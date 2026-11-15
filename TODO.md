@@ -8,6 +8,9 @@
 - Reported: the window closes instantly during merging (user, windowed, release build). On the RX 7800 XT
   (RADV) every start crashed in `vkCreateComputePipelines` until fa8009a (invalid SPIR-V from
   `blockSum`), which may have been this. Needs a windowed retest on that machine.
+- `zig build bench -- 4000000 30 gpu` hangs the GPU (amdgpu ring timeout and reset, then
+  VK_ERROR_DEVICE_LOST every tick): the bench uses the default 1M capacity for any n (found
+  2026-11-15, fix in progress on branch game-bench). Do not run the GPU bench above 1M until fixed.
 - Merge events: 32k per tick; pairs that don't fit merge next tick (game-fixes, 2026-11-13).
 - Zig's SPIR-V backend omits the `Block` decoration (VUID-04680); `src/tools/spirv_fixup.zig` patches
   it at build time (9d83558). Every shader passes `spirv-val --target-env vulkan1.2`
