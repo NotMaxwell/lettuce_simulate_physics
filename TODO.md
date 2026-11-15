@@ -85,9 +85,18 @@ Decisions for the user (block the phases marked):
      projection; `--method tree` (sort, tree build, walk every tick; auto = tree above 50k bodies,
      overflow regrow, restart bit-identical; 1M Plummer 1000 ticks |dE/E0| 2.9e-6). Tree ms/tick
      on the RX 7800 XT: 1M 63 · 4M 237 · 16M 1065 · 64M 6498 · 128M 20148 · 228M 57419; 66.5 B/body,
-     248M runs, 256M loses the device (VRAM suspected, unconfirmed). The walk is 98% of the tick and
-     its cost per body rises from 62 ns (1M) to 250 ns (228M). In progress: walk optimisation
-     (branch walk-opt). Not started: WP7 CUDA/PTX backend (waiting on cluster info).
+     248M runs, 256M loses the device (VRAM suspected, unconfirmed). Those are the per-body
+     walk (`--walk body`). Merged 2026-11-15: group walk (default, `--walk group`): one workgroup per
+     <=64 bodies shares one tree traversal; leaves over 64 equal-key bodies are spread over workgroups;
+     leaf pairs use exact integer offsets. Walk ms, same bench, group vs body: 1M 19.1-19.6 vs 59.1,
+     16M 349 vs 1019-1036, 64M 1727-1735 (body not rerun); tick sum 21.7 / 383 / ~1900 ms. 1M Plummer
+     1000 ticks |dE/E0| <= 3.2e-6, 2K/|W| 0.9987-0.9997. The walk is still ~90% of the tick. Not
+     remeasured with the group walk: 128M, 228M (a 228M bench was still running after 12 min when
+     Hyprland crashed, 15:45 on 2026-11-15; whether the run caused it is unknown, Hyprland crashed
+     again 28 s after the sim was gone). `--walk` is not stored in snapshots: a bit-identical restart
+     needs the same flag. Far cells still use f32 offsets (reviewer estimate: up to ~4e-3 relative on
+     one cell for wide outskirt groups, unmeasured). Not started: WP7 CUDA/PTX backend (waiting on
+     cluster info).
 - D2 Cluster: Alabama Supercomputer Center (docs https://hpcdocs.asc.edu/, being researched); which system, which GPUs, is Vulkan usable on compute nodes (else a CUDA/OpenCL backend),
      scheduler (Slurm?), GPUs per job, walltime, storage quota. On a compute node:
      `nvidia-smi`, `vulkaninfo --summary`, `sinfo`. Blocks 10+.
