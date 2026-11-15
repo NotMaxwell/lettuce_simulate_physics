@@ -329,6 +329,8 @@ test "walk3: group walk in one 2D dispatch matches ref3 and the chunked run" {
     defer tree.deinit(gpa);
     var rig = try Rig.init(dev, tree);
     defer rig.deinit();
+    // Group mode runs chunk / 8 workgroups per dispatch: 4999 (not a divisor of 34001) gives 7 dispatches of the 1D path.
+    rig.w.chunk = 8 * 4999;
     const chunked = try rig.forces(gpa, 1e-4);
     defer chunked.deinit(gpa);
     rig.w.chunk = 8 * (2 * n + 1);
