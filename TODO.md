@@ -89,9 +89,10 @@ Decisions for the user (block the phases marked):
      walk (`--walk body`). Merged 2026-11-15: group walk (default, `--walk group`): one workgroup per
      <=64 bodies shares one tree traversal; leaves over 64 equal-key bodies are spread over workgroups;
      leaf pairs use exact integer offsets. Walk ms, same bench, group vs body: 1M 19.1-19.6 vs 59.1,
-     16M 349 vs 1019-1036, 64M 1727-1735 (body not rerun); tick sum 21.7 / 383 / ~1900 ms. 1M Plummer
+     16M 349 vs 1019-1036, 64M 1727-1735, 128M 4235, 192M 7524 (body not rerun above 16M); tick
+     21.7 / 383 / ~1900 / 4526 / 7979 ms (128M was 20148 with the body walk). 1M Plummer
      1000 ticks |dE/E0| <= 3.2e-6, 2K/|W| 0.9987-0.9997. The walk is still ~90% of the tick. Not
-     remeasured with the group walk: 128M, 228M (a 228M bench was still running after 12 min when
+     remeasured with the group walk: 228M (a 228M bench was still running after 12 min when
      Hyprland crashed, 15:45 on 2026-11-15; whether the run caused it is unknown, Hyprland crashed
      again 28 s after the sim was gone). `--walk` is not stored in snapshots: a bit-identical restart
      needs the same flag. Far cells still use f32 offsets (reviewer estimate: up to ~4e-3 relative on
