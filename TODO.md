@@ -8,9 +8,15 @@
 - Reported: the window closes instantly during merging (user, windowed, release build). On the RX 7800 XT
   (RADV) every start crashed in `vkCreateComputePipelines` until fa8009a (invalid SPIR-V from
   `blockSum`), which may have been this. Needs a windowed retest on that machine.
-- `zig build bench -- 4000000 30 gpu` hangs the GPU (amdgpu ring timeout and reset, then
-  VK_ERROR_DEVICE_LOST every tick): the bench uses the default 1M capacity for any n (found
-  2026-11-15, fix in progress on branch game-bench). Do not run the GPU bench above 1M until fixed.
+- `zig build bench -- 4000000 30 gpu` hung the GPU (amdgpu ring timeout and reset, then
+  VK_ERROR_DEVICE_LOST every tick) because the bench used the default 1M capacity for any n. Merged
+  2026-11-15 (game-bench): the bench sizes capacity to n (out-of-range n exits 2) and spawns beyond
+  capacity are refused at queue time (`spawnRoom`), so bounds are never sized for balls that get
+  dropped. Root cause NOT confirmed: reviewer's hypothesis is 1M balls in a play area sized for 4M
+  (sparse gravity tree/grid). Still to do with the GPU idle: retake the 1M/4M/16M per-pass table
+  (the agent's table was taken while a game held the GPU; buffers were 292 MiB at 1M, 849 MiB at
+  4M, 3077 MiB at 16M) and check that a sparse world (few balls, huge bounds) cannot hang the GPU.
+  Galaxy `queueBody` is not capped by `spawnRoom` (bounds there do not come from total_area).
 - Merge events: 32k per tick; pairs that don't fit merge next tick (game-fixes, 2026-11-13).
 - Zig's SPIR-V backend omits the `Block` decoration (VUID-04680); `src/tools/spirv_fixup.zig` patches
   it at build time (9d83558). Every shader passes `spirv-val --target-env vulkan1.2`
