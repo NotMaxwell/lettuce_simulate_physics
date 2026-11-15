@@ -57,9 +57,8 @@ galaxy disk 1M 13.8 ms/tick (gravity 12.7).
        in the perf overlay and `zig build bench`.
 2. [x] Runtime capacity `--max-balls N` (default 1 << 20), 2D dispatch above 32768 groups
        (2026-11-15). Galaxy disk runs at 80M on the RX 7800 XT (16.08 of 16.37 GB, as reported by
-       the agent; 96M spills). Per-pass GPU timestamps (item 1) not done. Follow-ups: warn on an
-       unparseable or clamped `--max-balls`; `ensureCull` leaves `cull_args` null if its
-       allocation fails.
+       the agent; 96M spills). Per-pass GPU timestamps (item 1) not done. A bad `--max-balls` exits 2;
+       a value above the limit (268435455) warns and is clamped.
 3. [ ] Kernel work: fuse passes, Morton/Hilbert ordering for locality, indirect dispatch sized on
        the GPU, no per-tick CPU readback that scales with N.
 4. [x] GPU culling and points for sub-pixel balls (`--lod`, key L), 2026-11-15. render_gpu ms,
