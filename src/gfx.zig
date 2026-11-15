@@ -407,8 +407,13 @@ pub const Gfx = struct {
                     return fail("SDL_CreateGPUComputePipeline(ball cull)");
                 };
             }
+            // Assign both only once both exist: recordCull relies on cull_pipes implying cull_args.
+            const args = storageBuffer(dev, CC.args_words * 4, c.SDL_GPU_BUFFERUSAGE_INDIRECT) catch |e| {
+                for (ps) |made| c.SDL_ReleaseGPUComputePipeline(dev, made);
+                return e;
+            };
+            g.cull_args = args;
             g.cull_pipes = ps;
-            g.cull_args = try storageBuffer(dev, CC.args_words * 4, c.SDL_GPU_BUFFERUSAGE_INDIRECT);
         }
         if (groups <= g.cull_groups) return;
         // Headroom so a growing world does not reallocate every frame; SDL defers the release of

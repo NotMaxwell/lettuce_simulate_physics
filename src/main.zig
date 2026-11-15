@@ -419,7 +419,10 @@ fn parseOptions(args: []const [:0]const u8) Options {
         } else if (std.mem.eql(u8, flag, "--lod")) {
             o.lod = std.meta.stringToEnum(Lod, value) orelse .on;
         } else if (std.mem.eql(u8, flag, "--max-balls")) {
-            o.max_balls = std.fmt.parseInt(u32, value, 10) catch null;
+            o.max_balls = std.fmt.parseInt(u32, value, 10) catch {
+                std.debug.print("invalid --max-balls '{s}': expected an integer from 0 to {d}\n", .{ value, std.math.maxInt(u32) });
+                std.process.exit(2);
+            };
         } else if (std.mem.eql(u8, flag, "--collide")) {
             o.collide = std.meta.stringToEnum(L.CollideMode, value);
         }

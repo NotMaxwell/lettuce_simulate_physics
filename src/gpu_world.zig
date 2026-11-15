@@ -355,6 +355,7 @@ pub const GpuWorld = struct {
     /// see `gpu_bytes` for the total.
     pub fn initCap(gpa: std.mem.Allocator, dev: *c.SDL_GPUDevice, cap_in: u32) Error!GpuWorld {
         const cap = std.math.clamp(cap_in, 1, L.max_balls_limit);
+        if (cap_in > L.max_balls_limit) std.debug.print("warning: requested {d} balls exceeds the limit; clamped to {d}\n", .{ cap_in, cap });
         const batch = spawnBatchFor(cap);
         var sim = try gs.Sim.init(dev, cap, 2 * cap);
         errdefer sim.deinit();
