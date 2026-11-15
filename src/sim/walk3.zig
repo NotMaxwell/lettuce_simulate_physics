@@ -1,14 +1,15 @@
 //! Host side of the 3D tree kick (k3/walk.zig): pipelines, chunked dispatch, and a GPU copy of a
 //! tree built on the CPU by ref3.build (the GPU build, work package 4, must produce the same bytes).
 //!
-//! Bindings, in order. Read-only: pos (sorted), mass (sorted), nodes, quads. Read-write: vel, amag,
-//! pot (all three per sorted body). Flags are gpu_layout's sim3_flag_*: store_accel writes the
+//! Bindings, in order. Read-only: pos (sorted), mass (sorted), nodes, quads, tree3 status words.
+//! Read-write: vel, amag, pot (all three per sorted body). Flags are gpu_layout's sim3_flag_*: store_accel writes the
 //! acceleration into vel instead of kicking, potential fills pot.
 const std = @import("std");
 const c = @import("c");
 const L = @import("gpu_layout");
 const ref3 = @import("ref3.zig");
 const sim = @import("sim.zig");
+const tree3 = @import("tree3.zig");
 
 const walk_spv = @embedFile("k3_walk.spv");
 
@@ -37,6 +38,21 @@ pub fn preferredGroupSize(n: u32) u32 {
 /// time, so a chunk is ~60 ms: far under the driver's job watchdog even on a slower or shared GPU.
 pub const chunk_bodies: u32 = 1 << 20;
 
+/// Bodies per group of the group walk (k3/walk.zig walkGroup64, ref3.Tree.walkGroups); it is
+/// also the workgroup size, and the results depend on it.
+pub const group_bodies: u32 = 64;
+/// Group mode submits w.chunk / chunk_group_div workgroups per command buffer. Workgroup w checks
+/// one child of internal node (w - 1) / 2, and internal nodes are spread over the bodies like the
+/// leaves (Plummer: one per 22 bodies), so a chunk is about 1.4M bodies.
+const chunk_group_div: u32 = 8;
+
+pub const Mode = enum {
+    /// k3/walk.zig walk<gs>, ref3.Tree.walk.
+    body,
+    /// k3/walk.zig walkGroup64, ref3.Tree.walkGroups.
+    group,
+};
+
 pub const Kick = struct {
     n: u32,
     g: f32,
@@ -46,45 +62,66 @@ pub const Kick = struct {
     /// Length per position quantum: box_size / 2^32.
     box_scale: f32,
     flags: u32 = 0,
+    /// Group mode: an upper bound on the tree's leaf count (0: n).
+    leaves_max: u32 = 0,
 };
 
-pub const Bindings = struct { pos: Buffer, mass: Buffer, nodes: Buffer, quads: Buffer, vel: Buffer, amag: Buffer, pot: Buffer };
+/// `status` holds tree3's status words (tree3.statusBuffer); the per-body walk ignores it.
+pub const Bindings = struct { pos: Buffer, mass: Buffer, nodes: Buffer, quads: Buffer, status: Buffer, vel: Buffer, amag: Buffer, pot: Buffer };
+
+fn makePipeline(dev: *c.SDL_GPUDevice, entry: [*:0]const u8, gs: u32) ?*c.SDL_GPUComputePipeline {
+    return c.SDL_CreateGPUComputePipeline(dev, &.{
+        .code_size = walk_spv.len,
+        .code = walk_spv.ptr,
+        .entrypoint = entry,
+        .format = c.SDL_GPU_SHADERFORMAT_SPIRV,
+        .num_readonly_storage_buffers = 5,
+        .num_readwrite_storage_buffers = 3,
+        .num_uniform_buffers = 1,
+        .threadcount_x = gs,
+        .threadcount_y = 1,
+        .threadcount_z = 1,
+    });
+}
 
 pub const Walk3 = struct {
     dev: *c.SDL_GPUDevice,
-    /// Null where the device refused that workgroup size.
+    /// Per-body walk pipelines; null where the device refused that workgroup size.
     pipes: [group_sizes.len]?*c.SDL_GPUComputePipeline,
-    /// 0 picks autoGroupSize(n).
+    group_pipe: ?*c.SDL_GPUComputePipeline = null,
+    mode: Mode = .group,
+    /// Body mode workgroup size; 0 picks autoGroupSize(n).
     group_size: u32 = 0,
     chunk: u32 = chunk_bodies,
+    /// Profiling (initEntry): replaces the pipeline of `mode`.
+    extra: ?*c.SDL_GPUComputePipeline = null,
+    extra_gs: u32 = 0,
 
     /// SDL_GPU exposes no device limits (maxComputeWorkGroupSize/Invocations), so each size is
     /// created on its own and the ones the driver accepts are kept. Vulkan guarantees 128
     /// invocations; larger sizes rely on the driver rejecting what it cannot run.
     pub fn init(dev: *c.SDL_GPUDevice) Error!Walk3 {
         var w: Walk3 = .{ .dev = dev, .pipes = @splat(null) };
+        w.group_pipe = makePipeline(dev, "walkGroup64", group_bodies) orelse return error.GpuPipeline;
+        errdefer c.SDL_ReleaseGPUComputePipeline(dev, w.group_pipe.?);
         var any = false;
         inline for (group_sizes, &w.pipes) |gs, *p| {
-            p.* = c.SDL_CreateGPUComputePipeline(dev, &.{
-                .code_size = walk_spv.len,
-                .code = walk_spv.ptr,
-                .entrypoint = std.fmt.comptimePrint("walk{d}", .{gs}),
-                .format = c.SDL_GPU_SHADERFORMAT_SPIRV,
-                .num_readonly_storage_buffers = 4,
-                .num_readwrite_storage_buffers = 3,
-                .num_uniform_buffers = 1,
-                .threadcount_x = gs,
-                .threadcount_y = 1,
-                .threadcount_z = 1,
-            });
+            p.* = makePipeline(dev, std.fmt.comptimePrint("walk{d}", .{gs}), gs);
             if (p.* == null) std.log.warn("walk3: workgroup size {d} unavailable: {s}", .{ gs, c.SDL_GetError() }) else any = true;
         }
         if (!any) return error.GpuPipeline;
         return w;
     }
 
+    /// Profiling only: a Walk3 that runs entry point `entry` (workgroups of `gs`) as a `mode` walk.
+    pub fn initEntry(dev: *c.SDL_GPUDevice, entry: [*:0]const u8, gs: u32, mode: Mode) Error!Walk3 {
+        return .{ .dev = dev, .pipes = @splat(null), .mode = mode, .extra_gs = gs, .extra = makePipeline(dev, entry, gs) orelse return error.GpuPipeline };
+    }
+
     pub fn deinit(w: *Walk3) void {
         for (w.pipes) |p| if (p) |q| c.SDL_ReleaseGPUComputePipeline(w.dev, q);
+        if (w.group_pipe) |q| c.SDL_ReleaseGPUComputePipeline(w.dev, q);
+        if (w.extra) |q| c.SDL_ReleaseGPUComputePipeline(w.dev, q);
         w.* = undefined;
     }
 
@@ -104,19 +141,26 @@ pub const Walk3 = struct {
         return best;
     }
 
-    /// Records the kick of bodies [0, k.n) into `cmd0`, one chunk of `w.chunk` bodies per command
-    /// buffer. Every chunk but the last is submitted here without waiting (chunks write disjoint
-    /// ranges and later passes are ordered after them by SDL_GPU's pass barriers); the returned
-    /// command buffer holds the last chunk and is the caller's to submit.
+    /// Records the kick of bodies [0, k.n) into `cmd0`, one chunk per command buffer (w.chunk
+    /// bodies, or in group mode w.chunk / chunk_group_div workgroups). Every chunk but the last is
+    /// submitted here without waiting (chunks write disjoint ranges and later passes are ordered
+    /// after them by SDL_GPU's pass barriers); the returned command buffer holds the last chunk and
+    /// is the caller's to submit.
     pub fn record(w: *Walk3, cmd0: *c.SDL_GPUCommandBuffer, b: Bindings, k: Kick) Error!*c.SDL_GPUCommandBuffer {
-        const gs = if (w.group_size == 0) w.autoGroupSize(k.n) else w.group_size;
-        const pipe = for (group_sizes, w.pipes) |s, p| {
+        const grouped = w.mode == .group;
+        const gs = if (w.extra != null) w.extra_gs else if (grouped) group_bodies else if (w.group_size == 0) w.autoGroupSize(k.n) else w.group_size;
+        const pipe = if (w.extra) |e| e else if (grouped) w.group_pipe orelse return error.OutOfRange else for (group_sizes, w.pipes) |s, p| {
             if (s == gs) break p orelse return error.OutOfRange;
         } else return error.OutOfRange;
+        // Group mode: workgroups for the root and both children of every internal node, and at
+        // least n / gs of them so that an overflowed tree (zero force for every body) is covered.
+        const lmax: u64 = if (k.leaves_max == 0) k.n else @min(k.leaves_max, k.n);
+        const units: u32 = if (grouped) @intCast(@max(@min(1 + 2 * lmax, std.math.maxInt(u32)), (k.n + gs - 1) / gs)) else k.n;
+        const chunk = if (grouped) @max(w.chunk / chunk_group_div, 1) else w.chunk;
         var cmd = cmd0;
         var first: u32 = 0;
         while (true) {
-            const count = @min(w.chunk, k.n - first);
+            const count = @min(chunk, units - first);
             const p: L.WalkParams3 = .{
                 .n = k.n,
                 .first = first,
@@ -132,13 +176,13 @@ pub const Walk3 = struct {
             const rw = [3]c.SDL_GPUStorageBufferReadWriteBinding{ .{ .buffer = b.vel }, .{ .buffer = b.amag }, .{ .buffer = b.pot } };
             const cp = c.SDL_BeginGPUComputePass(cmd, null, 0, &rw, rw.len);
             c.SDL_BindGPUComputePipeline(cp, pipe);
-            const ro = [4]?*c.SDL_GPUBuffer{ b.pos, b.mass, b.nodes, b.quads };
+            const ro = [5]?*c.SDL_GPUBuffer{ b.pos, b.mass, b.nodes, b.quads, b.status };
             c.SDL_BindGPUComputeStorageBuffers(cp, 0, &ro, ro.len);
-            const groups = (count + gs - 1) / gs;
+            const groups = if (grouped) count else (count + gs - 1) / gs;
             c.SDL_DispatchGPUCompute(cp, @min(groups, dispatch_x), (groups + dispatch_x - 1) / dispatch_x, 1);
             c.SDL_EndGPUComputePass(cp);
             first += count;
-            if (first >= k.n) return cmd;
+            if (first >= units) return cmd;
             if (!c.SDL_SubmitGPUCommandBuffer(cmd)) return error.GpuSubmit;
             cmd = c.SDL_AcquireGPUCommandBuffer(w.dev) orelse return error.GpuSubmit;
         }
@@ -152,12 +196,15 @@ pub const GpuTree = struct {
     mass: Buffer,
     nodes: Buffer,
     quads: Buffer,
+    /// tree3's status words for this tree (leaf count, node count, no overflow).
+    status: Buffer,
     n: u32,
     node_cap: u32,
     node_count: u32 = 0,
+    leaves: u32 = 0,
 
     pub fn init(dev: *c.SDL_GPUDevice, n: u32, node_cap: u32) Error!GpuTree {
-        var t: GpuTree = .{ .dev = dev, .pos = undefined, .mass = undefined, .nodes = undefined, .quads = undefined, .n = n, .node_cap = node_cap };
+        var t: GpuTree = .{ .dev = dev, .pos = undefined, .mass = undefined, .nodes = undefined, .quads = undefined, .status = undefined, .n = n, .node_cap = node_cap };
         t.pos = try makeBuffer(dev, @as(u64, n) * @sizeOf(L.Pos3));
         errdefer c.SDL_ReleaseGPUBuffer(dev, t.pos);
         t.mass = try makeBuffer(dev, @as(u64, n) * 4);
@@ -165,11 +212,13 @@ pub const GpuTree = struct {
         t.nodes = try makeBuffer(dev, @as(u64, node_cap) * @sizeOf(L.Node));
         errdefer c.SDL_ReleaseGPUBuffer(dev, t.nodes);
         t.quads = try makeBuffer(dev, @as(u64, node_cap) * @sizeOf(L.NodeQuad));
+        errdefer c.SDL_ReleaseGPUBuffer(dev, t.quads);
+        t.status = try makeBuffer(dev, 4 * (tree3.status_max_depth + 1));
         return t;
     }
 
     pub fn deinit(t: *GpuTree) void {
-        for ([_]Buffer{ t.pos, t.mass, t.nodes, t.quads }) |b| c.SDL_ReleaseGPUBuffer(t.dev, b);
+        for ([_]Buffer{ t.pos, t.mass, t.nodes, t.quads, t.status }) |b| c.SDL_ReleaseGPUBuffer(t.dev, b);
         t.* = undefined;
     }
 
@@ -192,10 +241,15 @@ pub const GpuTree = struct {
         try uploadBytes(t.dev, t.nodes, std.mem.sliceAsBytes(tree.nodes));
         try uploadBytes(t.dev, t.quads, std.mem.sliceAsBytes(tree.quads));
         t.node_count = @intCast(tree.nodes.len);
+        t.leaves = tree.leaves;
+        var st: [tree3.status_max_depth + 1]u32 = @splat(0);
+        st[tree3.status_leaves] = tree.leaves;
+        st[tree3.status_nodes] = t.node_count;
+        try uploadBytes(t.dev, t.status, std.mem.sliceAsBytes(&st));
     }
 
     pub fn bindings(t: *const GpuTree, vel: Buffer, amag: Buffer, pot: Buffer) Bindings {
-        return .{ .pos = t.pos, .mass = t.mass, .nodes = t.nodes, .quads = t.quads, .vel = vel, .amag = amag, .pot = pot };
+        return .{ .pos = t.pos, .mass = t.mass, .nodes = t.nodes, .quads = t.quads, .status = t.status, .vel = vel, .amag = amag, .pot = pot };
     }
 };
 

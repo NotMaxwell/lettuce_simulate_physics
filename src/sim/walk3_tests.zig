@@ -1,7 +1,9 @@
-//! Tests of the 3D tree kick (k3/walk.zig) on trees built by ref3.build, plus two measurements
-//! that only run when asked, because they take minutes:
+//! Tests of the 3D tree kick (k3/walk.zig) on trees built by ref3.build, plus measurements that
+//! only run when asked, because they take minutes:
 //!   WALK3_BENCH=100000,1000000,4000000,16000000  walk times per size and workgroup size (WALK3_EPS)
 //!   WALK3_ENERGY=1                               100k Plummer, 200 ticks, tree rebuilt every tick
+//!   WALK3_PROFILE=1000000,16000000               work per body and timing variants on Sim3's GPU
+//!                                                trees (`zig build test-tree3`; WALK3_PROFILE_ONLY)
 const std = @import("std");
 const c = @import("c");
 const L = @import("gpu_layout");
@@ -114,6 +116,18 @@ fn summarise(errs: []f64) ErrSummary {
     return .{ .rms = @sqrt(sum2 / @as(f64, @floatFromInt(errs.len))), .p99 = errs[errs.len * 99 / 100], .max = errs[errs.len - 1] };
 }
 
+/// The ref3 walk the GPU walk of `mode` follows.
+fn refWalk(gpa: std.mem.Allocator, tree: ref3.Tree, mode: walk3.Mode, eps: f32) ![]ref3.Accel {
+    const out = try gpa.alloc(ref3.Accel, tree.pos.len);
+    switch (mode) {
+        .body => for (out, 0..) |*o, s| {
+            o.* = tree.walk(tree.pos[s], @intCast(s), 1, eps, null);
+        },
+        .group => tree.walkGroups(walk3.group_bodies, 1, eps, out, null),
+    }
+    return out;
+}
+
 /// GPU forces at `eps` against f64 direct summation and against the ref3 walk of the same tree.
 fn checkAccuracy(gpa: std.mem.Allocator, rig: *Rig, tree: ref3.Tree, cloud: Cloud, eps: f32) !Rig.Out {
     const n = cloud.pos.len;
@@ -130,18 +144,19 @@ fn checkAccuracy(gpa: std.mem.Allocator, rig: *Rig, tree: ref3.Tree, cloud: Clou
     const vs_direct = summarise(errs);
 
     // Only f32 arithmetic separates the GPU from the ref3 walk.
+    const refs = try refWalk(gpa, tree, rig.w.mode, eps);
+    defer gpa.free(refs);
     var pot_err: f64 = 0;
     var amag_err: f64 = 0;
-    for (errs, out.acc, out.amag, out.pot, 0..) |*e, a, am, p, s| {
-        const ref = tree.walk(tree.pos[s], @intCast(s), 1, eps, null);
+    for (errs, out.acc, out.amag, out.pot, refs) |*e, a, am, p, ref| {
         e.* = relErr(a, ref.a);
         pot_err = @max(pot_err, @abs(p - ref.pot) / @abs(ref.pot));
         const m = @sqrt(ref.a[0] * ref.a[0] + ref.a[1] * ref.a[1] + ref.a[2] * ref.a[2]);
         amag_err = @max(amag_err, @abs(am - m) / m);
     }
     const vs_ref = summarise(errs);
-    std.debug.print("walk3 10k theta 0.6 eps {d}: vs direct rms {e:.3} p99 {e:.3} max {e:.3}; vs ref3 walk rms {e:.3} p99 {e:.3} max {e:.3}, pot max {e:.3}, |a| max {e:.3}\n", .{
-        eps, vs_direct.rms, vs_direct.p99, vs_direct.max, vs_ref.rms, vs_ref.p99, vs_ref.max, pot_err, amag_err,
+    std.debug.print("walk3 10k theta 0.6 {t} walk, eps {d}: vs direct rms {e:.3} p99 {e:.3} max {e:.3}; vs ref3 walk rms {e:.3} p99 {e:.3} max {e:.3}, pot max {e:.3}, |a| max {e:.3}\n", .{
+        rig.w.mode, eps, vs_direct.rms, vs_direct.p99, vs_direct.max, vs_ref.rms, vs_ref.p99, vs_ref.max, pot_err, amag_err,
     });
     try testing.expect(vs_direct.rms <= 1.2e-3);
     try testing.expect(vs_direct.p99 <= 5e-3);
@@ -165,21 +180,38 @@ test "walk3: 10k Plummer at theta 0.6 matches direct sum and the ref3 walk, reru
     var rig = try Rig.init(dev, tree);
     defer rig.deinit();
 
+    rig.w.mode = .body;
+    for ([_]f32{ 0.01, 0.05, eps }) |e| (try checkAccuracy(gpa, &rig, tree, cloud, e)).deinit(gpa);
+    rig.w.mode = .group;
     for ([_]f32{ 0.01, 0.05 }) |e| (try checkAccuracy(gpa, &rig, tree, cloud, e)).deinit(gpa);
     const out = try checkAccuracy(gpa, &rig, tree, cloud, eps);
     defer out.deinit(gpa);
 
-    // Reruns, other workgroup sizes and other chunkings give the same bits.
-    for (walk3.group_sizes) |gs| for ([_]u32{ walk3.chunk_bodies, 999 }) |chunk| {
-        if (!rig.w.available(gs)) continue;
-        rig.w.group_size = gs;
+    // Reruns and other chunkings give the same bits; so do the per-body walk's workgroup sizes.
+    for ([_]u32{ walk3.chunk_bodies, 999 }) |chunk| {
         rig.w.chunk = chunk;
         const again = try rig.forces(gpa, eps);
         defer again.deinit(gpa);
         try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(out.acc), std.mem.sliceAsBytes(again.acc));
         try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(out.amag), std.mem.sliceAsBytes(again.amag));
         try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(out.pot), std.mem.sliceAsBytes(again.pot));
+    }
+    rig.w.mode = .body;
+    rig.w.chunk = walk3.chunk_bodies;
+    const body = try rig.forces(gpa, eps);
+    defer body.deinit(gpa);
+    for (walk3.group_sizes) |gs| for ([_]u32{ walk3.chunk_bodies, 999 }) |chunk| {
+        if (!rig.w.available(gs)) continue;
+        rig.w.group_size = gs;
+        rig.w.chunk = chunk;
+        const again = try rig.forces(gpa, eps);
+        defer again.deinit(gpa);
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(body.acc), std.mem.sliceAsBytes(again.acc));
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(body.amag), std.mem.sliceAsBytes(again.amag));
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(body.pot), std.mem.sliceAsBytes(again.pot));
     };
+    rig.w.mode = .group;
+    rig.w.chunk = walk3.chunk_bodies;
 
     // Kick mode adds kick * a to the stored velocity.
     const v0 = try gpa.alloc(L.Vel3, n);
@@ -244,12 +276,15 @@ test "walk3: two tight clumps 0.5 to 40 softening lengths apart match direct sum
         defer tree.deinit(gpa);
         var rig = try Rig.init(dev, tree);
         defer rig.deinit();
-        const out = try rig.forces(gpa, eps);
-        defer out.deinit(gpa);
-        var worst: f64 = 0;
-        for (out.acc, tree.perm) |a, o| worst = @max(worst, relErr(a, ref3.directAt(&pos, &mass, 1, pos[o], o, 1, eps).a));
-        std.debug.print("walk3 clumps {d} eps apart: max rel error vs direct {e:.2}\n", .{ sep, worst });
-        try testing.expect(worst < 1e-3);
+        for ([_]walk3.Mode{ .body, .group }) |mode| {
+            rig.w.mode = mode;
+            const out = try rig.forces(gpa, eps);
+            defer out.deinit(gpa);
+            var worst: f64 = 0;
+            for (out.acc, tree.perm) |a, o| worst = @max(worst, relErr(a, ref3.directAt(&pos, &mass, 1, pos[o], o, 1, eps).a));
+            std.debug.print("walk3 clumps {d} eps apart, {t} walk: max rel error vs direct {e:.2}\n", .{ sep, mode, worst });
+            try testing.expect(worst < 1e-3);
+        }
     }
 }
 
@@ -293,6 +328,7 @@ test "walk3: timing table (WALK3_BENCH=sizes)" {
         const build_ms = sim.msSince(tb);
         var rig = try Rig.init(dev, tree);
         defer rig.deinit();
+        rig.w.mode = .body;
 
         // Per-body work from the f64 walk on a sample (its decisions match the GPU's).
         var st: ref3.Stats = .{};
@@ -330,6 +366,10 @@ test "walk3: timing table (WALK3_BENCH=sizes)" {
                 gs, ms, nf * visits / ms * 1e-6, nf * inter / ms * 1e-6,
             });
         }
+        rig.w.mode = .group;
+        const gms = try timeWalk(&rig, eps, 5);
+        std.debug.print("  group walk ({d} bodies per group): {d:>9.2} ms (min of 5)\n", .{ walk3.group_bodies, gms });
+        rig.w.mode = .body;
         // One unchunked dispatch of more than 32768 groups exercises the 2D group index.
         if (n > 32768 * 64 and rig.w.available(64)) {
             rig.w.group_size = 64;
@@ -473,4 +513,107 @@ fn drift(p: u32, d: f32) u32 {
     const m: u32 = @intFromFloat(@floor(a + 0.5));
     if (d < 0) return if (m > p - lo) lo else p - m;
     return if (m > hi - p) hi else p + m;
+}
+
+const sim3 = @import("sim3.zig");
+
+/// Plummer bodies as `zig build sim -- --dim 3 --method tree --bench` makes them, sorted and with a
+/// GPU tree built by one force evaluation.
+fn benchSim(dev: *c.SDL_GPUDevice, gpa: std.mem.Allocator, n: u32) !sim3.Sim3 {
+    var prng = std.Random.DefaultPrng.init(1);
+    const bodies = try ic3.plummer(gpa, prng.random(), n, .{});
+    defer gpa.free(bodies);
+    var s = try sim3.Sim3.init(dev, .{ .n = n, .eps = 0.01, .dt = 0.01, .box = ic3.fitBox(bodies, 4), .method = .tree, .theta = 0.6 });
+    errdefer s.deinit();
+    try s.upload(bodies);
+    const acc = try gpa.alloc(L.Vel3, n);
+    defer gpa.free(acc);
+    try s.accelerations(acc);
+    return s;
+}
+
+fn simBindings(s: *sim3.Sim3) walk3.Bindings {
+    const t = &s.tree.?;
+    return .{ .pos = s.pos, .mass = s.mass, .nodes = t.nodes, .quads = t.quads, .status = t.statusBuffer(), .vel = s.vel, .amag = s.amag, .pot = s.pot };
+}
+
+fn simKick(s: *sim3.Sim3) walk3.Kick {
+    return .{ .n = s.cfg.n, .g = s.cfg.g, .eps = s.cfg.eps, .kick = s.cfg.dt, .box_scale = @floatCast(s.cfg.box.size / 0x1p32), .leaves_max = (s.tree.?.node_cap + 1) / 2 };
+}
+
+fn timeSimWalk(s: *sim3.Sim3, w: *walk3.Walk3, flags: u32, reps: u32) !f64 {
+    var best = std.math.inf(f64);
+    var k = simKick(s);
+    k.flags = flags;
+    for (0..reps + 1) |r| {
+        const cmd = c.SDL_AcquireGPUCommandBuffer(s.dev) orelse return error.GpuSubmit;
+        const t0 = c.SDL_GetPerformanceCounter();
+        const last = try w.record(cmd, simBindings(s), k);
+        try walk3.submitWait(s.dev, last);
+        if (r > 0) best = @min(best, sim.msSince(t0));
+    }
+    return best;
+}
+
+test "walk3 (tree3 step): profile on GPU-built trees (WALK3_PROFILE=sizes)" {
+    // WALK3_PROFILE_ONLY=a,b limits the timed entry points to those named.
+    const list = envSet("WALK3_PROFILE") orelse return error.SkipZigTest;
+    const only = envSet("WALK3_PROFILE_ONLY");
+    const dev = try device();
+    defer c.SDL_DestroyGPUDevice(dev);
+    const gpa = std.heap.smp_allocator;
+    var it = std.mem.tokenizeScalar(u8, list, ',');
+    while (it.next()) |tok| {
+        const n = try std.fmt.parseInt(u32, tok, 10);
+        var s = try benchSim(dev, gpa, n);
+        defer s.deinit();
+        const st = try s.tree.?.readStatus();
+        std.debug.print("n={d}: {d} nodes, depth {d}\n", .{ n, st.nodes, st.max_depth });
+        const out = try gpa.alloc(L.Vel3, n);
+        defer gpa.free(out);
+        const Entry = struct { name: [*:0]const u8, gs: u32, mode: walk3.Mode };
+        const stat_entries = [_]Entry{ .{ .name = "walkStats", .gs = 1024, .mode = .body }, .{ .name = "walkGroupStats64", .gs = 64, .mode = .group } };
+        for (stat_entries) |e| {
+            if (only) |o| if (!listHas(o, std.mem.span(e.name))) continue;
+            var w = try walk3.Walk3.initEntry(dev, e.name, e.gs, e.mode);
+            defer w.deinit();
+            _ = try timeSimWalk(&s, &w, 0, 0);
+            try walk3.downloadBytes(dev, s.vel, std.mem.sliceAsBytes(out));
+            var sum: [3]f64 = @splat(0);
+            // A wave of 32 per-body walks costs about its longest walk.
+            var wave_max: f64 = 0;
+            var maxp: f32 = 0;
+            var g: usize = 0;
+            while (g < n) : (g += 32) {
+                var m: f32 = 0;
+                for (out[g..@min(g + 32, n)]) |v| {
+                    sum[0] += v.x;
+                    sum[1] += v.y;
+                    sum[2] += v.z;
+                    m = @max(m, v.x);
+                    maxp = @max(maxp, v.z);
+                }
+                wave_max += m * @as(f64, @floatFromInt(@min(32, n - g)));
+            }
+            const nf: f64 = @floatFromInt(n);
+            std.debug.print("  {s}: per body visits {d:.0} cells {d:.0} pairs {d:.0} (max pairs {d:.0}); longest walk per 32 bodies {d:.0}\n", .{ e.name, sum[0] / nf, sum[1] / nf, sum[2] / nf, maxp, wave_max / nf });
+        }
+        const entries = [_]Entry{
+            .{ .name = "walk1024", .gs = 1024, .mode = .body },   .{ .name = "walkNoLeafMem", .gs = 1024, .mode = .body },       .{ .name = "walkNoLeaf", .gs = 1024, .mode = .body },
+            .{ .name = "walkGroup64", .gs = 64, .mode = .group }, .{ .name = "walkGroupNoLeafMem64", .gs = 64, .mode = .group }, .{ .name = "walkGroupNoLeaf64", .gs = 64, .mode = .group },
+        };
+        for (entries) |e| {
+            if (only) |o| if (!listHas(o, std.mem.span(e.name))) continue;
+            var w = try walk3.Walk3.initEntry(dev, e.name, e.gs, e.mode);
+            defer w.deinit();
+            const ms = try timeSimWalk(&s, &w, 0, 3);
+            std.debug.print("  {s}: {d:.2} ms (min of 3)\n", .{ e.name, ms });
+        }
+    }
+}
+
+fn listHas(list: []const u8, name: []const u8) bool {
+    var it = std.mem.tokenizeScalar(u8, list, ',');
+    while (it.next()) |t| if (std.mem.eql(u8, t, name)) return true;
+    return false;
 }

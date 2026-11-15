@@ -419,6 +419,7 @@ pub const Sim3 = struct {
             .mass = s.mass,
             .nodes = tree.nodes,
             .quads = tree.quads,
+            .status = tree.statusBuffer(),
             .vel = s.vel,
             .amag = s.amag,
             .pot = s.pot,
@@ -429,6 +430,7 @@ pub const Sim3 = struct {
             .kick = s.cfg.dt * factor,
             .box_scale = @floatCast(s.cfg.box.size / 0x1p32),
             .flags = flags,
+            .leaves_max = (tree.node_cap + 1) / 2,
         });
     }
 
