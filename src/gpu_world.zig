@@ -496,6 +496,14 @@ pub const GpuWorld = struct {
         return .{ .fire = fire, .ash = ash };
     }
 
+    /// Balls that can still be queued without being dropped at upload: never-used tail slots plus
+    /// freed slots, minus spawns already waiting. Queued area feeds snapBounds, so a ball that
+    /// cannot get a slot must not be queued at all.
+    pub fn spawnRoom(gw: *const GpuWorld) usize {
+        const slots = @as(usize, gw.capacity - gw.count) + gw.free.items.len;
+        return slots -| gw.pendingSpawns();
+    }
+
     pub fn pendingSpawns(gw: *const GpuWorld) usize {
         return gw.pending.items.len - gw.pending_head;
     }
@@ -503,6 +511,7 @@ pub const GpuWorld = struct {
     /// Queues one ball with world.spawnBall's random properties; it reaches the GPU on a later
     /// tick (at most `spawn_batch` per tick). Its area counts towards the play area immediately.
     pub fn queueBall(gw: *GpuWorld, w: *world.World, x: f32, y: f32) !void {
+        if (gw.spawnRoom() == 0) return;
         const nb = world.randomBall(w.prng.random(), w.current_level);
         try gw.pending.append(gw.gpa, nb);
         try gw.pending_pos.append(gw.gpa, .{ .x = x, .y = y });
@@ -510,7 +519,9 @@ pub const GpuWorld = struct {
     }
 
     /// physics.spawnBurst for GPU balls: a sunflower spiral one spawn diameter apart.
-    pub fn queueBurst(gw: *GpuWorld, w: *world.World, x: f32, y: f32, count: u32) !void {
+    pub fn queueBurst(gw: *GpuWorld, w: *world.World, x: f32, y: f32, requested: u32) !void {
+        const count: u32 = @intCast(@min(requested, gw.spawnRoom()));
+        if (count < requested) std.log.warn("spawn burst truncated: requested {d}, room for {d}", .{ requested, count });
         if (count == 0) return;
         try gw.pending.ensureUnusedCapacity(gw.gpa, count);
         try gw.pending_pos.ensureUnusedCapacity(gw.gpa, count);
@@ -1342,6 +1353,36 @@ test "gpu world: spawn, merge, pick/grab/release, lasso, explosion" {
     gw.drain(&w);
     try std.testing.expectEqual(@as(u32, 3), gw.count);
     try std.testing.expectEqual(@as(u32, 2), gw.alive);
+}
+
+test "gpu world: spawns beyond capacity are refused at queue time" {
+    _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SkipZigTest;
+    defer c.SDL_Quit();
+    const gfx = @import("gfx.zig");
+    var gpu = gfx.Gfx.init(.{ .window = null }) catch return error.SkipZigTest;
+    defer gpu.deinit();
+    const gpa = std.testing.allocator;
+    var gw = try GpuWorld.initCap(gpa, gpu.dev, 1000);
+    defer gw.deinit();
+    gw.profile_every = 0;
+    var w = world.World.init(gpa, 7);
+    defer w.deinit();
+    const in: Input = .{ .mutual_gravity = false, .merging = false, .random_explosions = false };
+
+    try gw.queueBurst(&w, 500, 500, 5000);
+    try std.testing.expectEqual(@as(usize, 1000), gw.pendingSpawns());
+    var area: f64 = 0;
+    for (gw.pending.items) |nb| area += std.math.pi * nb.radius * nb.radius;
+    try std.testing.expectApproxEqRel(area, gw.total_area, 1e-9);
+    try gw.queueBall(&w, 0, 0);
+    try std.testing.expectEqual(@as(usize, 1000), gw.pendingSpawns());
+
+    while (gw.pendingSpawns() > 0) gw.tick(&w, in);
+    gw.drain(&w);
+    try std.testing.expectEqual(@as(u32, 1000), gw.count);
+    try std.testing.expectEqual(@as(u32, 1000), gw.alive);
+    try std.testing.expectEqual(@as(usize, 0), gw.spawnRoom());
 }
 
 test "gpu world: balls past one dispatch row (2D dispatch) are simulated" {
