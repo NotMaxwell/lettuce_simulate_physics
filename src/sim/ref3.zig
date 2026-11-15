@@ -246,7 +246,90 @@ pub const Tree = struct {
         }
         return .{ .a = .{ acc.a[0] * g, acc.a[1] * g, acc.a[2] * g }, .pot = acc.pot * g };
     }
+
+    /// `walk` with the opening decision made for a group of targets inside the box [lo, hi]
+    /// (quanta, inclusive): a node is accepted only if every point of the box would accept it, so
+    /// each target gets the interactions of its own walk or finer ones. Terms are those of `walk`.
+    pub fn walkBox(t: Tree, target: Pos3, self: ?u32, lo: Pos3, hi: Pos3, g: f64, eps: f64, stats: ?*Stats) Accel {
+        var acc: Accel = .{};
+        var st: Stats = .{};
+        const tp = [3]f64{ phys(target.x, t.box), phys(target.y, t.box), phys(target.z, t.box) };
+        const eps2 = eps * eps;
+        var idx: u32 = 0;
+        while (idx != end) {
+            const n = t.nodes[idx];
+            st.visits += 1;
+            const d2 = boxDist2(lo, hi, n.com, t.box);
+            if (d2 > n.open_r2 and d2 > near_k * near_k * eps2) {
+                st.cells += 1;
+                const r = [3]f64{ tp[0] - phys(n.com.x, t.box), tp[1] - phys(n.com.y, t.box), tp[2] - phys(n.com.z, t.box) };
+                cellAccel(&acc, r, r[0] * r[0] + r[1] * r[1] + r[2] * r[2], n.mass, t.quads[idx], eps2);
+                idx = n.skip;
+            } else if (isLeaf(n)) {
+                const first = n.child & ~leaf_flag;
+                const cnt = nodeCount(n);
+                for (first..first + cnt) |j| {
+                    if (self != null and j == self.?) continue;
+                    st.pairs += 1;
+                    const p = t.pos[j];
+                    pair(&acc, .{ phys(p.x, t.box) - tp[0], phys(p.y, t.box) - tp[1], phys(p.z, t.box) - tp[2] }, t.mass[j], eps2);
+                }
+                idx = n.skip;
+            } else idx = n.child;
+        }
+        if (stats) |s| {
+            s.visits += st.visits;
+            s.cells += st.cells;
+            s.pairs += st.pairs;
+        }
+        return .{ .a = .{ acc.a[0] * g, acc.a[1] * g, acc.a[2] * g }, .pot = acc.pot * g };
+    }
+
+    /// The group walk of the GPU (k3/walk.zig walkGroup) for every sorted body. Groups are the
+    /// topmost nodes holding at most `group` bodies, or leaves above that (one shared key); their
+    /// bodies, in blocks of `group`, walk with the bounding box of their block. `out[s]` is sorted
+    /// body s.
+    pub fn walkGroups(t: Tree, group: u32, g: f64, eps: f64, out: []Accel, stats: ?*Stats) void {
+        var idx: u32 = 0;
+        while (idx != end) {
+            const gn = t.nodes[idx];
+            if (!isLeaf(gn) and nodeCount(gn) > group) {
+                idx = gn.child;
+                continue;
+            }
+            var ln = gn;
+            while (!isLeaf(ln)) ln = t.nodes[ln.child];
+            const first = ln.child & ~leaf_flag;
+            const stop = first + nodeCount(gn);
+            idx = gn.skip;
+            var b = first;
+            while (b < stop) : (b += group) {
+                const e = @min(b + group, stop);
+                var lo = t.pos[b];
+                var hi = lo;
+                for (t.pos[b..e]) |p| {
+                    lo = .{ .x = @min(lo.x, p.x), .y = @min(lo.y, p.y), .z = @min(lo.z, p.z) };
+                    hi = .{ .x = @max(hi.x, p.x), .y = @max(hi.y, p.y), .z = @max(hi.z, p.z) };
+                }
+                for (b..e) |s| out[s] = t.walkBox(t.pos[s], @intCast(s), lo, hi, g, eps, stats);
+            }
+        }
+    }
 };
+
+/// Squared physical distance from `c` to the nearest point of the box [lo, hi] (quanta).
+pub fn boxDist2(lo: Pos3, hi: Pos3, c: Pos3, box: f64) f64 {
+    const gap = struct {
+        fn f(l: u32, h: u32, v: u32) f64 {
+            const vv: i64 = v;
+            const d = @max(@as(i64, l) - vv, vv - @as(i64, h), 0);
+            return @floatFromInt(d);
+        }
+    }.f;
+    const s = box / 4294967296.0;
+    const d = [3]f64{ gap(lo.x, hi.x, c.x) * s, gap(lo.y, hi.y, c.y) * s, gap(lo.z, hi.z, c.z) * s };
+    return d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+}
 
 /// Nodes closer than near_k softening lengths are never accepted. Measured (2 x 400-body clumps of
 /// size 0.2 eps, 0.5-40 eps apart): with no guard, cells inside a clump smaller than eps cost 4e-3
