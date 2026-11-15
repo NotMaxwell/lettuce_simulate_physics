@@ -106,13 +106,12 @@ Decisions for the user (block the phases marked):
      again 28 s after the sim was gone). `--walk` is not stored in snapshots: a bit-identical restart
      needs the same flag. Far cells still use f32 offsets (reviewer estimate: up to ~4e-3 relative on
      one cell for wide outskirt groups, unmeasured). WP7 CUDA/PTX backend, first half merged 2026-11-15:
-     `zig build ptx` emits k3_direct/step/tree as PTX (sm_80) through a backend switch in
-     `k3/common.zig`; host contract in docs/ptx.md. Compile-only: nothing assembled (no ptxas) or
-     run (no NVIDIA GPU). To do: sort and walk to PTX (sort.zig `sharedInc` -> `C.atomicIncShared`,
-     walk.zig `cc` -> `C.ccFor`, and walk.zig must stop importing tree.zig: that import puts tree's
-     10 entry points into k3_walk.spv today, confirmed by review); per-kernel block-size table and
-     the missing `.maxntid` in docs/ptx.md; host side (Backend interface over SDL_GPU or a dlopened
-     libcuda), which waits on cluster info.
+     `zig build ptx` emits all five k3 kernel files as PTX (sm_80; direct 1, step 4, tree 10,
+     sort 6, walk 12 entries) through a backend switch in `k3/common.zig`; host contract and the
+     per-entry block-size table in docs/ptx.md. Compile-only: nothing assembled (no ptxas) or run
+     (no NVIDIA GPU). k3_walk.spv no longer carries tree's entry points (12, was 22). Open: no
+     `.maxntid` is emitted (a 1024-thread walk entry may fail to launch); host side (Backend
+     interface over SDL_GPU or a dlopened libcuda), which waits on cluster info.
 - D2 Cluster: Alabama Supercomputer Center (docs https://hpcdocs.asc.edu/, being researched); which system, which GPUs, is Vulkan usable on compute nodes (else a CUDA/OpenCL backend),
      scheduler (Slurm?), GPUs per job, walltime, storage quota. On a compute node:
      `nvidia-smi`, `vulkaninfo --summary`, `sinfo`. Blocks 10+.
