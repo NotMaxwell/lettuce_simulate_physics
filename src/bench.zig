@@ -6,6 +6,7 @@ const world = @import("world.zig");
 const physics = @import("physics.zig");
 const gfx = @import("gfx.zig");
 const gpu_world = @import("gpu_world.zig");
+const L = @import("gpu_layout");
 
 test {
     _ = physics;
@@ -145,6 +146,10 @@ fn ms(ns: u64) f64 {
 /// off. Reports pipelined throughput (ticks submitted back to back, wall time / ticks, which is
 /// the GPU cost per tick once the queue is full) and a per-stage breakdown from blocking samples.
 fn gpuBench(n: u32, ticks: u32) !void {
+    if (n == 0 or n > L.max_balls_limit) {
+        std.debug.print("gpu bench: ball count {d} out of range, expected 1..{d}\n", .{ n, L.max_balls_limit });
+        std.process.exit(2);
+    }
     // SDL_GPU needs the video subsystem; the bench never opens a window.
     _ = c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "offscreen");
     if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SdlInit;
@@ -152,8 +157,9 @@ fn gpuBench(n: u32, ticks: u32) !void {
     var gpu = try gfx.Gfx.init(.{ .window = null });
     defer gpu.deinit();
     const gpa = std.heap.smp_allocator;
-    var gw = try gpu_world.GpuWorld.init(gpa, gpu.dev);
+    var gw = try gpu_world.GpuWorld.initCap(gpa, gpu.dev, n);
     defer gw.deinit();
+    std.debug.print("capacity {d} balls: {d} MiB of GPU buffers, {d:.1} B/ball\n", .{ gw.capacity, gw.gpu_bytes >> 20, @as(f64, @floatFromInt(gw.gpu_bytes)) / @as(f64, @floatFromInt(gw.capacity)) });
     var w = world.World.init(gpa, 42);
     defer w.deinit();
 
