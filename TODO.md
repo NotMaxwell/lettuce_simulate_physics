@@ -13,9 +13,8 @@
   2026-11-15 (game-bench): the bench sizes capacity to n (out-of-range n exits 2) and spawns beyond
   capacity are refused at queue time (`spawnRoom`), so bounds are never sized for balls that get
   dropped. Root cause NOT confirmed: reviewer's hypothesis is 1M balls in a play area sized for 4M
-  (sparse gravity tree/grid). Still to do with the GPU idle: retake the 1M/4M/16M per-pass table
-  (the agent's table was taken while a game held the GPU; buffers were 292 MiB at 1M, 849 MiB at
-  4M, 3077 MiB at 16M) and check that a sparse world (few balls, huge bounds) cannot hang the GPU.
+  (sparse gravity tree/grid). 1M/4M/16M now run clean (table under Scale item 1). Still to
+  do: check that a sparse world (few balls, huge bounds) cannot hang the GPU.
   Galaxy `queueBody` is not capped by `spawnRoom` (bounds there do not come from total_area).
 - Merge events: 32k per tick; pairs that don't fit merge next tick (game-fixes, 2026-11-13).
 - Zig's SPIR-V backend omits the `Block` decoration (VUID-04680); `src/tools/spirv_fixup.zig` patches
@@ -62,8 +61,17 @@ pull g·m/r), so circular speed is sqrt(g·M_enclosed) at any radius; disks have
 Every game feature must work at 1M balls on one GPU.
 Today (RX 7800 XT): 1M balls 2.39 ms/tick with gravity, 1.48 ms without; 100k 0.32-0.45 ms;
 galaxy disk 1M 13.8 ms/tick (gravity 12.7).
-1. [ ] Profile per pass at 1M/4M/16M (GPU timestamps, not blocking samples) and publish the table
-       in the perf overlay and `zig build bench`.
+1. [x] Per-pass table at 1M/4M/16M from `zig build bench -- <n> 100 gpu` (2026-11-15, GPU idle;
+       blocking samples, SDL_GPU has no timestamp queries; not shown in the perf overlay beyond
+       what it already had). ms/tick pipelined, then gravity / collide / merge-hoop-readback:
+       gravity on:  100k 0.53 (0.58/0.30/0.09) · 1M 2.37 (0.98/1.33/0.09) · 4M 13.4 (4.46/9.13/0.18)
+                    · 16M 78.1 (22.4/56.7/0.64)
+       gravity off: 100k 0.30 · 1M 1.47 (0.07/1.62/1.03) · 4M 9.63 (0.14/9.75/6.77)
+                    · 16M 60.7 (0.50/56.9/45.5)
+       GPU buffers: 1M 292 MiB (307 B/ball), 4M 849 MiB (223), 16M 3077 MiB (202).
+       Collide is superlinear (x6.9 for 1M->4M, x6.2 for 4M->16M) and is 70-90% of the tick above
+       1M: item 3. With gravity off the third column grows to most of the tick (45 ms at 16M);
+       unexplained, probably stage attribution in the blocking sampler.
 2. [x] Runtime capacity `--max-balls N` (default 1 << 20), 2D dispatch above 32768 groups
        (2026-11-15). Galaxy disk runs at 80M on the RX 7800 XT (16.08 of 16.37 GB, as reported by
        the agent; 96M spills). Per-pass GPU timestamps (item 1) not done. A bad `--max-balls` exits 2;
