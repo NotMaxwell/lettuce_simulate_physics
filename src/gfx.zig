@@ -40,7 +40,13 @@ const BallUniforms = extern struct {
     ignition_temp: f32,
     max_burn: f32,
     max_level: f32,
+    use_list: u32 = 0,
+    list_top: u32 = 0,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
 };
+
+const CC = @import("shaders/cull_common.zig");
 
 /// Caller-owned GPU buffers read by the ball pass. Create each with usage
 /// SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ | COMPUTE_STORAGE_READ | COMPUTE_STORAGE_WRITE
@@ -80,6 +86,11 @@ pub const BallPass = struct {
     /// Render interpolation between previous and current tick, 0..1.
     alpha: f32 = 1,
     cam: BallCamera = .{},
+    /// Cull off-screen balls and draw sub-pixel ones as points (shaders/ball_cull.zig): a u32
+    /// buffer of at least `count` entries that the frame may overwrite (GRAPHICS_STORAGE_READ |
+    /// COMPUTE_STORAGE_WRITE). Null draws every id as a sprite. Only one pass per frame may set it.
+    /// Particle pools must not: their flat-colour records go through the sprite path only.
+    lod_list: ?*c.SDL_GPUBuffer = null,
 };
 
 /// Must match `View` in shaders/sprite.zig (std140 uniform).
@@ -182,6 +193,16 @@ pub const Gfx = struct {
     trail_do_clear: bool = false,
     trail_do_record: bool = false,
     trail_active: bool = false,
+    point_pipe: *c.SDL_GPUGraphicsPipeline,
+    /// Cull kernels (built on first use) and their scratch: per-workgroup counts and offsets,
+    /// sized for `cull_groups` workgroups, and the two indirect draw records.
+    cull_pipes: ?[3]*c.SDL_GPUComputePipeline = null,
+    cull_grp: ?*c.SDL_GPUBuffer = null,
+    cull_offs: ?*c.SDL_GPUBuffer = null,
+    cull_args: ?*c.SDL_GPUBuffer = null,
+    cull_groups: u32 = 0,
+    /// Index into `ball_passes` of this frame's LOD pass.
+    lod_pass: ?u32 = null,
 
     pub fn init(opts: Options) !Gfx {
         // SPIR-V 1.5 shaders (see build.zig) need a Vulkan 1.2 instance; SDL defaults to 1.0.
@@ -213,8 +234,10 @@ pub const Gfx = struct {
         defer c.SDL_ReleaseGPUShader(dev, vs_sprite);
         const vs_tri = try shader(dev, "triVs", c.SDL_GPU_SHADERSTAGE_VERTEX, 0, 1, 1);
         defer c.SDL_ReleaseGPUShader(dev, vs_tri);
-        const vs_ball = try shaderFrom(dev, balls_spv, "ballVs", c.SDL_GPU_SHADERSTAGE_VERTEX, 0, 7, 1);
+        const vs_ball = try shaderFrom(dev, balls_spv, "ballVs", c.SDL_GPU_SHADERSTAGE_VERTEX, 0, 8, 1);
         defer c.SDL_ReleaseGPUShader(dev, vs_ball);
+        const vs_point = try shaderFrom(dev, balls_spv, "pointVs", c.SDL_GPU_SHADERSTAGE_VERTEX, 0, 8, 1);
+        defer c.SDL_ReleaseGPUShader(dev, vs_point);
         const fs = try shader(dev, "spriteFs", c.SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0, 0);
         defer c.SDL_ReleaseGPUShader(dev, fs);
 
@@ -235,6 +258,7 @@ pub const Gfx = struct {
             .sprite_pipe = try pipeline(dev, vs_sprite, fs, format),
             .tri_pipe = try pipeline(dev, vs_tri, fs, format),
             .ball_pipe = try pipeline(dev, vs_ball, fs, format),
+            .point_pipe = try pipelineFull(dev, vs_point, fs, format, false, c.SDL_GPU_PRIMITIVETYPE_POINTLIST),
             .sampler = sampler,
             .white = undefined,
             .width = opts.width,
@@ -251,6 +275,9 @@ pub const Gfx = struct {
         if (g.trail_pipe) |pp| c.SDL_ReleaseGPUGraphicsPipeline(g.dev, pp);
         if (g.trail_rec_pipe) |pp| c.SDL_ReleaseGPUComputePipeline(g.dev, pp);
         if (g.trail_ring) |b| c.SDL_ReleaseGPUBuffer(g.dev, b);
+        if (g.cull_pipes) |ps| for (ps) |pp| c.SDL_ReleaseGPUComputePipeline(g.dev, pp);
+        for ([_]?*c.SDL_GPUBuffer{ g.cull_grp, g.cull_offs, g.cull_args }) |mb| if (mb) |b| c.SDL_ReleaseGPUBuffer(g.dev, b);
+        c.SDL_ReleaseGPUGraphicsPipeline(g.dev, g.point_pipe);
         g.draws.deinit(std.heap.smp_allocator);
         g.ball_passes.deinit(std.heap.smp_allocator);
         if (g.canvas) |t| c.SDL_ReleaseGPUTexture(g.dev, t);
@@ -306,6 +333,7 @@ pub const Gfx = struct {
         g.draws.clearRetainingCapacity();
         g.ball_passes.clearRetainingCapacity();
         g.trail_active = false;
+        g.lod_pass = null;
         if (g.window) |w| {
             var pw: c_int = 0;
             var ph: c_int = 0;
@@ -341,10 +369,96 @@ pub const Gfx = struct {
     /// Draws `pass.count` balls straight from the caller's storage buffers (no per-ball CPU work),
     /// in call order with the other draws. The buffers must stay valid until `end` returns, and any
     /// compute work writing them must be submitted before `end` (same command stream, earlier).
-    pub fn ballPass(g: *Gfx, pass: BallPass) !void {
-        if (pass.count == 0) return;
+    pub fn ballPass(g: *Gfx, pass_in: BallPass) !void {
+        if (pass_in.count == 0) return;
+        var pass = pass_in;
+        if (pass.lod_list != null) {
+            if (g.lod_pass != null) {
+                pass.lod_list = null;
+            } else {
+                try g.ensureCull(divCeil(pass.count, L.group_size));
+                g.lod_pass = @intCast(g.ball_passes.items.len);
+            }
+        }
         try g.ball_passes.append(std.heap.smp_allocator, pass);
         try g.draws.append(std.heap.smp_allocator, .{ .kind = .balls, .tex = pass.atlas, .first = @intCast(g.ball_passes.items.len - 1), .count = pass.count });
+    }
+
+    /// Builds the cull pipelines on first use and grows the per-workgroup scratch to `groups`.
+    fn ensureCull(g: *Gfx, groups: u32) !void {
+        const dev = g.dev;
+        if (g.cull_pipes == null) {
+            const names = [3][*:0]const u8{ "cullCount", "cullScan", "cullWrite" };
+            var ps: [3]*c.SDL_GPUComputePipeline = undefined;
+            for (names, &ps, 0..) |name, *pp, k| {
+                pp.* = c.SDL_CreateGPUComputePipeline(dev, &.{
+                    .code_size = trail_rec_spv.len,
+                    .code = trail_rec_spv.ptr,
+                    .entrypoint = name,
+                    .format = c.SDL_GPU_SHADERFORMAT_SPIRV,
+                    .num_readonly_storage_buffers = 4,
+                    .num_readwrite_storage_buffers = 4,
+                    .num_uniform_buffers = 1,
+                    .threadcount_x = L.group_size,
+                    .threadcount_y = 1,
+                    .threadcount_z = 1,
+                }) orelse {
+                    for (ps[0..k]) |made| c.SDL_ReleaseGPUComputePipeline(dev, made);
+                    return fail("SDL_CreateGPUComputePipeline(ball cull)");
+                };
+            }
+            g.cull_pipes = ps;
+            g.cull_args = try storageBuffer(dev, CC.args_words * 4, c.SDL_GPU_BUFFERUSAGE_INDIRECT);
+        }
+        if (groups <= g.cull_groups) return;
+        // Headroom so a growing world does not reallocate every frame; SDL defers the release of
+        // the old buffers until frames in flight are done with them.
+        const want = groups + groups / 4 + 64;
+        for ([_]?*c.SDL_GPUBuffer{ g.cull_grp, g.cull_offs }) |mb| if (mb) |b| c.SDL_ReleaseGPUBuffer(dev, b);
+        g.cull_grp = null;
+        g.cull_offs = null;
+        g.cull_groups = 0;
+        g.cull_grp = try storageBuffer(dev, want * 4, 0);
+        g.cull_offs = try storageBuffer(dev, want * 8, 0);
+        g.cull_groups = want;
+    }
+
+    fn cullParams(g: *const Gfx, bp: BallPass) CC.CullParams {
+        return .{
+            .n = bp.count,
+            .groups = divCeil(bp.count, L.group_size),
+            .point_top = bp.count - 1,
+            .view_w = @floatFromInt(g.width),
+            .view_h = @floatFromInt(g.height),
+            .alpha = bp.alpha,
+            .scale = bp.cam.scale,
+            .ox = bp.cam.ox,
+            .oy = bp.cam.oy,
+            .bx = bp.cam.bx,
+            .by = bp.cam.by,
+        };
+    }
+
+    /// The cull passes of this frame's LOD ball pass; they fill its id list and the indirect args.
+    fn recordCull(g: *Gfx, cmd: *c.SDL_GPUCommandBuffer) void {
+        const bp = g.ball_passes.items[g.lod_pass orelse return];
+        const cp_params = g.cullParams(bp);
+        const ro = [4]*c.SDL_GPUBuffer{ bp.bufs.meta, bp.bufs.prev_pos, bp.bufs.pos, bp.bufs.body };
+        const rw = [4]c.SDL_GPUStorageBufferReadWriteBinding{
+            .{ .buffer = g.cull_grp.? },
+            .{ .buffer = g.cull_offs.? },
+            .{ .buffer = g.cull_args.? },
+            .{ .buffer = bp.lod_list.? },
+        };
+        const grid = L.dispatchGrid(cp_params.groups);
+        for (g.cull_pipes.?, 0..) |pipe, k| {
+            c.SDL_PushGPUComputeUniformData(cmd, 0, &cp_params, @sizeOf(CC.CullParams));
+            const cp = c.SDL_BeginGPUComputePass(cmd, null, 0, &rw, rw.len);
+            c.SDL_BindGPUComputePipeline(cp, pipe);
+            c.SDL_BindGPUComputeStorageBuffers(cp, 0, &ro, ro.len);
+            if (k == 1) c.SDL_DispatchGPUCompute(cp, 1, 1, 1) else c.SDL_DispatchGPUCompute(cp, grid[0], grid[1], 1);
+            c.SDL_EndGPUComputePass(cp);
+        }
     }
 
     /// Forgets all trail history (a new scene); applied by the next frame that draws trails.
@@ -461,6 +575,7 @@ pub const Gfx = struct {
         try g.vert_stage.upload(dev, copy.?, Vertex);
         c.SDL_EndGPUCopyPass(copy);
         if (g.trail_ring != null and g.trail_active) g.recordTrails(cmd);
+        g.recordCull(cmd);
 
         const view = View{ .width = @floatFromInt(g.width), .height = @floatFromInt(g.height) };
         c.SDL_PushGPUVertexUniformData(cmd, 0, &view, @sizeOf(View));
@@ -515,14 +630,32 @@ pub const Gfx = struct {
                     .max_level = cfg.max_level,
                 };
                 bound = .balls;
-                c.SDL_BindGPUGraphicsPipeline(pass, g.ball_pipe);
                 const b = bp.bufs;
-                const sbufs = [7]*c.SDL_GPUBuffer{ b.pos, b.prev_pos, b.body, b.state, b.heat, b.meta, b.tiles };
-                c.SDL_BindGPUVertexStorageBuffers(pass, 0, &sbufs, 7);
-                c.SDL_PushGPUVertexUniformData(cmd, 0, &u, @sizeOf(BallUniforms));
+                // Without a list the shader never reads binding 7, but it must be bound.
+                const sbufs = [8]*c.SDL_GPUBuffer{ b.pos, b.prev_pos, b.body, b.state, b.heat, b.meta, b.tiles, bp.lod_list orelse b.meta };
                 const bind = c.SDL_GPUTextureSamplerBinding{ .texture = bp.atlas, .sampler = g.sampler };
+                if (bp.lod_list == null) {
+                    c.SDL_BindGPUGraphicsPipeline(pass, g.ball_pipe);
+                    c.SDL_BindGPUVertexStorageBuffers(pass, 0, &sbufs, 8);
+                    c.SDL_PushGPUVertexUniformData(cmd, 0, &u, @sizeOf(BallUniforms));
+                    c.SDL_BindGPUFragmentSamplers(pass, 0, &bind, 1);
+                    c.SDL_DrawGPUPrimitives(pass, 6, bp.count, 0, 0);
+                    continue;
+                }
+                // Points first so sprites (larger bodies) stay on top of the dust.
+                var lu = u;
+                lu.use_list = 1;
+                lu.list_top = bp.count - 1;
+                c.SDL_BindGPUGraphicsPipeline(pass, g.point_pipe);
+                c.SDL_BindGPUVertexStorageBuffers(pass, 0, &sbufs, 8);
+                c.SDL_PushGPUVertexUniformData(cmd, 0, &lu, @sizeOf(BallUniforms));
                 c.SDL_BindGPUFragmentSamplers(pass, 0, &bind, 1);
-                c.SDL_DrawGPUPrimitives(pass, 6, bp.count, 0, 0);
+                c.SDL_DrawGPUPrimitivesIndirect(pass, g.cull_args.?, 16, 1);
+                c.SDL_BindGPUGraphicsPipeline(pass, g.ball_pipe);
+                c.SDL_BindGPUVertexStorageBuffers(pass, 0, &sbufs, 8);
+                c.SDL_PushGPUVertexUniformData(cmd, 0, &lu, @sizeOf(BallUniforms));
+                c.SDL_BindGPUFragmentSamplers(pass, 0, &bind, 1);
+                c.SDL_DrawGPUPrimitivesIndirect(pass, g.cull_args.?, 0, 1);
                 continue;
             }
             if (bound != d.kind) {
@@ -631,6 +764,10 @@ fn pipeline(dev: *c.SDL_GPUDevice, vs: *c.SDL_GPUShader, fs: *c.SDL_GPUShader, f
 }
 
 fn pipelineBlend(dev: *c.SDL_GPUDevice, vs: *c.SDL_GPUShader, fs: *c.SDL_GPUShader, format: c.SDL_GPUTextureFormat, additive: bool) !*c.SDL_GPUGraphicsPipeline {
+    return pipelineFull(dev, vs, fs, format, additive, c.SDL_GPU_PRIMITIVETYPE_TRIANGLELIST);
+}
+
+fn pipelineFull(dev: *c.SDL_GPUDevice, vs: *c.SDL_GPUShader, fs: *c.SDL_GPUShader, format: c.SDL_GPUTextureFormat, additive: bool, prim: c.SDL_GPUPrimitiveType) !*c.SDL_GPUGraphicsPipeline {
     const color = c.SDL_GPUColorTargetDescription{
         .format = format,
         .blend_state = .{
@@ -646,10 +783,21 @@ fn pipelineBlend(dev: *c.SDL_GPUDevice, vs: *c.SDL_GPUShader, fs: *c.SDL_GPUShad
     return c.SDL_CreateGPUGraphicsPipeline(dev, &.{
         .vertex_shader = vs,
         .fragment_shader = fs,
-        .primitive_type = c.SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
+        .primitive_type = prim,
         .rasterizer_state = .{ .cull_mode = c.SDL_GPU_CULLMODE_NONE },
         .target_info = .{ .color_target_descriptions = &color, .num_color_targets = 1 },
     }) orelse fail("SDL_CreateGPUGraphicsPipeline");
+}
+
+fn storageBuffer(dev: *c.SDL_GPUDevice, size: u32, extra_usage: u32) !*c.SDL_GPUBuffer {
+    return c.SDL_CreateGPUBuffer(dev, &.{
+        .usage = c.SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_READ | c.SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE | extra_usage,
+        .size = size,
+    }) orelse fail("SDL_CreateGPUBuffer");
+}
+
+fn divCeil(a: u32, b: u32) u32 {
+    return (a + b - 1) / b;
 }
 
 fn fail(what: []const u8) error{Gpu} {

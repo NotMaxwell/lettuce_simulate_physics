@@ -4,16 +4,29 @@
 //! so a layout change cannot drift between the two.
 //!
 //! Balls live on the GPU as struct-of-arrays storage buffers (one buffer per field group below),
-//! sized for `max_balls` and indexed by ball id. Passes that only need positions touch only `pos`.
+//! sized for the world's capacity (chosen at startup) and indexed by ball id. Passes that only
+//! need positions touch only `pos`.
 
-pub const max_balls: u32 = 1 << 20;
+/// Ball capacity of the game when none is asked for (main.zig --max-balls).
+pub const default_max_balls: u32 = 1 << 20;
+/// Largest capacity: SDL_GPU buffer sizes are u32, and the widest per-ball buffers hold 16 bytes.
+pub const max_balls_limit: u32 = 0x0FFF_FFFF;
 
 /// Workgroup size for every 1D compute kernel.
 pub const group_size: u32 = 256;
+/// Workgroups per row of a dispatch: passes over more than dispatch_x * group_size threads go 2D
+/// (y rows of dispatch_x groups), because x is capped (65535 on some drivers). Kernels recover the
+/// flat id as global_invocation_id.x + global_invocation_id.y * dispatch_x * group_size.
+pub const dispatch_x: u32 = 32768;
+
+/// Grid size (x, y) of a 1D dispatch of `groups` workgroups.
+pub fn dispatchGrid(groups: u32) [2]u32 {
+    return .{ @min(groups, dispatch_x), (groups + dispatch_x - 1) / dispatch_x };
+}
 
 pub const Vec2 = extern struct { x: f32, y: f32 };
 
-/// Per-ball field groups; each is its own storage buffer of `max_balls` elements.
+/// Per-ball field groups; each is its own storage buffer of capacity elements.
 pub const BallPos = Vec2; // current position (world units)
 pub const BallPrevPos = Vec2; // position at previous tick, for render interpolation
 pub const BallVel = Vec2; // velocity, world units per tick
