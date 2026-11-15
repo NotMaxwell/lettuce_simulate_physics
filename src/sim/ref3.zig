@@ -285,10 +285,10 @@ pub const Tree = struct {
         return .{ .a = .{ acc.a[0] * g, acc.a[1] * g, acc.a[2] * g }, .pot = acc.pot * g };
     }
 
-    /// The group walk of the GPU (k3/walk.zig walkGroup) for every sorted body. Groups are the
-    /// topmost nodes holding at most `group` bodies, or leaves above that (one shared key); their
-    /// bodies, in blocks of `group`, walk with the bounding box of their block. `out[s]` is sorted
-    /// body s.
+    /// The group walk of the GPU (k3/walk.zig walkNodes) for every sorted body. Groups are the
+    /// topmost nodes holding at most `group` bodies; a leaf above that (one shared key) is split
+    /// where it crosses the blocks [q group, q group + group) of the body order. Each group walks
+    /// with its bounding box. `out[s]` is sorted body s.
     pub fn walkGroups(t: Tree, group: u32, g: f64, eps: f64, out: []Accel, stats: ?*Stats) void {
         var idx: u32 = 0;
         while (idx != end) {
@@ -303,8 +303,9 @@ pub const Tree = struct {
             const stop = first + nodeCount(gn);
             idx = gn.skip;
             var b = first;
-            while (b < stop) : (b += group) {
-                const e = @min(b + group, stop);
+            while (b < stop) {
+                const e = if (stop - first > group) @min((b / group + 1) * group, stop) else stop;
+                defer b = e;
                 var lo = t.pos[b];
                 var hi = lo;
                 for (t.pos[b..e]) |p| {

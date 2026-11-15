@@ -250,6 +250,118 @@ fn timeWalk(rig: *Rig, eps: f32, reps: u32) !f64 {
     return best;
 }
 
+/// plummerCloud plus, for each entry of `runs`, that many bodies at one point: the corners of the
+/// open domain, where escapers stick (k3/step.zig). Each run shares one 63-bit key, so it is one
+/// leaf whatever its size.
+fn bigLeafCloud(gpa: std.mem.Allocator, n: usize, runs: []const u32, seed: u64) !Cloud {
+    var extra: usize = 0;
+    for (runs) |k| extra += k;
+    const base = try plummerCloud(gpa, n, seed);
+    defer base.deinit(gpa);
+    const pos = try gpa.alloc(ref3.Pos3, n + extra);
+    errdefer gpa.free(pos);
+    const mass = try gpa.alloc(f32, n + extra);
+    @memcpy(pos[0..n], base.pos);
+    @memcpy(mass[0..n], base.mass);
+    var at = n;
+    for (runs, 0..) |k, r| {
+        const lo: u32 = 1 << 30;
+        const hi: u32 = 3 * (1 << 30) - 1;
+        const corner: ref3.Pos3 = .{ .x = if (r & 1 != 0) hi else lo, .y = if (r & 2 != 0) hi else lo, .z = if (r & 4 != 0) hi else lo };
+        @memset(pos[at..][0..k], corner);
+        @memset(mass[at..][0..k], base.mass[0]);
+        at += k;
+    }
+    return .{ .pos = pos, .mass = mass, .box = base.box };
+}
+
+/// Group-walk forces against ref3.walkGroups, at the tolerance of checkAccuracy.
+fn checkGroupRef(gpa: std.mem.Allocator, rig: *Rig, tree: ref3.Tree, eps: f32, label: []const u8) !void {
+    const out = try rig.forces(gpa, eps);
+    defer out.deinit(gpa);
+    const refs = try refWalk(gpa, tree, .group, eps);
+    defer gpa.free(refs);
+    const errs = try gpa.alloc(f64, out.acc.len);
+    defer gpa.free(errs);
+    var pot_err: f64 = 0;
+    for (errs, out.acc, out.pot, refs) |*e, a, p, ref| {
+        e.* = relErr(a, ref.a);
+        pot_err = @max(pot_err, @abs(p - ref.pot) / @abs(ref.pot));
+    }
+    const s = summarise(errs);
+    std.debug.print("walk3 group walk, {s}: vs ref3 rms {e:.3} p99 {e:.3} max {e:.3}, pot max {e:.3}\n", .{ label, s.rms, s.p99, s.max, pot_err });
+    try testing.expect(s.rms <= 1e-5);
+    try testing.expect(s.p99 <= 2e-5);
+    try testing.expect(pot_err <= 1e-5);
+}
+
+test "walk3: group walk with one-key leaves of 65 to 700 bodies matches ref3" {
+    const dev = try device();
+    defer c.SDL_DestroyGPUDevice(dev);
+    const gpa = testing.allocator;
+    // 65 and 129 straddle block boundaries; 700 needs 11 blocks and 11 tiles per opening.
+    const cloud = try bigLeafCloud(gpa, 10_000, &.{ 65, 129, 700, 40 }, 42);
+    defer cloud.deinit(gpa);
+    const tree = try ref3.build(gpa, cloud.pos, cloud.mass, .{ .box = cloud.box, .theta = 0.6 });
+    defer tree.deinit(gpa);
+    var big: u32 = 0;
+    for (0..tree.leaves) |j| {
+        if (ref3.nodeCount(tree.nodes[tree.leafNode(@intCast(j))]) > walk3.group_bodies) big += 1;
+    }
+    try testing.expectEqual(@as(u32, 3), big);
+    var rig = try Rig.init(dev, tree);
+    defer rig.deinit();
+    try checkGroupRef(gpa, &rig, tree, 1e-4, "one-key leaves of 65, 129, 700");
+    // The 700-body corner is 3 eps from nothing else at eps 0.05, but the runs see each other
+    // through the leaf loop at any eps.
+    try checkGroupRef(gpa, &rig, tree, 0.05, "same, eps 0.05");
+}
+
+test "walk3: group walk in one 2D dispatch matches ref3 and the chunked run" {
+    const dev = try device();
+    defer c.SDL_DestroyGPUDevice(dev);
+    const gpa = testing.allocator;
+    // Rig passes no leaf bound, so a dispatch has 2n + 1 workgroups: n = 17000 is past 32768.
+    const n = 17_000;
+    const cloud = try plummerCloud(gpa, n, 7);
+    defer cloud.deinit(gpa);
+    const tree = try ref3.build(gpa, cloud.pos, cloud.mass, .{ .box = cloud.box, .theta = 0.6 });
+    defer tree.deinit(gpa);
+    var rig = try Rig.init(dev, tree);
+    defer rig.deinit();
+    const chunked = try rig.forces(gpa, 1e-4);
+    defer chunked.deinit(gpa);
+    rig.w.chunk = 8 * (2 * n + 1);
+    try checkGroupRef(gpa, &rig, tree, 1e-4, "17k bodies, one dispatch of 34001 workgroups");
+    const whole = try rig.forces(gpa, 1e-4);
+    defer whole.deinit(gpa);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(chunked.acc), std.mem.sliceAsBytes(whole.acc));
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(chunked.pot), std.mem.sliceAsBytes(whole.pot));
+}
+
+test "walk3: walk time with a one-key leaf of K bodies (WALK3_BIGLEAF=K,...)" {
+    const list = envSet("WALK3_BIGLEAF") orelse return error.SkipZigTest;
+    const n: u32 = if (envSet("WALK3_BIGLEAF_N")) |s| try std.fmt.parseInt(u32, s, 10) else 1_000_000;
+    const dev = try device();
+    defer c.SDL_DestroyGPUDevice(dev);
+    const gpa = std.heap.smp_allocator;
+    var it = std.mem.tokenizeScalar(u8, list, ',');
+    while (it.next()) |tok| {
+        const k = try std.fmt.parseInt(u32, tok, 10);
+        const cloud = try bigLeafCloud(gpa, n, if (k == 0) &.{} else &.{k}, 42);
+        defer cloud.deinit(gpa);
+        const tree = try ref3.build(gpa, cloud.pos, cloud.mass, .{ .box = cloud.box, .theta = 0.6 });
+        defer tree.deinit(gpa);
+        var rig = try Rig.init(dev, tree);
+        defer rig.deinit();
+        rig.w.mode = .group;
+        const gms = try timeWalk(&rig, 0.01, 3);
+        rig.w.mode = .body;
+        const bms = try timeWalk(&rig, 0.01, 3);
+        std.debug.print("bigleaf: {d} Plummer + one leaf of {d}: group walk {d:.2} ms, per-body walk {d:.2} ms (min of 3)\n", .{ n, k, gms, bms });
+    }
+}
+
 test "walk3: two tight clumps 0.5 to 40 softening lengths apart match direct sum" {
     const dev = try device();
     defer c.SDL_DestroyGPUDevice(dev);

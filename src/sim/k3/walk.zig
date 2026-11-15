@@ -34,11 +34,11 @@ const count_mask: u32 = (1 << 26) - 1;
 const status_leaves: u32 = 6;
 const status_overflow: u32 = 8;
 
-/// One tile of an opened leaf, relative to the group box (walkGroup); sized for the largest group.
+/// One tile of an opened leaf (walkGroup): positions, and masses over box_scale^2 (quantaPair).
 const max_group: u32 = 64;
-const sh_x = C.Shared(f32, max_group, "sh_x");
-const sh_y = C.Shared(f32, max_group, "sh_y");
-const sh_z = C.Shared(f32, max_group, "sh_z");
+const sh_px = C.Shared(u32, max_group, "sh_px");
+const sh_py = C.Shared(u32, max_group, "sh_py");
+const sh_pz = C.Shared(u32, max_group, "sh_pz");
 const sh_m = C.Shared(f32, max_group, "sh_m");
 
 fn cc(comptime x: u32) @import("std").builtin.CallingConvention {
@@ -60,6 +60,8 @@ const Acc = struct {
     y: f32 = 0,
     z: f32 = 0,
     phi: f32 = 0,
+    /// Leaf-pair potential over bs (quantaPair).
+    phi_q: f32 = 0,
     visits: u32 = 0,
     cells: u32 = 0,
     pairs: u32 = 0,
@@ -116,7 +118,7 @@ inline fn finish(i: u32, a: Acc, comptime vr: Variant) void {
     }
     C.store(amag, i, @sqrt(gx * gx + gy * gy + gz * gz));
     if (params.flags & L.sim3_flag_potential != 0) {
-        C.store(pot, i, g * a.phi);
+        C.store(pot, i, g * (a.phi + a.phi_q * params.box_scale));
     }
 }
 
@@ -166,23 +168,32 @@ inline fn walkBody(comptime gs: u32, comptime vr: Variant) void {
     finish(i, a, vr);
 }
 
-/// Groups are the tree's "group nodes": the topmost nodes holding at most gs bodies, or leaves
-/// (one shared key) above that. Workgroup 0 checks the root; workgroup 1 + 2p + side checks child
-/// `side` of internal node p, which is a group node when p holds more than gs bodies and the child
-/// does not (or is a leaf). The host dispatches 1 + 2 * (an upper bound on the leaf count), and at
-/// least n / gs workgroups; the rest leave at once.
+/// Two roles per workgroup w, both checked by every workgroup:
+/// - Group nodes: the topmost nodes holding at most gs bodies. Workgroup 0 checks the root;
+///   workgroup 1 + 2p + side checks child `side` of internal node p, which is a group node when p
+///   holds more than gs bodies and the child does not.
+/// - Big leaves: a leaf of more than gs bodies (one shared key) is walked in the blocks
+///   [q gs, q gs + gs) of the body order it overlaps, block q by workgroup q, so its cost (each
+///   of its bodies sums all of the others) is spread over workgroups instead of serialised.
+/// The host dispatches max(1 + 2 * (a bound on the leaf count), n / gs) workgroups.
 inline fn walkNodes(comptime gs: u32, comptime vr: Variant) void {
     const group = C.groupId();
     if (group >= params.count) return;
     const w = params.first + group;
     const lid = C.lid();
+    // Runtime index base: a comptime index into a buffer array field miscompiles (k3/tree.zig).
+    const s0 = params.count - params.count;
     // An overflowed build left an empty root: zero force for every body, as walkBody computes.
-    if (C.load(status, status_overflow) != 0) {
+    if (C.load(status, s0 + status_overflow) != 0) {
         const i = w * gs + lid;
         if (i < params.n) finish(i, .{}, vr);
         return;
     }
-    const m = C.load(status, status_leaves);
+    groupNode(gs, w, C.load(status, s0 + status_leaves), lid, vr);
+    if (w < (params.n + gs - 1) / gs) bigLeafBlock(gs, w, lid, vr);
+}
+
+inline fn groupNode(comptime gs: u32, w: u32, m: u32, lid: u32, comptime vr: Variant) void {
     var c: u32 = 0;
     if (w != 0) {
         const p = (w - 1) / 2;
@@ -194,15 +205,76 @@ inline fn walkNodes(comptime gs: u32, comptime vr: Variant) void {
     }
     const cn = C.load(nodes, c);
     const count = cn.info & count_mask;
-    if (cn.child & leaf_flag == 0 and count > gs) return;
+    // Internal nodes above gs are not groups; leaves above gs are bigLeafBlock's.
+    if (count > gs) return;
     // First body: the leftmost leaf's.
     var dn = cn;
     while (dn.child & leaf_flag == 0) dn = C.load(nodes, dn.child);
-    const first = dn.child & ~leaf_flag;
-    var base: u32 = 0;
-    while (base < count) : (base += gs) {
-        walkGroup(gs, first + base, @min(gs, count - base), lid, vr);
+    walkGroup(gs, dn.child & ~leaf_flag, count, lid, vr);
+}
+
+/// Leaves hold at most 32 bodies unless they share one 63-bit key (ref3.leafRange), so with
+/// gs >= 32 a leaf of more than gs bodies is exactly a run of more than gs equal keys. Block q
+/// meets at most two such runs: the one containing its first body and the one containing its last.
+inline fn bigLeafBlock(comptime gs: u32, q: u32, lid: u32, comptime vr: Variant) void {
+    const f = q * gs;
+    const e = @min(f + gs, params.n) - 1;
+    var after = f;
+    if (inBigRun(gs, f)) {
+        const hi = runEnd(f);
+        walkGroup(gs, f, @min(hi, e) - f + 1, lid, vr);
+        after = hi + 1;
     }
+    if (e >= after and inBigRun(gs, e)) {
+        const lo = runStart(e);
+        walkGroup(gs, lo, e - lo + 1, lid, vr);
+    }
+}
+
+inline fn sameKey(a: u32, b: u32) bool {
+    const p = C.load(pos, a);
+    const r = C.load(pos, b);
+    return ((p.x ^ r.x) | (p.y ^ r.y) | (p.z ^ r.z)) >> 11 == 0;
+}
+
+/// Whether body x is in a run of more than gs equal keys. Such a run reaches 32 bodies to one side
+/// of any of its members, so one or two compares reject almost every body before the searches.
+inline fn inBigRun(comptime gs: u32, x: u32) bool {
+    const n = params.n;
+    const near = (x >= gs / 2 and sameKey(x, x - gs / 2)) or (x + gs / 2 < n and sameKey(x, x + gs / 2));
+    return near and runEnd(x) - runStart(x) + 1 > gs;
+}
+
+/// First body of x's run of equal keys: doubling steps, then halving (all loads uniform).
+inline fn runStart(x: u32) u32 {
+    var lo = x;
+    var step: u32 = 1;
+    while (step <= lo and sameKey(lo - step, x)) {
+        lo -= step;
+        step *= 2;
+    }
+    // lo is in the run, lo - step is not (or does not exist).
+    while (step > 1) {
+        step /= 2;
+        if (step <= lo and sameKey(lo - step, x)) lo -= step;
+    }
+    return lo;
+}
+
+/// Last body of x's run of equal keys.
+inline fn runEnd(x: u32) u32 {
+    const last = params.n - 1;
+    var hi = x;
+    var step: u32 = 1;
+    while (step <= last - hi and sameKey(hi + step, x)) {
+        hi += step;
+        step *= 2;
+    }
+    while (step > 1) {
+        step /= 2;
+        if (step <= last - hi and sameKey(hi + step, x)) hi += step;
+    }
+    return hi;
 }
 
 /// The shared walk of bodies [g0, g0 + gn). Every thread runs it (barriers); threads past gn
@@ -222,11 +294,14 @@ inline fn walkGroup(comptime gs: u32, g0: u32, gn: u32, lid: u32, comptime vr: V
     const bs = params.box_scale;
     const eps2 = params.eps2;
     const near2 = 9 * eps2;
-    // Positions as f32 offsets from the box corner: a pair or a cell then costs one subtract per
-    // axis instead of a subtract, a conversion and a scale (measured 25% of the walk at 1M).
+    // The target as an f32 offset from the box corner: a cell's r is then the uniform integer
+    // corner-to-com offset plus mx, a conversion and a multiply-add per axis.
     const mx = C.delta(me.x, lo.x) * bs;
     const my = C.delta(me.y, lo.y) * bs;
     const mz = C.delta(me.z, lo.z) * bs;
+    // Leaf pairs are summed in quanta: exact integer offsets, no scale per pair (quantaPair).
+    const inv_bs2 = 1 / (bs * bs);
+    const eps2_q = eps2 * inv_bs2;
     var a: Acc = .{};
     var idx: u32 = 0;
     while (idx != end) {
@@ -254,19 +329,19 @@ inline fn walkGroup(comptime gs: u32, g0: u32, gn: u32, lid: u32, comptime vr: V
                 C.barrier();
                 if (lid < tn) {
                     const p = if (vr.no_leaf_mem) L.Pos3{ .x = lo.x +% lid, .y = lo.y, .z = lo.z } else C.load(pos, tb + lid);
-                    sh_x[lid] = C.delta(p.x, lo.x) * bs;
-                    sh_y[lid] = C.delta(p.y, lo.y) * bs;
-                    sh_z[lid] = C.delta(p.z, lo.z) * bs;
-                    sh_m[lid] = if (vr.no_leaf_mem) bs else C.load(mass, tb + lid);
+                    sh_px[lid] = p.x;
+                    sh_py[lid] = p.y;
+                    sh_pz[lid] = p.z;
+                    sh_m[lid] = (if (vr.no_leaf_mem) bs else C.load(mass, tb + lid)) * inv_bs2;
                 }
                 C.barrier();
                 // Self pair by index, as in ref3; branch-free so the loop can be unrolled.
                 var t: u32 = 0;
                 while (t + 1 < tn) : (t += 2) {
-                    relPair(&a, tb + t == i, sh_x[t] - mx, sh_y[t] - my, sh_z[t] - mz, sh_m[t], eps2);
-                    relPair(&a, tb + t + 1 == i, sh_x[t + 1] - mx, sh_y[t + 1] - my, sh_z[t + 1] - mz, sh_m[t + 1], eps2);
+                    quantaPair(&a, tb + t == i, me, t, eps2_q);
+                    quantaPair(&a, tb + t + 1 == i, me, t + 1, eps2_q);
                 }
-                if (t < tn) relPair(&a, tb + t == i, sh_x[t] - mx, sh_y[t] - my, sh_z[t] - mz, sh_m[t], eps2);
+                if (t < tn) quantaPair(&a, tb + t == i, me, t, eps2_q);
             }
             idx = nd.skip;
         } else idx = nd.child;
@@ -279,18 +354,24 @@ inline fn gap(l: u32, h: u32, v: u32) u32 {
     return if (v < l) l - v else if (v > h) v - h else 0;
 }
 
-/// Softened pair at offset d (source minus target); the self pair adds exact zeros.
-inline fn relPair(a: *Acc, self: bool, dx: f32, dy: f32, dz: f32, m0: f32, eps2: f32) void {
+/// Softened pair with tile body t, from exact integer offsets d in quanta: with the tile mass
+/// prescaled by 1/bs^2 (and eps^2 by the same), m_q d / |d|^3 is the physical acceleration and
+/// m_q / |d| is the potential over bs. Offsets from the group box as f32 would save the
+/// conversions but round coincident bodies (escapers stuck at a wall) apart.
+inline fn quantaPair(a: *Acc, self: bool, me: L.Pos3, t: u32, eps2_q: f32) void {
     if (!self) a.pairs += 1;
-    const m = if (self) 0 else m0;
+    const dx = C.delta(sh_px[t], me.x);
+    const dy = C.delta(sh_py[t], me.y);
+    const dz = C.delta(sh_pz[t], me.z);
+    const m = if (self) 0 else sh_m[t];
     // 1 keeps the self term finite when eps is 0.
-    const s = if (self) 1 else dx * dx + dy * dy + dz * dz + eps2;
+    const s = if (self) 1 else dx * dx + dy * dy + dz * dz + eps2_q;
     const inv = 1.0 / @sqrt(s);
     const w = m * inv * inv * inv;
     a.x += w * dx;
     a.y += w * dy;
     a.z += w * dz;
-    a.phi -= m * inv;
+    a.phi_q -= m * inv;
 }
 
 // Per-body walk, one entry point per workgroup size; the host picks one (walk3.zig `group_sizes`).
