@@ -108,6 +108,10 @@ pub fn build(b: *std.Build) void {
     sim_mod.addAnonymousImport("k3_direct.spv", .{ .root_source_file = spirvObject(b, "k3_direct", b.path("src/sim/k3/direct.zig"), sim_layout, null) });
     sim_mod.addAnonymousImport("k3_step.spv", .{ .root_source_file = spirvObject(b, "k3_step", b.path("src/sim/k3/step.zig"), sim_layout, null) });
     sim_mod.addImport("ic3", b.createModule(.{ .root_source_file = b.path("src/ic3.zig"), .target = target, .optimize = optimize }));
+
+    // 3D tree-walk kick (src/sim/walk3.zig).
+    sim_mod.addAnonymousImport("k3_walk.spv", .{ .root_source_file = spirvObject(b, "k3_walk", b.path("src/sim/k3/walk.zig"), sim_layout, null) });
+
     const sim_exe = b.addExecutable(.{ .name = "sim", .root_module = sim_mod });
     b.installArtifact(sim_exe);
     const sim_run = b.addRunArtifact(sim_exe);

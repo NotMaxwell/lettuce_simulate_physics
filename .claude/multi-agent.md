@@ -20,6 +20,7 @@ commands, the file-ownership map and anything repo-specific. Agent definitions l
 |---|---|---|---|
 | `chore` | Haiku | low | Fully specified mechanical edits, renames, boilerplate, docs |
 | `verifier` | Haiku | low | Running build/tests/bench and summarising the logs |
+| `cleanup` | Haiku | low | Auditing worktrees/branches after merges: removes merged ones, reports the rest |
 | `Explore` (built-in) | — | — | Broad read-only search when only the conclusion is needed |
 | `builder` | Sonnet | medium | Ordinary module/feature work, ports, located bug fixes, tests |
 | `optimizer` | Opus | high | SIMD, threads, GPU kernels, spatial structures; must report before/after numbers |

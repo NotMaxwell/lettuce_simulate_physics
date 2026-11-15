@@ -71,8 +71,12 @@ Rough sizing for 2B (estimate, to be measured): lean layout ~20 B/body in 2D (40
 
 Decisions for the user (block the phases marked):
 - D1 Gravity: DECIDED 2026-11-13: 3D 1/r^2 for the sim (the game stays 2D). Design: docs/sim3d.md
-     (radix-tree Barnes-Hut, u32 positions, ~66 B/body). In progress: WP0+2 direct sum (branch
-     s3-direct), WP1 CPU reference tree (s3-ref), WP6 snapshot v2 + projection (s3-snap).
+     (radix-tree Barnes-Hut, u32 positions, ~66 B/body). Merged 2026-11-13: WP0+2 GPU direct sum,
+     KDK, diagnostics, snapshots (`--dim 3`); WP1 ref3 CPU reference; WP3 GPU sort (1M 2.0 ms, 16M
+     33 ms); WP4 GPU tree build (1M 2.0 ms, 16M 12.7 ms, 14 B/body + sort scratch); WP5 GPU walk
+     (θ=0.6: 1M 48 ms, 16M 857 ms; softened monopole+quad, 3-eps guard); WP6 snapshot v2 +
+     projection. In progress: `--method tree` integration (branch s3-integrate). Not started: WP7
+     CUDA/PTX backend (waiting on cluster info), WP8 scale table.
 - D2 Cluster: Alabama Supercomputer Center (docs https://hpcdocs.asc.edu/, being researched); which system, which GPUs, is Vulkan usable on compute nodes (else a CUDA/OpenCL backend),
      scheduler (Slurm?), GPUs per job, walltime, storage quota. On a compute node:
      `nvidia-smi`, `vulkaninfo --summary`, `sinfo`. Blocks 10+.
