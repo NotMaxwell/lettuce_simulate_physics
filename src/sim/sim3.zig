@@ -27,6 +27,7 @@ const Sort3 = @import("sort3.zig").Sort3;
 const tree3 = @import("tree3.zig");
 const Tree3 = tree3.Tree3;
 const Walk3 = @import("walk3.zig").Walk3;
+const WalkMode = @import("walk3.zig").Mode;
 
 const direct_spv = @embedFile("k3_direct.spv");
 const step_spv = @embedFile("k3_step.spv");
@@ -54,6 +55,8 @@ pub const Config = struct {
     method: Method = .direct,
     /// Opening angle of the tree method.
     theta: f32 = 0.6,
+    /// Tree walk (walk3.zig Mode): shared per group of 64 bodies, or one per body.
+    walk: WalkMode = .group,
     /// Tree node capacity is n / node_div (the design's N/4; the measured need is 0.09N). A larger
     /// divisor exists to exercise the overflow path.
     node_div: u32 = 4,
@@ -161,6 +164,7 @@ pub const Sim3 = struct {
             s.tree = try s.buildTree(s.cfg.n / cfg.node_div);
             errdefer s.tree.?.deinit();
             s.walk = try Walk3.init(dev);
+            s.walk.?.mode = cfg.walk;
             errdefer s.walk.?.deinit();
             s.status_tb = c.SDL_CreateGPUTransferBuffer(dev, &.{
                 .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD,
@@ -706,6 +710,7 @@ pub const Options = struct {
     bench: bool = false,
     method: enum { auto, direct, tree } = .auto,
     theta: f32 = 0.6,
+    walk: WalkMode = .group,
     out: ?[:0]const u8 = null,
     every_snap: u64 = 0,
     restart: ?[:0]const u8 = null,
@@ -714,7 +719,7 @@ pub const Options = struct {
 const usage =
     \\usage: sim --dim 3 [--ic plummer|kepler|uniform] [--n N] [--ticks K] [--dt F] [--every K] [--seed U64]
     \\               [--eps LEN] [--ecc E] [--margin M] [--boundary open|periodic] [--method auto|direct|tree]
-    \\               [--theta F] [--bench]
+    \\               [--theta F] [--walk group|body] [--bench]   (--theta, --walk: tree method only)
     \\               [--out DIR --every-snap K] [--restart FILE]   (restart: n, g, eps, dt, box, boundary come from the file; --ticks = further ticks)
     \\
 ;
@@ -765,6 +770,8 @@ fn parse(args: []const [:0]const u8) !Options {
             o.restart = v;
         } else if (std.mem.eql(u8, a, "--theta")) {
             o.theta = try std.fmt.parseFloat(f32, v);
+        } else if (std.mem.eql(u8, a, "--walk")) {
+            o.walk = std.meta.stringToEnum(WalkMode, v) orelse return error.BadWalk;
         } else return error.UnknownOption;
     }
     return o;
@@ -799,7 +806,7 @@ pub fn main(gpa: std.mem.Allocator, args: []const [:0]const u8) !void {
         header = try snap.readHeader(io);
         if (header.dim != 3) return error.BadHeader;
         const b: Boundary = @fromBackingInt(@intCast(@backingInt(@as(snap.Boundary, @fromBackingInt(@intCast(header.boundary))))));
-        cfg = .{ .n = @intCast(header.n), .g = header.g, .eps = header.softening, .dt = header.dt, .box = .{ .size = header.box_size }, .boundary = b, .theta = o.theta };
+        cfg = .{ .n = @intCast(header.n), .g = header.g, .eps = header.softening, .dt = header.dt, .box = .{ .size = header.box_size }, .boundary = b, .theta = o.theta, .walk = o.walk };
         std.debug.print("restart from {s}: {d} bodies at tick {d}\n", .{ path, header.n, header.tick });
     } else {
         var prng = std.Random.DefaultPrng.init(o.seed);
@@ -813,7 +820,7 @@ pub fn main(gpa: std.mem.Allocator, args: []const [:0]const u8) !void {
                 break :blk try gpa.dupe(ic3.Body3, &pair);
             },
         };
-        cfg = .{ .n = @intCast(bodies.len), .eps = o.eps, .dt = dt, .box = ic3.fitBox(bodies, o.margin), .boundary = o.boundary, .theta = o.theta };
+        cfg = .{ .n = @intCast(bodies.len), .eps = o.eps, .dt = dt, .box = ic3.fitBox(bodies, o.margin), .boundary = o.boundary, .theta = o.theta, .walk = o.walk };
     }
     const n = cfg.n;
     cfg.method = switch (o.method) {
@@ -829,7 +836,7 @@ pub fn main(gpa: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (restart_io) |io| try s.restore(gpa, io, &header) else try s.upload(bodies);
     gpa.free(bodies);
     bodies = &.{};
-    std.debug.print("{s}: {d} bodies, {s} (theta {d}), box {d:.4} (quantum {e:.2}), eps {d}, dt {d}, {d:.1} B/body\n", .{ @tagName(o.ic), n, @tagName(cfg.method), cfg.theta, cfg.box.size, cfg.box.size / 0x1p32, cfg.eps, cfg.dt, s.bytesPerBody() });
+    std.debug.print("{s}: {d} bodies, {s} (theta {d}, {t} walk), box {d:.4} (quantum {e:.2}), eps {d}, dt {d}, {d:.1} B/body\n", .{ @tagName(o.ic), n, @tagName(cfg.method), cfg.theta, cfg.walk, cfg.box.size, cfg.box.size / 0x1p32, cfg.eps, cfg.dt, s.bytesPerBody() });
     if (o.bench) return bench(&s, o);
 
     var sn: ?*snapper.Snapper = null;
