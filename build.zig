@@ -146,6 +146,14 @@ pub fn build(b: *std.Build) void {
     setGpuEnv(b, tree3_test_run);
     b.step("test-tree3", "GPU tree build tests only (src/sim/tree3_tests.zig)").dependOn(&tree3_test_run.step);
 
+    // PTX kernels for the CUDA driver API (docs/ptx.md); `zig build ptx` installs zig-out/ptx/k3_*.ptx.
+    const ptx_step = b.step("ptx", "Compile the k3 kernels to PTX (nvptx64-cuda, sm_80) into zig-out/ptx/");
+    // sort and walk are left out until they stop naming SPIR-V directly (docs/ptx.md).
+    inline for (.{ "direct", "step", "tree" }) |k| {
+        const f = b.addInstallFileWithDir(ptxObject(b, "k3_" ++ k, b.path("src/sim/k3/" ++ k ++ ".zig"), sim_layout), .{ .custom = "ptx" }, "k3_" ++ k ++ ".ptx");
+        ptx_step.dependOn(&f.step);
+    }
+
     // SDL_GPU demo: shaders are Zig compiled to SPIR-V and embedded with @embedFile.
     const demo_mod = b.createModule(.{
         .root_source_file = b.path("src/gfx_demo.zig"),
@@ -280,4 +288,22 @@ fn spirvObject(b: *std.Build, name: []const u8, root: std.Build.LazyPath, layout
         }),
     });
     return gpu_sim_build.fixedSpirv(b, obj.getEmittedBin(), b.fmt("{s}.spv", .{name}));
+}
+
+/// PTX (CUDA driver API) build of one k3 kernel file; not part of any default step.
+fn ptxObject(b: *std.Build, name: []const u8, root: std.Build.LazyPath, layout: *std.Build.Module) std.Build.LazyPath {
+    const obj = b.addObject(.{
+        .name = name,
+        .root_module = b.createModule(.{
+            .root_source_file = root,
+            .target = b.resolveTargetQuery(.{
+                .cpu_arch = .nvptx64,
+                .os_tag = .cuda,
+                .cpu_model = .{ .explicit = &std.Target.nvptx.cpu.sm_80 },
+            }),
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "gpu_layout", .module = layout }},
+        }),
+    });
+    return obj.getEmittedAsm();
 }
