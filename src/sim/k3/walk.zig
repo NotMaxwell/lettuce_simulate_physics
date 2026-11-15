@@ -43,11 +43,11 @@ const sh_m = C.Shared(f32, max_group, "sh_m");
 
 // A leaf above max_group bodies must be one run of equal keys (bigLeafBlock); that holds only if no leaf is capped above it.
 comptime {
-    if (@import("tree.zig").leaf_cap_bodies > max_group) @compileError("tree leaf cap exceeds the walk's max_group");
+    if (C.leaf_cap_bodies > max_group) @compileError("tree leaf cap exceeds the walk's max_group");
 }
 
 fn cc(comptime x: u32) @import("std").builtin.CallingConvention {
-    return .{ .spirv_kernel = .{ .x = x, .y = 1, .z = 1 } };
+    return C.ccFor(x);
 }
 
 /// Profiling switches (walk3_tests "profile"); the shipped entry points use the defaults.

@@ -1,6 +1,6 @@
 # PTX backend (work package 7, first half)
 
-Status: compile-only. Nothing here was assembled (`ptxas` is not installed) or run; there is no
+Status: compile-only, all five k3 kernel files build. Nothing here was assembled (`ptxas` is not installed) or run; there is no
 NVIDIA GPU on the build machine.
 
 ## What builds
@@ -13,8 +13,45 @@ nvptx64 can only emit assembly in Zig 0.17 (`-femit-asm`; `getEmittedAsm`), whic
 | `k3_direct.ptx` | kick | builds |
 | `k3_step.ptx` | drift, diag, rungsClear, rungs | builds |
 | `k3_tree.ptx` | leafCount, leafWrite, scanBlock, scanAdd, leafFinish, karras, depthLeaf, bigLeaves, depthArgs, moments | builds |
-| `k3_sort.ptx` | keys, histogram, scanRows, scatter, gather12, gather4 | needs the sort.zig edit below (verified on a scratch copy) |
-| `k3_walk.ptx` | walk64..walk1024, walkGroup64, walkStats, walkNoLeaf, walkNoLeafMem, walkGroup*64 (12) | needs the walk.zig edits below (verified on a scratch copy) |
+| `k3_sort.ptx` | keys, histogram, scanRows, scatter, gather12, gather4 | builds |
+| `k3_walk.ptx` | walk64, walk128, walk256, walk512, walk1024, walkGroup64, walkStats, walkNoLeafMem, walkNoLeaf, walkGroupStats64, walkGroupNoLeafMem64, walkGroupNoLeaf64 (12) | builds |
+
+All five are in the `ptx` step. Nothing was assembled or run (no `ptxas`, no NVIDIA GPU).
+
+## Launch contract per entry point
+`G` = `L.group_size` = 256 (src/gpu_layout.zig). Block is always (B, 1, 1). Grid is (min(g, 32768), ceil(g / 32768), 1)
+for `g` groups, except the indirect entries. Verified against the `callconv` of each `export fn` and the host dispatches
+in src/sim/{sim3,sort3,tree3,walk3}.zig.
+
+| file | entry | block B | groups g |
+|---|---|---|---|
+| direct | kick | G | ceil(count / G) per chunk |
+| step | drift | G | ceil(n / G) |
+| step | rungsClear | G | 1 (16 bins) |
+| step | rungs | G | ceil(n / G) |
+| step | diag | G | ceil(ceil(n / diag_per_thread) / G); the kernel returns early past that count |
+| sort | keys, gather12, gather4 | G | ceil(n / G) |
+| sort | histogram, scatter | G | ceil(n / (G * 8)) (`sort.block`) |
+| sort | scanRows | G | radix = 256 (one group per digit) |
+| tree | leafCount, leafWrite | G | ceil(n / 2048) (`block` = G * 8) |
+| tree | scanBlock | G | ceil(count / 2048) for that scan level |
+| tree | scanAdd | G | ceil(count / G) for that scan level |
+| tree | leafFinish, depthArgs | G | 1 |
+| tree | karras, depthLeaf, bigLeaves, moments | G | indirect: x/y/z read by the host from the args buffer the kernels write (`arg_moments`, offsets in tree3.zig); a zero grid must be skipped |
+| walk | walk64, walk128, walk256, walk512, walk1024 | 64, 128, 256, 512, 1024 as named | ceil(count / B) |
+| walk | walkGroup64 | 64 | count (one group per unit; `walk3.group_bodies` = 64) |
+| walk | walkGroupStats64, walkGroupNoLeafMem64, walkGroupNoLeaf64 | 64 | count, as walkGroup64 (profiling) |
+| walk | walkStats, walkNoLeafMem, walkNoLeaf | 1024 | ceil(count / 1024) (profiling) |
+
+**Warning: the block size is not a free parameter.** Kernels use the compile-time group size for strides, shared-array
+sizes, scan widths and loop bounds (e.g. `radix == group_size`, `sh[f * G + l]`, walk `max_group` = 64 shared arrays and
+the group walk's 64 bodies per group). Launching with a different block size silently corrupts results rather than
+failing. Likewise the group walk's results depend on its 64.
+
+**Open item: no `.maxntid`.** The PTX has no `.maxntid`/`.reqntid`, so ptxas may allocate more than 64 registers per thread.
+A 1024-thread entry (`walk1024`, `walkStats`, `walkNoLeafMem`, `walkNoLeaf`) that needs more than 64 registers would then fail
+at launch with `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`. Fix: emit `.maxntid` or post-process the PTX. Check with
+`cuFuncGetAttribute(CU_FUNC_ATTRIBUTE_NUM_REGS)` / `MAX_THREADS_PER_BLOCK` and fall back to a smaller `walkNNN`.
 
 ## Host contract
 Backend is chosen in `src/sim/k3/common.zig` from `builtin.cpu.arch`; kernel bodies are untouched.
@@ -40,18 +77,15 @@ New exports: `ccFor(x)`, `atomicIncShared(p)`, `leaf_cap_bodies`. PTX uses `@ato
   otherwise `mass` aliased `pot` and `sx`/`sy` aliased; and `addrspace(.constant)` is not supported
   on nvptx. Both fixed in common.zig (`const key = name;` capture, `.global` for the uniform).
 - `export`ed buffer structs must be `extern struct`.
-- sort.zig lines 34-44: `sharedInc` uses inline SPIR-V asm (`unsupported output constraint` on nvptx).
-  Replace the body with `C.atomicIncShared(p);` (keeps the same signature).
-- walk.zig lines 49-51: `cc` returns `.spirv_kernel`. Replace with `return C.ccFor(x);`.
-- walk.zig line 46 imports `tree.zig`, which on PTX pulls tree's kernels and a second `params` symbol
-  in (an exported symbol collision; SPIR-V silently renames it `params_0`, and walk.spv carries tree's
-  10 entry points as dead weight). Replace with `C.leaf_cap_bodies`, and in tree.zig line 28 write
-  `pub const leaf_cap_bodies: u32 = C.leaf_cap_bodies;`. After that `k3_sort`/`k3_walk` build; add
-  `"sort", "walk"` to the list in the `ptx` step of build.zig.
+- sort.zig `sharedInc` used inline SPIR-V asm (`unsupported output constraint` on nvptx); it now calls
+  `C.atomicIncShared`. The SPIR-V shim body is the same asm (OpAtomicIAdd, workgroup scope, semantics 0, value 1).
+- walk.zig `cc` now returns `C.ccFor(x)`.
+- walk.zig imported `tree.zig` only for `leaf_cap_bodies`, which pulled tree's kernels and a second `params`
+  symbol into the walk module (SPIR-V renamed it `params_0`; walk.spv had 22 entry points). The assert now uses
+  `C.leaf_cap_bodies`, and tree.zig re-exports it (`pub const leaf_cap_bodies: u32 = C.leaf_cap_bodies;`).
 
 ## Second half (not done)
 A `Backend` interface (alloc, copy, launch, sync) with two implementations: SDL_GPU (today's path)
 and a dlopened `libcuda.so` (cuInit, cuModuleLoadData on the PTX, cuModuleGetGlobal for the symbols
-above, cuLaunchKernel, cuMemAlloc, no 4 GiB binding cap). Open questions: `.maxntid`/`__launch_bounds__`
-is not emitted, so register allocation assumes up to 1024 threads; the device-scope atomics are
+above, cuLaunchKernel, cuMemAlloc, no 4 GiB binding cap). Open questions: `.maxntid` (see above); the device-scope atomics are
 relaxed, as on SPIR-V; shared memory above 48 KiB needs `cuFuncSetAttribute`.

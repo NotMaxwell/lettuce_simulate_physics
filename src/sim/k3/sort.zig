@@ -32,15 +32,7 @@ const params = C.uniform(SortParams, "params");
 
 /// Workgroup-scope OpAtomicIAdd on shared memory; the result is unused, so only counts depend on it.
 inline fn sharedInc(p: *addrspace(.shared) u32) void {
-    _ = asm volatile (
-        \\%ret = OpAtomicIAdd %u32 %p %scope %sem %v
-        : [ret] "" (-> u32),
-        : [u32] "t" (u32),
-          [p] "" (p),
-          [scope] "" (@as(u32, @backingInt(@import("std").spirv.Scope.workgroup))),
-          [sem] "" (@as(u32, 0)),
-          [v] "" (@as(u32, 1)),
-    );
+    C.atomicIncShared(p);
 }
 
 const sc = C.Shared(u32, C.group_size, "sc");
