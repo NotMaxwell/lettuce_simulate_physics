@@ -25,7 +25,7 @@ const args = C.rw(u32, 3, "args");
 const P = C.uniform(Params, "params");
 
 const gs = C.group_size;
-pub const leaf_cap_bodies: u32 = 32;
+pub const leaf_cap_bodies: u32 = C.leaf_cap_bodies;
 pub const per_thread: u32 = 8;
 /// Bodies per leafCount/leafWrite group and elements per scanBlock group.
 pub const block: u32 = gs * per_thread;

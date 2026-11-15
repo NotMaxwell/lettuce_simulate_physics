@@ -148,8 +148,8 @@ pub fn build(b: *std.Build) void {
 
     // PTX kernels for the CUDA driver API (docs/ptx.md); `zig build ptx` installs zig-out/ptx/k3_*.ptx.
     const ptx_step = b.step("ptx", "Compile the k3 kernels to PTX (nvptx64-cuda, sm_80) into zig-out/ptx/");
-    // sort and walk are left out until they stop naming SPIR-V directly (docs/ptx.md).
-    inline for (.{ "direct", "step", "tree" }) |k| {
+    // All five k3 kernel files; each is its own module, so buffer symbols are per file.
+    inline for (.{ "direct", "step", "tree", "sort", "walk" }) |k| {
         const f = b.addInstallFileWithDir(ptxObject(b, "k3_" ++ k, b.path("src/sim/k3/" ++ k ++ ".zig"), sim_layout), .{ .custom = "ptx" }, "k3_" ++ k ++ ".ptx");
         ptx_step.dependOn(&f.step);
     }
