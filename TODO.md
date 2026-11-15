@@ -55,10 +55,18 @@ Today (RX 7800 XT): 1M balls 2.39 ms/tick with gravity, 1.48 ms without; 100k 0.
 galaxy disk 1M 13.8 ms/tick (gravity 12.7).
 1. [ ] Profile per pass at 1M/4M/16M (GPU timestamps, not blocking samples) and publish the table
        in the perf overlay and `zig build bench`.
-2. [ ] Raise `max_balls` (1 << 20 today) to what VRAM allows; find the real per-ball byte cost.
+2. [x] Runtime capacity `--max-balls N` (default 1 << 20), 2D dispatch above 32768 groups
+       (2026-11-15). Galaxy disk runs at 80M on the RX 7800 XT (16.08 of 16.37 GB, as reported by
+       the agent; 96M spills). Per-pass GPU timestamps (item 1) not done. Follow-ups: warn on an
+       unparseable or clamped `--max-balls`; `ensureCull` leaves `cull_args` null if its
+       allocation fails.
 3. [ ] Kernel work: fuse passes, Morton/Hilbert ordering for locality, indirect dispatch sized on
        the GPU, no per-tick CPU readback that scales with N.
-4. [ ] Rendering at scale: point sprites / density splatting for sub-pixel bodies, LOD, culling.
+4. [x] GPU culling and points for sub-pixel balls (`--lod`, key L), 2026-11-15. render_gpu ms,
+       before -> after, min of 3: 1M zoom 1 0.96 -> 0.43, zoom 300 0.69 -> 0.33; 80M zoom 1
+       68.4 -> 29.6, zoom 300 39.2 -> 15.0. Bench 100k unchanged (0.442 ms/tick). Points draw
+       before sprites; a sub-pixel ball centred just off-screen can lose its edge dot. Only
+       checked headless. Density splatting not done.
 
 ## Sim version: headless matter simulation (`zig build sim`)
 End goal: simulate small-universe matter, ~1-2B bodies, on the Alabama supercomputer (student
