@@ -2,28 +2,27 @@
 
 ## Brev H100 (functional testing)
 
-1. Create an H100 instance with an Ubuntu image that has the NVIDIA driver and CUDA
-   (`nvidia-smi` works, CUDA in `/usr/local/cuda`). Clone the repo there.
-2. `bash cluster/brev_setup.sh`: installs Clang 18 + libc++ + libomp + lld + Ninja, configures
-   `clang-release` against `/usr/local/cuda`, builds, runs `ctest`, then a short bench.
-3. Check the CUDA tests actually **ran**: `build/clang-release/lettuce-tests cuda` must report
-   `17 run, 0 failed, 0 skipped`. Skipped means no device was found. On a multi-GPU instance the
-   script also runs `lettuce-mpi-tests` with one rank per GPU and a 1-vs-all-GPU bench.
+1. Create an instance with one H100 (2 or more to test multi-GPU) and an Ubuntu 22.04/24.04 image
+   that has the NVIDIA driver and CUDA. Connect with `brev shell <name>` or plain ssh.
+2. `git clone` the fork, then `git checkout claude/hopeful-faraday-w1o2ca`.
+3. `bash cluster/brev_setup.sh`. It installs the toolchain, builds, and runs the unit tests, the
+   multi-GPU tests (on multi-GPU instances), the bench and a 1M-body run. It chooses:
+   - Clang 18, or Clang 20 when CUDA is newer than 12.3, from apt.llvm.org if the distro lacks it;
+   - CMake from pip if the distro's is older than 3.24 (Ubuntu 22.04 ships 3.22);
+   - GCC 12 + nvcc if the Clang build fails.
 
-Clang 18 officially knows CUDA up to 12.3. With a newer toolkit it warns and usually still works.
-If it fails, either install a newer Clang from apt.llvm.org (`wget https://apt.llvm.org/llvm.sh &&
-sudo bash llvm.sh 20 all`, then pass `-DCMAKE_CXX_COMPILER=clang++-20 -DCMAKE_CUDA_COMPILER=clang++-20`),
-or use the fallback: `cmake --preset nvcc-release && cmake --build --preset nvcc-release`.
+   Everything is logged to `out/brev-report.txt`.
+4. Check the end of the report for `ALL TESTS PASSED`, and that the CUDA line reads
+   `17 run, 0 failed, 0 skipped`. Skipped means the GPU was not found, which is not a pass.
 
-First things to look at on the GPU:
+Live view from your laptop: start a run with `live=8080`, forward the port, then open
+`http://localhost:8080/`.
 
 ```bash
-B=build/clang-release
-$B/lettuce-tests cuda                                  # correctness vs CPU and brute force
-$B/lettuce-bench backend=cuda,cpu n=1e4,1e5,1e6 steps=3
-$B/lettuce configs/plummer.ini n=1000000 method=tree steps=200 diag_every=50
-$B/lettuce configs/collision.ini n=2000000 method=tree steps=3000 render_every=50
+ssh -L 8080:localhost:8080 <instance>
 ```
+
+Brev also offers its own port forwarding; either works.
 
 ## ASA-X cluster (performance runs)
 
