@@ -7,8 +7,6 @@ Barnes-Hut tree with quadrupole moments, on the GPU (CUDA) or the CPU (OpenMP). 
 headless: they print conservation diagnostics and write a CSV, binary snapshots (restartable) and
 PNG density renders.
 
-It grew out of a Python/pygame bouncing-ball toy, which is kept in [`python/`](python/) for history.
-
 ## Quick start
 
 ```bash

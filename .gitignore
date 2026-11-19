@@ -1,15 +1,7 @@
-__pycache__/
-*.py[cod]
-*$py.class
 .DS_Store
-.env
-venv/
-ENV/
 build/
 .scratch/
-.venv/
 out/
 *.snap
-build/
 cmake-build-*/
 .idea/

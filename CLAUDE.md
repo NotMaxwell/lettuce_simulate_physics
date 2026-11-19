@@ -5,12 +5,13 @@ A celestial-body gravity simulation (3D Newtonian N-body) in C++23 + CUDA. Headl
 diagnostics, snapshots and PNG renders. Targets: NVIDIA H100 (sm_90). Functional testing on a
 Brev H100 instance, performance runs on the ASA-X cluster's H100 nodes. The CPU backend (OpenMP)
 is the fallback and the reference the CUDA backend is checked against.
-`python/` is the original pygame toy this project grew out of; it is history, do not edit it.
 
 ## Hard rules
 - All work goes to the fork `NotMaxwell/lettuce_simulate_physics` (remote `origin`).
   Never add, commit to, push to, or open PRs against `commonLuke/lettuce_simulate_physics`.
-- Languages: C++23 for host code (GCC >= 13; no std::print, GCC 13 lacks it), CUDA (C++17 dialect, nvcc 12 has no C++23) for kernels; headers included by .cu files stay C++17-clean, CMake for the build. Vendored single headers
+- Languages: C++23 for host code (no std::print, GCC 13 lacks it), CUDA for kernels (clang CUDA,
+  C++23; the nvcc fallback tops out at C++20, so .cu files and headers they include stay C++20-clean),
+  CMake for the build. Toolchain is Clang/LLVM (libc++, lld, libomp). Vendored single headers
   live in `vendor/`. Job scripts for clusters live in `cluster/` (Slurm/bash is fine there only).
 - Measure performance with `lettuce-bench` before and after a change; report real numbers, never
   guesses. Numbers from this container (no GPU) are CPU-only; say so.
@@ -22,14 +23,16 @@ is the fallback and the reference the CUDA backend is checked against.
   anywhere new). Otherwise pick the sensible default, say so, and keep going.
 
 ## Build and verify
-- Configure: `cmake -S . -B build` (Release by default; CUDA is used when `nvcc` is found,
-  `-DLETTUCE_CUDA=OFF|ON` to force). `-DCMAKE_CUDA_ARCHITECTURES="80;90"` to add A100.
-- In this dev container CUDA 12.0 needs `-DCMAKE_CUDA_HOST_COMPILER=g++-12`. There is no GPU here:
-  CUDA code is compile-checked only.
-- `cmake --build build -j` then `ctest --test-dir build --output-on-failure`
-  (or `build/lettuce-tests [name-filter]`).
-- Run: `build/lettuce configs/plummer.ini [key=value ...]`. Bench: `build/lettuce-bench`.
-- Scratch files and build dirs go in `.scratch/` (git-ignored), never `/tmp`.
+- Presets (also what CLion imports): `cmake --preset clang-release` (Clang for host + CUDA),
+  `clang-cpu` (no CUDA), `clang-debug`, `nvcc-release` (GCC + nvcc fallback). Build dirs are
+  `build/<preset>`; `cmake --build --preset <p>` then `ctest --preset <p>`.
+- In this dev container: no GPU, CUDA code is compile-checked only. Clang CUDA needs
+  `-DCUDAToolkit_ROOT=$PWD/.scratch/cuda-root -DCMAKE_CUDA_FLAGS=--cuda-path=$PWD/.scratch/cuda-root`
+  (symlinked standard layout over Ubuntu's split CUDA 12.0 package); nvcc 12.0 needs
+  `-DCMAKE_CUDA_HOST_COMPILER=g++-12`.
+- Tests: `build/<preset>/lettuce-tests [name-filter]`. Run: `build/<preset>/lettuce configs/plummer.ini
+  [key=value ...]`. Bench: `build/<preset>/lettuce-bench`.
+- Scratch files and extra build dirs go in `.scratch/` (git-ignored), never `/tmp`.
 
 ## Architecture
 - `bodies.hpp` host struct-of-arrays · `config.*` .ini + `key=value` overrides
