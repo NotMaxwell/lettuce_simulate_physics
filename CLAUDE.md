@@ -30,7 +30,8 @@ is the fallback and the reference the CUDA backend is checked against.
   `-DCUDAToolkit_ROOT=$PWD/.scratch/cuda-root -DCMAKE_CUDA_FLAGS=--cuda-path=$PWD/.scratch/cuda-root`
   (symlinked standard layout over Ubuntu's split CUDA 12.0 package); nvcc 12.0 needs
   `-DCMAKE_CUDA_HOST_COMPILER=g++-12`.
-- Tests: `build/<preset>/lettuce-tests [name-filter]`. Run: `build/<preset>/lettuce configs/plummer.ini
+- Tests: `build/<preset>/lettuce-tests [name-filter]`; multi-rank: `mpirun -n 4 --oversubscribe
+  build/<preset>/lettuce-mpi-tests` (as root here add `--allow-run-as-root`; OMP_NUM_THREADS=1). Run: `build/<preset>/lettuce configs/plummer.ini
   [key=value ...]`. Bench: `build/<preset>/lettuce-bench`.
 - Scratch files and extra build dirs go in `.scratch/` (git-ignored), never `/tmp`.
 
@@ -42,6 +43,8 @@ is the fallback and the reference the CUDA backend is checked against.
 - `simulation.*` KDK leapfrog driver, diagnostics, output cadence
 - `snapshot.*` binary snapshots/restart · `render.*` PNG/JPEG density projection
 - `live.*` browser live view: HTTP + MJPEG server, render thread, pause/step/stop gate
+- `parallel.*` MPI: one rank per GPU, cost-balanced Morton domains, LET exchange (`docs/multigpu.md`);
+  degrades to one rank without MPI. Driver code that runs per step must stay collective.
 - `main.cpp` (`lettuce`), `bench.cpp` (`lettuce-bench`), `render_main.cpp` (`lettuce-render`)
 - Design notes: `docs/design.md`. Running on Brev / ASA-X: `docs/running.md`.
 

@@ -5,6 +5,7 @@ set -euo pipefail
 
 sudo apt-get update
 sudo apt-get install -y cmake ninja-build clang-18 lld-18 libc++-18-dev libc++abi-18-dev libomp-18-dev \
+  libopenmpi-dev openmpi-bin \
   || { echo "clang-18 not in this image's apt sources; add apt.llvm.org (see docs/running.md)"; exit 1; }
 
 CUDA_ROOT=${CUDA_HOME:-/usr/local/cuda}
@@ -17,3 +18,12 @@ cmake --preset clang-release \
 cmake --build --preset clang-release
 ctest --preset clang-release
 build/clang-release/lettuce-bench backend=cuda,cpu n=1e4,1e5,1e6 steps=3
+
+# Multi-GPU instance: the distributed path, one rank per GPU.
+NGPU=$(nvidia-smi -L | wc -l)
+if [ "$NGPU" -gt 1 ]; then
+  mpirun -n "$NGPU" --bind-to none build/clang-release/lettuce-mpi-tests
+  for np in 1 "$NGPU"; do
+    mpirun -n "$np" --bind-to none build/clang-release/lettuce-bench backend=cuda method=tree n=1e6,1e7 steps=3
+  done
+fi

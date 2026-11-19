@@ -194,7 +194,10 @@ TEST("cpu let: empty remote list equals compute_forces bit-for-bit") {
         a->compute_forces(fp, true);
         b->build_tree(fp);
         b->compute_forces_with(fp, true, {});
-        CHECK(a->diagnostics().pe == b->diagnostics().pe);
+        // The per-body potentials are identical, but the OpenMP reduction that sums them may combine
+        // thread partials in a different order each run, so the total agrees only to rounding.
+        const double pa = a->diagnostics().pe, pb = b->diagnostics().pe;
+        CHECK_NEAR(pa, pb, 1e-12 * std::fabs(pa));
         a->kick(1.0);
         b->kick(1.0);
         Bodies oa, ob;

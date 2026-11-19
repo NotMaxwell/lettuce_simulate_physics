@@ -84,7 +84,10 @@ target_include_directories(lettuce_core SYSTEM PRIVATE vendor)
 target_link_libraries(lettuce_core PUBLIC OpenMP::OpenMP_CXX)
 if(lettuce_use_mpi)
   target_link_libraries(lettuce_core PUBLIC MPI::MPI_C)
-  set_source_files_properties(src/parallel.cpp PROPERTIES COMPILE_DEFINITIONS LETTUCE_HAVE_MPI)
+  # OMPI/MPICH_SKIP_MPICXX: mpi.h would otherwise pull in the removed MPI C++ bindings, which we
+  # neither use nor link.
+  set_source_files_properties(src/parallel.cpp PROPERTIES COMPILE_DEFINITIONS
+                              "LETTUCE_HAVE_MPI;OMPI_SKIP_MPICXX=1;MPICH_SKIP_MPICXX=1")
 endif()
 
 if(lettuce_use_cuda)

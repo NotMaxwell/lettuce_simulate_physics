@@ -7,7 +7,8 @@
 2. `bash cluster/brev_setup.sh`: installs Clang 18 + libc++ + libomp + lld + Ninja, configures
    `clang-release` against `/usr/local/cuda`, builds, runs `ctest`, then a short bench.
 3. Check the CUDA tests actually **ran**: `build/clang-release/lettuce-tests cuda` must report
-   `10 run, 0 failed, 0 skipped`. Skipped means no device was found.
+   `17 run, 0 failed, 0 skipped`. Skipped means no device was found. On a multi-GPU instance the
+   script also runs `lettuce-mpi-tests` with one rank per GPU and a 1-vs-all-GPU bench.
 
 Clang 18 officially knows CUDA up to 12.3. With a newer toolkit it warns and usually still works.
 If it fails, either install a newer Clang from apt.llvm.org (`wget https://apt.llvm.org/llvm.sh &&
@@ -39,8 +40,11 @@ The job builds into `build/asax-h100` once and reuses it, runs the test suite, t
 the run you passed. Output: `out/slurm-<job>.log` and `out/run-<job>/`.
 
 If the cluster's LLVM module is older than its CUDA, swap the `cmake --preset clang-release ...`
-line for `cmake --preset nvcc-release -B "$BUILD"` (GCC ≥ 13 for C++23 host code).
+line for `cmake --preset nvcc-release -B "$BUILD"` (GCC ≥ 12, verified, for the C++23 host code).
 
-Memory: about 105 bytes per body on the GPU in tree mode, so an 80 GB H100 holds roughly 700M
+For several GPUs in one job, use `cluster/asax_multigpu.slurm` (one rank per GPU; see
+[multigpu.md](multigpu.md)). First confirm your account may request more than one GPU per job.
+
+Memory: about 105–117 bytes per body on the GPU in tree mode, so an 80 GB H100 holds roughly 650M
 bodies. This is the CUDA backend author's estimate, not yet measured. Direct summation past ~10⁶
 bodies is only useful as a check.

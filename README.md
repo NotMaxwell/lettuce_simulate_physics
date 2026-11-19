@@ -17,7 +17,7 @@ build/clang-release/lettuce configs/plummer.ini
 ```
 
 Needs CMake ≥ 3.24, Ninja, Clang ≥ 17 with libc++ and libomp, lld, and for the GPU build CUDA
-≥ 12.0. If CUDA is not in `/usr/local/cuda`, add
+≥ 12.0. MPI (any implementation) is optional and enables multi-GPU runs. If CUDA is not in `/usr/local/cuda`, add
 `-DCUDAToolkit_ROOT=<cuda> -DCMAKE_CUDA_FLAGS=--cuda-path=<cuda>`. The `nvcc-release` preset
 (GCC + nvcc) is the fallback where Clang is older than the installed CUDA. Running on Brev and the
 ASA-X cluster: [docs/running.md](docs/running.md).
@@ -56,6 +56,16 @@ Drag to rotate, scroll to zoom, colour by density or speed; pause, single-step o
 from the page. On a remote GPU machine, forward the port with `ssh -L 8080:localhost:8080 <host>`.
 Details, including ASA-X compute nodes: [docs/live.md](docs/live.md).
 
+## Multiple GPUs
+
+```bash
+mpirun -n 4 build/clang-release/lettuce configs/plummer.ini n=1e8 method=tree   # one GPU per rank
+```
+
+Bodies are split across GPUs by a cost-balanced space-filling curve, and the ranks exchange
+locally essential trees. Accuracy matches a single GPU. Design, measurements and limits:
+[docs/multigpu.md](docs/multigpu.md). On ASA-X: `cluster/asax_multigpu.slurm`.
+
 ## Output
 
 Everything goes to `out_dir` (default `out/`):
@@ -86,7 +96,7 @@ Measured on a 4-core 2.1 GHz Xeon, CPU backend only (no GPU numbers yet):
 ## Layout
 
 - `src/` — `bodies.hpp`, `config.*`, `scenarios.*`, `backend.hpp`, `cpu_backend.cpp`,
-  `cuda_backend.cu`, `simulation.*`, `snapshot.*`, `render.*`, `live.*`, `main.cpp`, `bench.cpp`, `render_main.cpp`
+  `cuda_backend.cu`, `simulation.*`, `snapshot.*`, `render.*`, `live.*`, `parallel.*` (MPI), `main.cpp`, `bench.cpp`, `render_main.cpp`
 - `tests/` — unit and physics tests (`build/<preset>/lettuce-tests [filter]`); CUDA tests skip without a GPU
 - `configs/` — starting configurations · `cluster/` — Brev setup and ASA-X Slurm job
 - `docs/design.md` — physics, algorithms, precision · `vendor/` — stb_image_write

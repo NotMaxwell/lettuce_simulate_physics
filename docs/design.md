@@ -59,7 +59,10 @@ and CUDA (clang's native CUDA support, sm_90). nvcc is kept as a fallback (`nvcc
 for sites where Clang is older than the installed CUDA, so `.cu` sources and the headers they
 include must stay C++20-clean.
 
+## Multiple GPUs
+One MPI rank per GPU, with cost-balanced Morton domains and locally-essential-tree exchange; see
+[multigpu.md](multigpu.md).
+
 ## Not done yet
-- Multiple GPUs / MPI across nodes (the Morton order gives the domain split when needed).
 - Block (hierarchical) time steps; periodic boxes / TreePM; cosmological integration.
 - Drawing live-view frames on the GPU (today they are drawn on the CPU after a copy, fine up to ~10M bodies).

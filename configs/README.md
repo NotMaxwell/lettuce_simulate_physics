@@ -33,6 +33,11 @@ A scenario parameter the chosen scenario does not read (e.g. a typo like `plumme
 the run with an error. The effective configuration is written to `<out_dir>/config.ini`, which
 reruns the same thing.
 
+## Multi-GPU key
+
+`rebalance_every` (default 10): force calls between re-splitting the bodies across MPI ranks by
+measured cost. Only matters under `mpirun`; see [docs/multigpu.md](../docs/multigpu.md).
+
 ## Live view keys
 
 Any config can be watched in a browser while it runs; see [docs/live.md](../docs/live.md).
