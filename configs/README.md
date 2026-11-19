@@ -32,3 +32,19 @@ Arguments after the file are `key=value` and win over the file, using the same k
 A scenario parameter the chosen scenario does not read (e.g. a typo like `plummer.cutt`) stops
 the run with an error. The effective configuration is written to `<out_dir>/config.ini`, which
 reruns the same thing.
+
+## Live view keys
+
+Any config can be watched in a browser while it runs; see [docs/live.md](../docs/live.md).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `live` | 0 | TCP port for the live view; 0 = off |
+| `live_bind` | 127.0.0.1 | listen address; localhost only, reach it through an SSH tunnel |
+| `live_width`, `live_height` | 960, 720 | first frame size (the browser then asks for its window size) |
+| `live_fps` | 30 | frame cap; frames are skipped, never queued |
+| `live_quality` | 80 | JPEG quality |
+| `live_hold` | true | keep serving the final state after the last step, until Stop |
+| `live_paused` | false | start paused |
+
+With `live` set, `steps = 0` runs until you press Stop.

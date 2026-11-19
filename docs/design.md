@@ -62,4 +62,4 @@ include must stay C++20-clean.
 ## Not done yet
 - Multiple GPUs / MPI across nodes (the Morton order gives the domain split when needed).
 - Block (hierarchical) time steps; periodic boxes / TreePM; cosmological integration.
-- An interactive viewer (H100 nodes are headless; frames are written as PNGs).
+- Drawing live-view frames on the GPU (today they are drawn on the CPU after a copy, fine up to ~10M bodies).

@@ -143,6 +143,14 @@ void set_key(Config& c, const std::string& key, const std::string& v) {
     else if (key == "view") c.view = v;
     else if (key == "render_extent") c.render_extent = parse_double(key, v);
     else if (key == "restart") c.restart = v;
+    else if (key == "live") c.live = parse_int(key, v);
+    else if (key == "live_bind") c.live_bind = v;
+    else if (key == "live_width") c.live_width = parse_int(key, v);
+    else if (key == "live_height") c.live_height = parse_int(key, v);
+    else if (key == "live_fps") c.live_fps = parse_double(key, v);
+    else if (key == "live_quality") c.live_quality = parse_int(key, v);
+    else if (key == "live_hold") c.live_hold = parse_bool(key, v);
+    else if (key == "live_paused") c.live_paused = parse_bool(key, v);
     else fail("unknown key '" + key + "'");
 }
 
@@ -193,6 +201,11 @@ void validate(const Config& c) {
     if (c.render_height < 16 || c.render_height > 16384) fail("render_height must be in 16..16384");
     if (!(c.render_extent >= 0)) fail("render_extent must be >= 0");
     if (c.threads < 0) fail("threads must be >= 0");
+    if (c.live < 0 || c.live > 65535) fail("live must be a TCP port 1..65535, or 0 for off");
+    if (c.live_width < 64 || c.live_width > 4096) fail("live_width must be in 64..4096");
+    if (c.live_height < 64 || c.live_height > 4096) fail("live_height must be in 64..4096");
+    if (!(c.live_fps > 0 && c.live_fps <= 240)) fail("live_fps must be in (0, 240]");
+    if (c.live_quality < 1 || c.live_quality > 100) fail("live_quality must be in 1..100");
 }
 
 std::string dump_config(const Config& c) {
@@ -223,6 +236,14 @@ std::string dump_config(const Config& c) {
     kv("view", c.view);
     kv("render_extent", fmt_double(c.render_extent));
     kv("restart", c.restart);
+    kv("live", std::to_string(c.live));
+    kv("live_bind", c.live_bind);
+    kv("live_width", std::to_string(c.live_width));
+    kv("live_height", std::to_string(c.live_height));
+    kv("live_fps", fmt_double(c.live_fps));
+    kv("live_quality", std::to_string(c.live_quality));
+    kv("live_hold", b(c.live_hold));
+    kv("live_paused", b(c.live_paused));
     for (auto& p : c.params) kv(p.first.c_str(), p.second);
     return s;
 }

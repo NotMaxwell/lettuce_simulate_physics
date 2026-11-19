@@ -40,7 +40,8 @@ is the fallback and the reference the CUDA backend is checked against.
 - `backend.hpp` interface: state stays on the device between steps
 - `cpu_backend.cpp` OpenMP direct + Barnes-Hut · `cuda_backend.cu` CUDA direct + Barnes-Hut
 - `simulation.*` KDK leapfrog driver, diagnostics, output cadence
-- `snapshot.*` binary snapshots/restart · `render.*` PNG density projection
+- `snapshot.*` binary snapshots/restart · `render.*` PNG/JPEG density projection
+- `live.*` browser live view: HTTP + MJPEG server, render thread, pause/step/stop gate
 - `main.cpp` (`lettuce`), `bench.cpp` (`lettuce-bench`), `render_main.cpp` (`lettuce-render`)
 - Design notes: `docs/design.md`. Running on Brev / ASA-X: `docs/running.md`.
 

@@ -58,6 +58,7 @@ add_library(lettuce_core STATIC
   src/render.cpp
   src/cpu_backend.cpp
   src/simulation.cpp
+  src/live.cpp
   src/stb_impl.cpp
 )
 target_include_directories(lettuce_core PUBLIC src)

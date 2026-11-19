@@ -46,6 +46,16 @@ build/clang-release/lettuce configs/solar.ini --print  # effective configuration
 
 Keys, units and per-scenario parameters: [configs/README.md](configs/README.md).
 
+## Watch it live
+
+```bash
+build/clang-release/lettuce configs/disk.ini steps=0 live=8080   # open http://localhost:8080/
+```
+
+Drag to rotate, scroll to zoom, colour by density or speed; pause, single-step or stop the run
+from the page. On a remote GPU machine, forward the port with `ssh -L 8080:localhost:8080 <host>`.
+Details, including ASA-X compute nodes: [docs/live.md](docs/live.md).
+
 ## Output
 
 Everything goes to `out_dir` (default `out/`):
@@ -76,7 +86,7 @@ Measured on a 4-core 2.1 GHz Xeon, CPU backend only (no GPU numbers yet):
 ## Layout
 
 - `src/` — `bodies.hpp`, `config.*`, `scenarios.*`, `backend.hpp`, `cpu_backend.cpp`,
-  `cuda_backend.cu`, `simulation.*`, `snapshot.*`, `render.*`, `main.cpp`, `bench.cpp`, `render_main.cpp`
+  `cuda_backend.cu`, `simulation.*`, `snapshot.*`, `render.*`, `live.*`, `main.cpp`, `bench.cpp`, `render_main.cpp`
 - `tests/` — unit and physics tests (`build/<preset>/lettuce-tests [filter]`); CUDA tests skip without a GPU
 - `configs/` — starting configurations · `cluster/` — Brev setup and ASA-X Slurm job
 - `docs/design.md` — physics, algorithms, precision · `vendor/` — stb_image_write

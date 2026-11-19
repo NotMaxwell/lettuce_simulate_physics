@@ -6,6 +6,7 @@
 #include <fstream>
 #include <stdexcept>
 
+#include "live.hpp"
 #include "render.hpp"
 #include "scenarios.hpp"
 #include "snapshot.hpp"
@@ -115,6 +116,7 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log) {
     double integrate_s = 0;
     double interval_s = 0;
     uint64_t interval_steps = 0;
+    double diag_virial = 0;
 
     auto diagnose = [&](uint64_t step, bool have_tree_pe) {
         Diag d = be->diagnostics();
@@ -137,6 +139,7 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log) {
                      static_cast<unsigned long long>(be->times().interactions));
         std::fflush(csv);
         sum.e1 = r.e;
+        diag_virial = r.virial;
         interval_s = 0;
         interval_steps = 0;
     };
@@ -168,17 +171,68 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log) {
         }
     };
 
-    const uint64_t last = step0 + cfg.steps;
+    // With a live view, steps = 0 runs until Stop is pressed in the browser.
+    const bool unbounded = cfg.live && cfg.steps == 0;
+    const uint64_t last = unbounded ? UINT64_MAX : step0 + cfg.steps;
     auto diag_due = [&](uint64_t step) {
         return step == last || (cfg.diag_every && step % cfg.diag_every == 0);
+    };
+
+    std::unique_ptr<LiveView> live;
+    Bodies live_buf;
+    LiveStats ls;
+    if (cfg.live) {
+        LiveOptions lo;
+        lo.port = cfg.live;
+        lo.bind = cfg.live_bind;
+        lo.width = cfg.live_width;
+        lo.height = cfg.live_height;
+        lo.fps = cfg.live_fps;
+        lo.quality = cfg.live_quality;
+        lo.view = cfg.view;
+        lo.start_paused = cfg.live_paused;
+        live = std::make_unique<LiveView>(lo, log);
+        std::fprintf(log, "# live view at %s  (remote machine: ssh -L %d:localhost:%d <host>, then open http://localhost:%d/)\n",
+                     live->url().c_str(), cfg.live, cfg.live, cfg.live);
+        std::fflush(log);
+        ls.scenario = cfg.restart.empty() ? cfg.scenario : "restart";
+        ls.backend = be->name();
+        ls.method = fp.method == ForceMethod::tree ? "tree" : "direct";
+        ls.n = n;
+        ls.last_step = unbounded ? 0 : last;
+    }
+    // Last diagnostic, for the live view's status line.
+    double last_de = 0, last_virial = 0, last_ms = 0;
+    uint64_t last_diag_step = step0;
+    auto publish = [&](uint64_t step, bool force_frame) {
+        if (!live) return;
+        ls.step = step;
+        ls.time = time;
+        ls.diag_step = last_diag_step;
+        ls.de = last_de;
+        ls.virial = last_virial;
+        ls.ms_per_step = last_ms;
+        live->set_stats(ls);
+        if (force_frame || live->frame_due()) {
+            be->download(live_buf);
+            live->submit(live_buf);
+        }
     };
 
     be->compute_forces(fp, !exact_pe);
     diagnose(step0, true);
     sum.e0 = e0;
     write_outputs(step0, step0 == last);
+    last_virial = diag_virial;
+    publish(step0, true);
 
+    uint64_t done = 0;
+    bool stopped = false;
     for (uint64_t step = step0 + 1; step <= last; ++step) {
+        if (live && !live->gate()) {
+            stopped = true;
+            break;
+        }
         bool due = diag_due(step);
         auto t0 = std::chrono::steady_clock::now();
         be->kick(0.5 * cfg.dt);
@@ -192,15 +246,37 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log) {
         integrate_s += s;
         interval_s += s;
         ++interval_steps;
+        ++done;
         time += cfg.dt;
-        if (due) diagnose(step, true);
+        if (live) last_ms = 0.9 * last_ms + 0.1 * 1e3 * s;
+        if (due) {
+            diagnose(step, true);
+            last_de = e0 != 0 ? (sum.e1 - e0) / std::fabs(e0) : 0;
+            last_virial = diag_virial;
+            last_diag_step = step;
+        }
         write_outputs(step, step == last);
+        publish(step, false);
     }
 
+    if (stopped) {
+        std::fprintf(log, "# stopped from the live view after %llu steps\n", static_cast<unsigned long long>(done));
+        if (interval_steps) {
+            // The last force call only had a potential if it was a diagnostic step.
+            if (!exact_pe) be->compute_forces(fp, true);
+            diagnose(step0 + done, true);
+        }
+    } else if (live && cfg.live_hold) {
+        publish(step0 + done, true);
+        std::fprintf(log, "# run finished; still serving %s (press Stop in the browser or Ctrl-C to exit)\n",
+                     live->url().c_str());
+        std::fflush(log);
+        live->hold();
+    }
     std::fclose(csv);
-    sum.steps = cfg.steps;
+    sum.steps = done;
     sum.wall_s = integrate_s;
-    sum.ms_per_step = cfg.steps ? 1e3 * integrate_s / double(cfg.steps) : 0;
+    sum.ms_per_step = done ? 1e3 * integrate_s / double(done) : 0;
     std::fprintf(log, "# done: %llu steps in %.3f s (%.3f ms/step), dE/E0 = %.3e\n",
                  static_cast<unsigned long long>(sum.steps), sum.wall_s, sum.ms_per_step,
                  e0 != 0 ? (sum.e1 - sum.e0) / std::fabs(sum.e0) : 0.0);

@@ -46,6 +46,16 @@ struct Config {
     double render_extent = 0;   // half-width of the view in world units, 0 = fit to the bodies
     std::string restart;        // snapshot to resume from; overrides scenario, n and seed
 
+    // Live view: an HTTP server streaming frames to a browser (see live.hpp). 0 = off.
+    int live = 0;                        // TCP port
+    std::string live_bind = "127.0.0.1"; // localhost only: reach it through an SSH tunnel
+    int live_width = 960;
+    int live_height = 720;
+    double live_fps = 30;                // frame cap; frames are skipped, never queued
+    int live_quality = 80;               // JPEG quality 1..100
+    bool live_hold = true;               // keep serving the last state after the final step
+    bool live_paused = false;            // start paused (press Run in the browser)
+
     std::map<std::string, std::string> params;  // scenario keys, e.g. "disk.radius" -> "1.5"
 
     // Scenario parameter lookup. Records the key as used so leftover (misspelt) keys can be reported.
