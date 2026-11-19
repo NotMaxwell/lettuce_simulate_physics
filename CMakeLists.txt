@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(lettuce LANGUAGES CXX)
+project(lettuce LANGUAGES C CXX)
 
 # Speed is the point of this project, so an unspecified build type means Release.
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -24,6 +24,23 @@ option(LETTUCE_LIBCXX "Use libc++ (Clang only)" OFF)
 option(LETTUCE_LLD "Link with lld" OFF)
 
 find_package(OpenMP REQUIRED COMPONENTS CXX)
+
+# One MPI rank per GPU (src/parallel.cpp). Only the C API is used, so any MPI built with any C++
+# standard library works, including with libc++.
+set(LETTUCE_MPI AUTO CACHE STRING "Multi-GPU / multi-node support through MPI: AUTO, ON or OFF")
+set_property(CACHE LETTUCE_MPI PROPERTY STRINGS AUTO ON OFF)
+set(lettuce_use_mpi OFF)
+if(NOT LETTUCE_MPI STREQUAL "OFF")
+  if(LETTUCE_MPI STREQUAL "ON")
+    find_package(MPI REQUIRED COMPONENTS C)
+  else()
+    find_package(MPI COMPONENTS C)
+  endif()
+  if(MPI_C_FOUND)
+    set(lettuce_use_mpi ON)
+  endif()
+endif()
+message(STATUS "lettuce: MPI ${lettuce_use_mpi}")
 
 set(lettuce_use_cuda OFF)
 if(NOT LETTUCE_CUDA STREQUAL "OFF")
@@ -59,11 +76,16 @@ add_library(lettuce_core STATIC
   src/cpu_backend.cpp
   src/simulation.cpp
   src/live.cpp
+  src/parallel.cpp
   src/stb_impl.cpp
 )
 target_include_directories(lettuce_core PUBLIC src)
 target_include_directories(lettuce_core SYSTEM PRIVATE vendor)
 target_link_libraries(lettuce_core PUBLIC OpenMP::OpenMP_CXX)
+if(lettuce_use_mpi)
+  target_link_libraries(lettuce_core PUBLIC MPI::MPI_C)
+  set_source_files_properties(src/parallel.cpp PROPERTIES COMPILE_DEFINITIONS LETTUCE_HAVE_MPI)
+endif()
 
 if(lettuce_use_cuda)
   target_sources(lettuce_core PRIVATE src/cuda_backend.cu)
@@ -112,3 +134,23 @@ file(GLOB lettuce_test_sources CONFIGURE_DEPENDS tests/*.cpp)
 add_executable(lettuce-tests ${lettuce_test_sources})
 target_link_libraries(lettuce-tests PRIVATE lettuce_core)
 add_test(NAME lettuce-tests COMMAND lettuce-tests WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+if(lettuce_use_mpi)
+  file(GLOB lettuce_mpi_test_sources CONFIGURE_DEPENDS tests/mpi/*.cpp)
+  add_executable(lettuce-mpi-tests ${lettuce_mpi_test_sources})
+  target_include_directories(lettuce-mpi-tests PRIVATE tests)
+  target_link_libraries(lettuce-mpi-tests PRIVATE lettuce_core)
+  # Open MPI refuses more ranks than cores unless told otherwise; MPICH rejects the flag.
+  set(lettuce_mpiexec_extra "")
+  execute_process(COMMAND ${MPIEXEC_EXECUTABLE} --version OUTPUT_VARIABLE lettuce_mpiexec_version ERROR_QUIET)
+  if(lettuce_mpiexec_version MATCHES "Open MPI|OpenRTE")
+    set(lettuce_mpiexec_extra --oversubscribe)
+  endif()
+  foreach(np 1 2 4)
+    add_test(NAME lettuce-mpi-tests-np${np}
+             COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${np} ${lettuce_mpiexec_extra} ${MPIEXEC_PREFLAGS}
+                     $<TARGET_FILE:lettuce-mpi-tests> ${MPIEXEC_POSTFLAGS}
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(lettuce-mpi-tests-np${np} PROPERTIES ENVIRONMENT "OMP_NUM_THREADS=1")
+  endforeach()
+endif()

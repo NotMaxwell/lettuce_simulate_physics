@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 #include <vector>
 
 #include "backend.hpp"
@@ -111,6 +112,7 @@ struct WalkScratch {
     std::vector<int32_t> bi;
     std::vector<float> nx, ny, nz, nm, qxx, qxy, qxz, qyy, qyz, qzz;
     std::vector<uint32_t> stack;
+    std::vector<int32_t> let_stack;
     std::size_t nb = 0, nn = 0;
     void need_bodies(std::size_t n) {
         if (bx.size() >= n) return;
@@ -139,6 +141,8 @@ public:
         m_ = b.m; id_ = b.id;
         ax_.assign(n_, 0.f); ay_.assign(n_, 0.f); az_.assign(n_, 0.f); pot_.assign(n_, 0.f);
         has_pot_ = false;
+        tree_ok_ = false;
+        cost_.clear();
     }
 
     void download(Bodies& b) override {
@@ -148,29 +152,119 @@ public:
     }
 
     void compute_forces(const ForceParams& p, bool potential) override {
+        build_tree(p);
+        compute_forces_with(p, potential, {});
+    }
+
+    void build_tree(const ForceParams& p) override {
+        pend_sort_ms_ = pend_build_ms_ = 0;
+        if (p.method != ForceMethod::tree || n_ == 0) return;
+        auto ts = clk::now();
+        sort_bodies();
+        pend_sort_ms_ = ms_since(ts);
+        auto tb = clk::now();
+        build_octree(p.theta);
+        pend_build_ms_ = ms_since(tb);
+        tree_ok_ = true;
+    }
+
+    void compute_forces_with(const ForceParams& p, bool potential, const std::vector<const LetTree*>& remote) override {
         auto t0 = clk::now();
-        times_ = PhaseTimes{times_.step_ms};
-        if (n_ == 0) { has_pot_ = potential; return; }
-        if (p.method == ForceMethod::direct) {
-            auto tw = clk::now();
-            if (potential) direct<true>(float(p.G), float(p.eps * p.eps));
-            else direct<false>(float(p.G), float(p.eps * p.eps));
-            times_.walk_ms = ms_since(tw);
-            times_.interactions = uint64_t(n_) * n_;
-        } else {
-            auto ts = clk::now();
-            sort_bodies();
-            times_.sort_ms = ms_since(ts);
-            auto tb = clk::now();
-            build_tree(p.theta);
-            times_.build_ms = ms_since(tb);
-            auto tw = clk::now();
-            times_.interactions =
-                potential ? walk<true>(float(p.G), float(p.eps * p.eps)) : walk<false>(float(p.G), float(p.eps * p.eps));
-            times_.walk_ms = ms_since(tw);
-        }
+        PhaseTimes t;
+        t.step_ms = times_.step_ms;
+        if (p.method == ForceMethod::tree && n_ > 0 && !tree_ok_) build_tree(p);
+        t.sort_ms = pend_sort_ms_;
+        t.build_ms = pend_build_ms_;
+        pend_sort_ms_ = pend_build_ms_ = 0;
+        times_ = t;
         has_pot_ = potential;
-        times_.force_ms = ms_since(t0);
+        cost_.resize(n_);
+        if (n_ == 0) return;
+        const float G = float(p.G), e2 = float(p.eps * p.eps);
+        auto tw = clk::now();
+        if (p.method == ForceMethod::direct) {
+            if (potential) direct<true>(G, e2);
+            else direct<false>(G, e2);
+            times_.interactions = uint64_t(n_) * n_;
+            times_.interactions += potential ? direct_remote<true>(G, e2, remote) : direct_remote<false>(G, e2, remote);
+        } else {
+            times_.interactions = potential ? walk<true>(G, e2, remote) : walk<false>(G, e2, remote);
+        }
+        times_.walk_ms = ms_since(tw);
+        times_.force_ms = times_.sort_ms + times_.build_ms + ms_since(t0);
+    }
+
+    Box3 local_bounds() override {
+        Box3 bx;
+        if (n_ == 0) return bx;
+        const long ln = long(n_);
+        float mnx = x_[0], mny = y_[0], mnz = z_[0], mxx = mnx, mxy = mny, mxz = mnz;
+#pragma omp parallel for num_threads(nt_) reduction(min : mnx, mny, mnz) reduction(max : mxx, mxy, mxz)
+        for (long i = 0; i < ln; ++i) {
+            mnx = std::min(mnx, x_[i]); mny = std::min(mny, y_[i]); mnz = std::min(mnz, z_[i]);
+            mxx = std::max(mxx, x_[i]); mxy = std::max(mxy, y_[i]); mxz = std::max(mxz, z_[i]);
+        }
+        bx.lo[0] = mnx; bx.lo[1] = mny; bx.lo[2] = mnz;
+        bx.hi[0] = mxx; bx.hi[1] = mxy; bx.hi[2] = mxz;
+        return bx;
+    }
+
+    // Reads only the tree and body arrays, so concurrent calls for different targets are safe.
+    LetTree export_let(const Box3& target, const ForceParams& p) override {
+        LetTree out;
+        if (n_ == 0) return out;
+        if (p.method == ForceMethod::direct) return export_direct();
+        if (!tree_ok_) throw std::logic_error("cpu export_let: call build_tree first");
+        if (nodes_[0].m <= 0) return out;
+        const float bcx = 0.5f * (target.lo[0] + target.hi[0]), bhx = 0.5f * (target.hi[0] - target.lo[0]);
+        const float bcy = 0.5f * (target.lo[1] + target.hi[1]), bhy = 0.5f * (target.hi[1] - target.lo[1]);
+        const float bcz = 0.5f * (target.lo[2] + target.hi[2]), bhz = 0.5f * (target.hi[2] - target.lo[2]);
+        // The output array doubles as the breadth-first queue: src[k] is the local node behind
+        // out.nodes[k]. Children are appended as one block when their parent is processed, which
+        // keeps every sibling set contiguous.
+        std::vector<uint32_t> src;
+        src.reserve(256);
+        out.nodes.reserve(256);
+        auto emit = [&](uint32_t ni) {
+            const Node& nd = nodes_[ni];
+            LetNode l{};
+            l.cx = nd.cx; l.cy = nd.cy; l.cz = nd.cz; l.mass = nd.m;
+            l.qxx = nd.qxx; l.qxy = nd.qxy; l.qxz = nd.qxz; l.qyy = nd.qyy; l.qyz = nd.qyz; l.qzz = nd.qzz;
+            l.rcrit2 = nd.rcrit2;
+            l.first_child = -1; l.child_count = 0; l.body_first = -1; l.body_count = 0;
+            out.nodes.push_back(l);
+            src.push_back(ni);
+        };
+        emit(0);
+        for (std::size_t k = 0; k < out.nodes.size(); ++k) {
+            const Node& nd = nodes_[src[k]];
+            float dx = std::max(std::fabs(nd.cx - bcx) - bhx, 0.f);
+            float dy = std::max(std::fabs(nd.cy - bcy) - bhy, 0.f);
+            float dz = std::max(std::fabs(nd.cz - bcz) - bhz, 0.f);
+            if (dx * dx + dy * dy + dz * dz >= nd.rcrit2) continue;  // terminal: emitted as is
+            if (nd.nchild == 0) {
+                const std::size_t b0 = out.bx.size(), nb = nd.hi - nd.lo;
+                out.bx.insert(out.bx.end(), x_.begin() + nd.lo, x_.begin() + nd.hi);
+                out.by.insert(out.by.end(), y_.begin() + nd.lo, y_.begin() + nd.hi);
+                out.bz.insert(out.bz.end(), z_.begin() + nd.lo, z_.begin() + nd.hi);
+                out.bm.insert(out.bm.end(), m_.begin() + nd.lo, m_.begin() + nd.hi);
+                out.nodes[k].body_first = int32_t(b0);
+                out.nodes[k].body_count = int32_t(nb);
+                continue;
+            }
+            const int32_t first = int32_t(out.nodes.size());
+            for (uint32_t c = nd.first; c < nd.first + nd.nchild; ++c)
+                if (nodes_[c].m > 0) emit(c);
+            out.nodes[k].first_child = first;
+            out.nodes[k].child_count = int32_t(out.nodes.size()) - first;
+        }
+        return out;
+    }
+
+    bool body_costs(std::vector<float>& cost) override {
+        if (cost_.size() != n_ || n_ == 0) return false;
+        cost = cost_;
+        return true;
     }
 
     void kick(double dt) override {
@@ -196,6 +290,7 @@ public:
             x[i] += vx[i] * h; y[i] += vy[i] * h; z[i] += vz[i] * h;
         }
         has_pot_ = false;
+        tree_ok_ = false;
         drift_ms_ = ms_since(t0);
         times_.step_ms = kick_ms_ + drift_ms_;
     }
@@ -325,6 +420,11 @@ private:
 #pragma omp parallel for num_threads(nt_) schedule(static)
         for (long i = 0; i < ln; ++i) tmpu_[i] = id_[idx_[i]];
         std::memcpy(id_.data(), tmpu_.data(), n * sizeof(uint32_t));
+        if (cost_.size() == n) {
+#pragma omp parallel for num_threads(nt_) schedule(static)
+            for (long i = 0; i < ln; ++i) tmpf_[i] = cost_[idx_[i]];
+            std::memcpy(cost_.data(), tmpf_.data(), n * sizeof(float));
+        }
     }
 
     // Stable parallel LSD radix sort of (key_, idx_); passes whose digit is constant are skipped.
@@ -415,7 +515,7 @@ private:
         }
     }
 
-    void build_tree(double theta) {
+    void build_octree(double theta) {
         nodes_.clear(); geo_.clear(); groups_.clear(); leaves_.clear();
         Node root{};
         root.lo = 0; root.hi = uint32_t(n_);
@@ -497,7 +597,7 @@ private:
 
     // ---- walk ------------------------------------------------------------------------------
     template <bool POT>
-    uint64_t walk(float G, float e2) {
+    uint64_t walk(float G, float e2, const std::vector<const LetTree*>& remote) {
         const long ng = long(groups_.size());
         uint64_t inter = 0;
 #pragma omp parallel num_threads(nt_) reduction(+ : inter)
@@ -506,13 +606,75 @@ private:
             if (s.stack.size() < 8 * (kMaxLevel + 2)) s.stack.resize(8 * (kMaxLevel + 2));
 #pragma omp for schedule(dynamic, 4)
             for (long g = 0; g < ng; ++g) {
-                build_list(groups_[g], s);
+                const Group& gr = groups_[g];
+                build_list(gr, s);
+                for (const LetTree* t : remote) build_list_let(*t, gr, s);
                 pad_lists(s);
-                eval_group<POT>(groups_[g], s, G, e2);
-                inter += uint64_t(s.nb + s.nn) * (groups_[g].hi - groups_[g].lo);
+                eval_group<POT, false>(gr, s, G, e2);
+                const std::size_t len = s.nb + s.nn;
+                std::fill(cost_.begin() + gr.lo, cost_.begin() + gr.hi, float(len));
+                inter += uint64_t(len) * (gr.hi - gr.lo);
             }
         }
         return inter;
+    }
+
+    // Direct method: local forces are already in a_/pot_; remote LETs are added per block of
+    // kGroupMax consecutive bodies (unsorted, so the boxes are loose, which only matters for
+    // LETs that are not always-open).
+    template <bool POT>
+    uint64_t direct_remote(float G, float e2, const std::vector<const LetTree*>& remote) {
+        const long nblk = long((n_ + kGroupMax - 1) / kGroupMax);
+        std::fill(cost_.begin(), cost_.end(), float(n_));
+        if (remote.empty()) return 0;
+        uint64_t inter = 0;
+#pragma omp parallel num_threads(nt_) reduction(+ : inter)
+        {
+            WalkScratch& s = scratch_[omp_get_thread_num()];
+#pragma omp for schedule(dynamic, 1)
+            for (long b = 0; b < nblk; ++b) {
+                Group gr = bounds_group(uint32_t(b * kGroupMax), uint32_t(std::min<std::size_t>(n_, (b + 1) * kGroupMax)));
+                s.nb = s.nn = 0;
+                for (const LetTree* t : remote) build_list_let(*t, gr, s);
+                pad_lists(s);
+                eval_group<POT, true>(gr, s, G, e2);
+                const std::size_t len = s.nb + s.nn;
+                for (uint32_t i = gr.lo; i < gr.hi; ++i) cost_[i] += float(len);
+                inter += uint64_t(len) * (gr.hi - gr.lo);
+            }
+        }
+        return inter;
+    }
+
+    Group bounds_group(uint32_t lo, uint32_t hi) const {
+        Group gr{0, 0, 0, 0, 0, 0, lo, hi};
+        float mnx = x_[lo], mny = y_[lo], mnz = z_[lo], mxx = mnx, mxy = mny, mxz = mnz;
+        for (uint32_t i = lo; i < hi; ++i) {
+            mnx = std::min(mnx, x_[i]); mny = std::min(mny, y_[i]); mnz = std::min(mnz, z_[i]);
+            mxx = std::max(mxx, x_[i]); mxy = std::max(mxy, y_[i]); mxz = std::max(mxz, z_[i]);
+        }
+        gr.bx = 0.5f * (mnx + mxx); gr.by = 0.5f * (mny + mxy); gr.bz = 0.5f * (mnz + mxz);
+        gr.hx = 0.5f * (mxx - mnx); gr.hy = 0.5f * (mxy - mny); gr.hz = 0.5f * (mxz - mnz);
+        return gr;
+    }
+
+    LetTree export_direct() const {
+        LetTree out;
+        out.bx = x_; out.by = y_; out.bz = z_; out.bm = m_;
+        double M = 0, sx = 0, sy = 0, sz = 0;
+        for (std::size_t i = 0; i < n_; ++i) {
+            double m = m_[i];
+            M += m; sx += m * x_[i]; sy += m * y_[i]; sz += m * z_[i];
+        }
+        LetNode r{};
+        if (M > 0) { r.cx = float(sx / M); r.cy = float(sy / M); r.cz = float(sz / M); }
+        r.mass = float(M);
+        // Always opened, so the quadrupole is never read and stays zero.
+        r.rcrit2 = 3.0e38f;
+        r.first_child = -1; r.child_count = 0;
+        r.body_first = 0; r.body_count = int32_t(n_);
+        out.nodes.push_back(r);
+        return out;
     }
 
     // Zero-mass padding to a multiple of 8 (index -1 never matches a body, Q = 0) lets the kernels
@@ -534,6 +696,54 @@ private:
         }
     }
 
+    // Remote bodies get index -1 so the self-exclusion in p2p8 never drops one.
+    static void push_let_bodies(WalkScratch& s, const LetTree& t, const LetNode& nd) {
+        s.need_bodies(s.nb + std::size_t(nd.body_count));
+        for (int32_t j = nd.body_first; j < nd.body_first + nd.body_count; ++j, ++s.nb) {
+            s.bx[s.nb] = t.bx[j]; s.by[s.nb] = t.by[j]; s.bz[s.nb] = t.bz[j]; s.bm[s.nb] = t.bm[j];
+            s.bi[s.nb] = -1;
+        }
+    }
+
+    template <class N>
+    static void push_node(WalkScratch& s, const N& nd, float m) {
+        s.need_nodes(s.nn + 1);
+        const std::size_t k = s.nn++;
+        s.nx[k] = nd.cx; s.ny[k] = nd.cy; s.nz[k] = nd.cz; s.nm[k] = m;
+        s.qxx[k] = nd.qxx; s.qxy[k] = nd.qxy; s.qxz[k] = nd.qxz;
+        s.qyy[k] = nd.qyy; s.qyz[k] = nd.qyz; s.qzz[k] = nd.qzz;
+    }
+
+    // Receiver walk of backend.hpp, against the group box, appending to the group's lists.
+    static void build_list_let(const LetTree& t, const Group& gr, WalkScratch& s) {
+        if (t.nodes.empty()) return;
+        // A LET may come from another backend with a different depth, so this stack grows.
+        auto& st = s.let_stack;
+        if (st.size() < 64) st.resize(64);
+        std::size_t sp = 0;
+        st[sp++] = 0;
+        while (sp) {
+            const LetNode& nd = t.nodes[std::size_t(st[--sp])];
+            const bool terminal = nd.first_child < 0 && nd.body_count == 0;
+            bool accept = terminal;
+            if (!terminal) {
+                float dx = std::max(std::fabs(nd.cx - gr.bx) - gr.hx, 0.f);
+                float dy = std::max(std::fabs(nd.cy - gr.by) - gr.hy, 0.f);
+                float dz = std::max(std::fabs(nd.cz - gr.bz) - gr.hz, 0.f);
+                accept = dx * dx + dy * dy + dz * dz >= nd.rcrit2;
+            }
+            if (accept) {
+                if (nd.body_count > 0 && nd.body_count <= kSmallLeaf) push_let_bodies(s, t, nd);
+                else push_node(s, nd, nd.mass);
+            } else if (nd.body_count > 0) {
+                push_let_bodies(s, t, nd);
+            } else {
+                if (sp + std::size_t(nd.child_count) > st.size()) st.resize(2 * (sp + std::size_t(nd.child_count)));
+                for (int32_t c = nd.first_child + nd.child_count; c-- > nd.first_child;) st[sp++] = c;
+            }
+        }
+    }
+
     void build_list(const Group& gr, WalkScratch& s) {
         s.nb = s.nn = 0;
         uint32_t sp = 0;
@@ -547,15 +757,8 @@ private:
             // otherwise include the group's own bodies.
             bool contains = nd.lo <= gr.lo && gr.hi <= nd.hi;
             if (!contains && dx * dx + dy * dy + dz * dz >= nd.rcrit2) {
-                if (nd.nchild == 0 && nd.hi - nd.lo <= uint32_t(kSmallLeaf)) {
-                    push_bodies(s, nd.lo, nd.hi);
-                } else {
-                    s.need_nodes(s.nn + 1);
-                    const std::size_t k = s.nn++;
-                    s.nx[k] = nd.cx; s.ny[k] = nd.cy; s.nz[k] = nd.cz; s.nm[k] = nd.m;
-                    s.qxx[k] = nd.qxx; s.qxy[k] = nd.qxy; s.qxz[k] = nd.qxz;
-                    s.qyy[k] = nd.qyy; s.qyz[k] = nd.qyz; s.qzz[k] = nd.qzz;
-                }
+                if (nd.nchild == 0 && nd.hi - nd.lo <= uint32_t(kSmallLeaf)) push_bodies(s, nd.lo, nd.hi);
+                else push_node(s, nd, nd.m);
             } else if (nd.nchild == 0) {
                 push_bodies(s, nd.lo, nd.hi);
             } else {
@@ -565,7 +768,8 @@ private:
         }
     }
 
-    template <bool POT>
+    // ADD accumulates into the existing accelerations/potential instead of overwriting them.
+    template <bool POT, bool ADD>
     void eval_group(const Group& gr, const WalkScratch& s, float G, float e2) {
         const float *bx = s.bx.data(), *by = s.by.data(), *bz = s.bz.data(), *bm = s.bm.data();
         const int32_t* bi = s.bi.data();
@@ -598,8 +802,13 @@ private:
             }
             ax += hsum(vax); ay += hsum(vay); az += hsum(vaz);
             if constexpr (POT) p += hsum(vp);
-            ax_[i] = G * ax; ay_[i] = G * ay; az_[i] = G * az;
-            if constexpr (POT) pot_[i] = -G * p;
+            if constexpr (ADD) {
+                ax_[i] += G * ax; ay_[i] += G * ay; az_[i] += G * az;
+                if constexpr (POT) pot_[i] -= G * p;
+            } else {
+                ax_[i] = G * ax; ay_[i] = G * ay; az_[i] = G * az;
+                if constexpr (POT) pot_[i] = -G * p;
+            }
         }
     }
 
@@ -608,6 +817,9 @@ private:
     std::vector<float> x_, y_, z_, vx_, vy_, vz_, m_, ax_, ay_, az_, pot_;
     std::vector<uint32_t> id_;
     bool has_pot_ = false;
+    bool tree_ok_ = false;   // tree and body order match the current positions
+    double pend_sort_ms_ = 0, pend_build_ms_ = 0;  // from build_tree, reported by the next force call
+    std::vector<float> cost_;  // interactions per body of the last force call, current body order
     PhaseTimes times_;
     double kick_ms_ = 0, drift_ms_ = 0;
 

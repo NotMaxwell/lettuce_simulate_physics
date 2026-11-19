@@ -8,15 +8,19 @@
 // Device memory, per body (capacity n):
 //   state x,y,z,vx,vy,vz,m,id       32 B
 //   ax,ay,az,pot                    16 B
+//   interaction counts               4 B   per-body cost for body_costs()
 //   posm (float4 pos+mass)          16 B   gathered copy for coalesced 16-byte loads in kernels
 //   Morton keys, double-buffered    16 B   (the alternate also holds leaf flags/scan/starts)
-//   sort indices, double-buffered    8 B   (the alternate is the permutation scratch)
-//   = 88 B, plus tree nodes: 88 B per node, 2K-1 nodes for K leaves (K ~ n/8..n/16 for Plummer)
-//   ~ 100-110 B/body total, so 80 GB holds ~700M bodies. Nodes are sized from the actual K.
+//   sort indices, double-buffered    8 B   (the alternate is the permutation scratch / group slots)
+//   = 92 B, plus tree nodes: 96 B per node (incl. an 8 B body range), 2K-1 nodes for K leaves
+//   (K ~ n/8..n/16 for Plummer), plus <= 4 B per leaf of walk-group list
+//   ~ 105-117 B/body total, so 80 GB holds ~650M bodies. Nodes are sized from the actual K.
+//   Remote LETs (compute_forces_with) add 48 B per LET node and 16 B per LET body, grow-only.
 //
 // Limits: n < 2^31 (int body/node indices; checked in upload()).
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
+#include <cub/device/device_select.cuh>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -24,6 +28,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -453,7 +459,7 @@ __device__ __forceinline__ int delta(const uint64_t* __restrict__ keys, const in
 }
 
 __global__ void build_radix(const uint64_t* __restrict__ keys, const int* __restrict__ start, int K,
-                            float4* __restrict__ nodeC, int* __restrict__ parent) {
+                            float4* __restrict__ nodeC, int* __restrict__ parent, int2* __restrict__ range) {
     long long gi = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (gi >= K - 1) return;
     const int i = static_cast<int>(gi);
@@ -477,6 +483,8 @@ __global__ void build_radix(const uint64_t* __restrict__ keys, const int* __rest
     nodeC[i] = make_float4(0.f, 0.f, __int_as_float(left), __int_as_float(right));
     parent[left] = i;
     parent[right] = i;
+    const int b0 = start[min((long long)i, j)], b1 = start[max((long long)i, j) + 1];
+    range[i] = make_int2(b0, b1 - b0);
 }
 
 // ---------------------------------------------------------------- tree: moments (bottom-up)
@@ -539,7 +547,8 @@ __device__ __forceinline__ float4 load_cg(const float4* p) {
 __global__ void __launch_bounds__(BS) moments_kernel(const float4* __restrict__ pm, const int* __restrict__ start,
                                                      int K, float inv_theta, const int* __restrict__ parent,
                                                      int* __restrict__ counter, float4* nodeA, float4* nodeB,
-                                                     float4* nodeC, float4* bmin, float4* bmax) {
+                                                     float4* nodeC, float4* bmin, float4* bmax,
+                                                     int2* __restrict__ range) {
     long long gl = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (gl >= K) return;
     const int leaf = static_cast<int>(gl);
@@ -562,6 +571,7 @@ __global__ void __launch_bounds__(BS) moments_kernel(const float4* __restrict__ 
         add_quad(q.w, q.x - M.com.x, q.y - M.com.y, q.z - M.com.z, M.qa, M.qyz);
     }
     int node = K - 1 + leaf;
+    range[node] = make_int2(b0, b1 - b0);
     store_node(node, M, inv_theta, b0, ~(b1 - b0), nodeA, nodeB, nodeC, bmin, bmax);
 
     while (true) {
@@ -603,6 +613,30 @@ __global__ void __launch_bounds__(BS) moments_kernel(const float4* __restrict__ 
 
 // ---------------------------------------------------------------- tree: walk
 
+// Far field about the com, d = com - x, s^2 = d^2 + eps^2:
+//   a = G [ M d/s^3 - Q d/s^5 + 5/2 (d.Q.d) d/s^7 ],  phi = -G [ M/s + 1/2 d.Q.d/s^5 ]
+// A = (com, M), B = (Qxx, Qyy, Qxy, Qxz), qyz; Qzz = -(Qxx + Qyy).
+template <bool POT>
+__device__ __forceinline__ void cell_term(const float4 p, const float4 A, const float4 B, const float qyz, float eps2,
+                                          float& sx, float& sy, float& sz, float& sp) {
+    const float dx = A.x - p.x, dy = A.y - p.y, dz = A.z - p.z;
+    const float d2 = fmaf(dx, dx, fmaf(dy, dy, dz * dz));
+    const float qzz = -(B.x + B.y);
+    const float qdx = B.x * dx + B.z * dy + B.w * dz;
+    const float qdy = B.z * dx + B.y * dy + qyz * dz;
+    const float qdz = B.w * dx + qyz * dy + qzz * dz;
+    const float dqd = dx * qdx + dy * qdy + dz * qdz;
+    const float inv = rsqrtf(d2 + eps2);
+    const float inv2 = inv * inv;
+    const float inv3 = inv * inv2, inv5 = inv3 * inv2, inv7 = inv5 * inv2;
+    const float rad = A.w * inv3 + 2.5f * dqd * inv7;
+    sx += rad * dx - qdx * inv5;
+    sy += rad * dy - qdy * inv5;
+    sz += rad * dz - qdz * inv5;
+    if (POT) sp += A.w * inv + 0.5f * dqd * inv5;
+}
+
+// Per-body walk (LETTUCE_CUDA_WALK=body), kept for comparison with the group walk.
 // One thread per body in Morton order, so a warp's bodies are close and follow similar paths.
 // Accept a node iff |com - x|^2 > rcrit^2 with rcrit = l/theta + |com - box centre|. The strict
 // comparison makes a single-body leaf (rcrit = 0) at the body's own position open instead of
@@ -614,6 +648,7 @@ __global__ void __launch_bounds__(WALK_BS) walk_kernel(const float4* __restrict_
                                                        const float4* __restrict__ nodeC, float eps2, float G,
                                                        float* __restrict__ ax, float* __restrict__ ay,
                                                        float* __restrict__ az, float* __restrict__ pot,
+                                                       uint32_t* __restrict__ counts,
                                                        unsigned long long* __restrict__ interactions,
                                                        int* __restrict__ error) {
     const long long gi = (long long)blockIdx.x * WALK_BS + threadIdx.x;
@@ -633,22 +668,7 @@ __global__ void __launch_bounds__(WALK_BS) walk_kernel(const float4* __restrict_
             const int cb = __float_as_int(C.w);
             bool descend = false;
             if (d2 > C.y) {
-                // Far field about the com, d = com - x, s^2 = d^2 + eps^2:
-                //   a = G [ M d/s^3 - Q d/s^5 + 5/2 (d.Q.d) d/s^7 ],  phi = -G [ M/s + 1/2 d.Q.d/s^5 ]
-                const float4 B = __ldg(&nodeB[node]);
-                const float qzz = -(B.x + B.y);
-                const float qdx = B.x * dx + B.z * dy + B.w * dz;
-                const float qdy = B.z * dx + B.y * dy + C.x * dz;
-                const float qdz = B.w * dx + C.x * dy + qzz * dz;
-                const float dqd = dx * qdx + dy * qdy + dz * qdz;
-                const float inv = rsqrtf(d2 + eps2);
-                const float inv2 = inv * inv;
-                const float inv3 = inv * inv2, inv5 = inv3 * inv2, inv7 = inv5 * inv2;
-                const float rad = A.w * inv3 + 2.5f * dqd * inv7;
-                sx += rad * dx - qdx * inv5;
-                sy += rad * dy - qdy * inv5;
-                sz += rad * dz - qdz * inv5;
-                if (POT) sp += A.w * inv + 0.5f * dqd * inv5;
+                cell_term<POT>(p, A, __ldg(&nodeB[node]), C.x, eps2, sx, sy, sz, sp);
                 ++count;
             } else if (cb < 0) {
                 const int b0 = __float_as_int(C.z), cnt = ~cb;
@@ -674,10 +694,343 @@ __global__ void __launch_bounds__(WALK_BS) walk_kernel(const float4* __restrict_
         ay[i] = G * sy;
         az[i] = G * sz;
         if (POT) pot[i] = -G * sp;
+        counts[i] = static_cast<uint32_t>(count);
     }
     // All 32 lanes reach this: WALK_BS is a multiple of 32 and no thread returns early.
     count = warp_sum(count);
     if ((threadIdx.x & 31) == 0 && count) atomicAdd(interactions, count);
+}
+
+// ---------------------------------------------------------------- tree: group walk
+//
+// One warp per group: up to 32*NB consecutive sorted bodies, NB per lane (slots lane, lane+32).
+// Local groups are the topmost tree nodes holding <= 32*NB bodies (leaves hold <= 32, so every
+// leaf is inside exactly one group). The warp shares one traversal against the group's bounding
+// box: a node is accepted only if its com is farther than rcrit from the whole box, so each body
+// gets the interactions its own walk would have had, or finer ones (never coarser).
+//
+// Traversal: a per-warp stack in shared memory. Each step pops up to 32 nodes, one per lane; the
+// lanes test them in parallel and ballots compact the outcomes: accepted nodes go to the cell
+// list (moments copied into shared memory), opened leaves to the body list (positions copied),
+// opened internal nodes push their children. A list is evaluated (every lane, for each of its
+// bodies, over the whole list from shared memory) when the next append would overflow it, and at
+// the end. All shared-memory hand-offs between lanes are separated by __syncwarp.
+//
+// Stack bound: a step popping P nodes grows the stack by at most P*(cmax-1) (cmax = most
+// children of a node), so P is limited to keep the stack <= thr; above thr the warp pops one node
+// per step, a plain depth-first walk, which grows the stack by at most (cmax-1)*height in total.
+// With thr = GSTACK - (cmax-1)*height - 1 the stack therefore never overflows (the overflow check
+// below is a guard against a wrong height bound, not an expected path).
+//
+// The same kernel walks remote LETs (LET = true): nodes use the LET encoding below, terminal
+// nodes are always accepted, the acceptance test is >= as in backend.hpp, and results are added
+// to the local ones.
+constexpr int GW_WARPS = 4;
+constexpr int GW_BS = 32 * GW_WARPS;
+constexpr int GSTACK = 512;
+constexpr int CELL_CAP = 64;
+constexpr int BODY_CAP = 64;
+constexpr unsigned FULL_MASK = 0xffffffffu;
+
+struct GroupSmem {
+    float4 cA[CELL_CAP];
+    float4 cB[CELL_CAP];
+    float cQ[CELL_CAP];
+    float4 bP[BODY_CAP];
+    int bI[BODY_CAP];
+    int lf[32], lc[32];
+    int stack[GSTACK];
+};
+
+// Local tree: nodeC = (Qyz, rcrit2, a, b) as built above, R = body range per node.
+// LET: nodeC = (Qyz, rcrit2, first, code), code > 0: internal with `code` contiguous children at
+// `first`; code < 0: leaf with ~code bodies at `first` in `body`; code == 0: terminal.
+struct WalkSrc {
+    const float4* A;
+    const float4* B;
+    const float4* C;
+    const int2* R;         // local only
+    const float4* body;    // what leaf body indices refer to
+    const int* roots;      // LET only: up to 32 root nodes
+    int nroots;
+    int thr;
+    int cmax_m1;
+};
+
+struct WalkGroups {
+    const int* node;   // group -> tree node (its body range is R[node]); null: fixed chunks of gmax
+    const int2* R;
+    const int* ndev;   // group count on the device; null: nhost
+    int nhost;
+    int gmax;
+    int n;
+    int* next;         // work counter, zeroed before each launch
+};
+
+struct WalkOut {
+    float *ax, *ay, *az, *pot;
+    uint32_t* counts;
+    unsigned long long* inter;
+    int* error;
+};
+
+template <int NB, bool POT>
+__device__ __forceinline__ void eval_cells(const GroupSmem& S, int ncell, int nslot, const float4 (&p)[NB],
+                                           float eps2, float (&sx)[NB], float (&sy)[NB], float (&sz)[NB],
+                                           float (&sp)[NB], uint32_t (&cnt)[NB]) {
+    __syncwarp();
+    if (NB == 2 && nslot == 2) {
+        for (int k = 0; k < ncell; ++k) {
+            const float4 A = S.cA[k], B = S.cB[k];
+            const float q = S.cQ[k];
+            cell_term<POT>(p[0], A, B, q, eps2, sx[0], sy[0], sz[0], sp[0]);
+            cell_term<POT>(p[NB - 1], A, B, q, eps2, sx[NB - 1], sy[NB - 1], sz[NB - 1], sp[NB - 1]);
+        }
+        cnt[NB - 1] += ncell;
+    } else {
+        for (int k = 0; k < ncell; ++k) cell_term<POT>(p[0], S.cA[k], S.cB[k], S.cQ[k], eps2, sx[0], sy[0], sz[0], sp[0]);
+    }
+    cnt[0] += ncell;
+    __syncwarp();
+}
+
+template <int NB, bool POT>
+__device__ __forceinline__ void eval_bodies(const GroupSmem& S, int nbody, int nslot, const float4 (&p)[NB],
+                                            const int (&idx)[NB], float eps2, float (&sx)[NB], float (&sy)[NB],
+                                            float (&sz)[NB], float (&sp)[NB], uint32_t (&cnt)[NB]) {
+    __syncwarp();
+    // Self pair skipped by index: subtracting it afterwards would cancel a term that can exceed
+    // the whole potential, and is infinite for eps = 0.
+    if (NB == 2 && nslot == 2) {
+        for (int k = 0; k < nbody; ++k) {
+            const float4 q = S.bP[k];
+            const int j = S.bI[k];
+            if (j != idx[0]) { pp<POT>(p[0], q, eps2, sx[0], sy[0], sz[0], sp[0]); ++cnt[0]; }
+            if (j != idx[NB - 1]) {
+                pp<POT>(p[NB - 1], q, eps2, sx[NB - 1], sy[NB - 1], sz[NB - 1], sp[NB - 1]);
+                ++cnt[NB - 1];
+            }
+        }
+    } else {
+        for (int k = 0; k < nbody; ++k) {
+            const int j = S.bI[k];
+            if (j != idx[0]) { pp<POT>(p[0], S.bP[k], eps2, sx[0], sy[0], sz[0], sp[0]); ++cnt[0]; }
+        }
+    }
+    __syncwarp();
+}
+
+template <int NB, bool POT, bool LET>
+__global__ void __launch_bounds__(GW_BS) group_walk_kernel(const float4* __restrict__ pm, const WalkSrc t,
+                                                           const WalkGroups gr, float eps2, float G, const WalkOut o) {
+    __shared__ GroupSmem smem[GW_WARPS];
+    GroupSmem& S = smem[threadIdx.x >> 5];
+    const int lane = threadIdx.x & 31;
+    const unsigned lt = (1u << lane) - 1u;
+    const int ngroups = gr.ndev ? *gr.ndev : gr.nhost;
+    unsigned long long total = 0;
+    while (true) {
+        int g = 0;
+        if (lane == 0) g = atomicAdd(gr.next, 1);
+        g = __shfl_sync(FULL_MASK, g, 0);
+        if (g >= ngroups) break;
+        int g0, gn;
+        if (gr.node) {
+            const int2 r = gr.R[gr.node[g]];
+            g0 = r.x;
+            gn = r.y;
+        } else {
+            g0 = g * gr.gmax;
+            gn = min(gr.gmax, gr.n - g0);
+        }
+        const int nslot = min(NB, (gn + 31) >> 5);  // warp-uniform
+        float4 p[NB];
+        int idx[NB];
+        bool act[NB];
+        float lo[3] = {FLT_MAX, FLT_MAX, FLT_MAX}, hi[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+#pragma unroll
+        for (int s = 0; s < NB; ++s) {
+            const int k = s * 32 + lane;
+            act[s] = k < gn;
+            // Idle slots shadow the group's first body: inside the box, results never stored.
+            idx[s] = act[s] ? g0 + k : g0;
+            p[s] = pm[idx[s]];
+            lo[0] = fminf(lo[0], p[s].x); lo[1] = fminf(lo[1], p[s].y); lo[2] = fminf(lo[2], p[s].z);
+            hi[0] = fmaxf(hi[0], p[s].x); hi[1] = fmaxf(hi[1], p[s].y); hi[2] = fmaxf(hi[2], p[s].z);
+        }
+#pragma unroll
+        for (int o2 = 16; o2 > 0; o2 >>= 1)
+#pragma unroll
+            for (int c = 0; c < 3; ++c) {
+                lo[c] = fminf(lo[c], __shfl_xor_sync(FULL_MASK, lo[c], o2));
+                hi[c] = fmaxf(hi[c], __shfl_xor_sync(FULL_MASK, hi[c], o2));
+            }
+        float sx[NB], sy[NB], sz[NB], sp[NB];
+        uint32_t cnt[NB];
+#pragma unroll
+        for (int s = 0; s < NB; ++s) { sx[s] = sy[s] = sz[s] = sp[s] = 0.f; cnt[s] = 0; }
+
+        __syncwarp();  // the previous group's last reads of S are done
+        int top;
+        if (LET) {
+            if (lane < t.nroots) S.stack[lane] = t.roots[lane];
+            top = t.nroots;
+        } else {
+            if (lane == 0) S.stack[0] = 0;
+            top = 1;
+        }
+        int ncell = 0, nbody = 0;
+        bool ovf = false;
+        while (top > 0) {
+            const int room = (t.thr - top) / t.cmax_m1;
+            const int P = min(32, min(top, max(1, room)));
+            __syncwarp();
+            const bool active = lane < P;
+            const int nd = active ? S.stack[top - P + lane] : 0;
+            __syncwarp();  // the window is read before children overwrite it
+            top -= P;
+            float4 A = make_float4(0.f, 0.f, 0.f, 0.f), C = A;
+            bool acc = false, leaf = false;
+            int code = 0;
+            if (active) {
+                A = __ldg(&t.A[nd]);
+                C = __ldg(&t.C[nd]);
+                const float gx = fmaxf(fmaxf(lo[0] - A.x, A.x - hi[0]), 0.f);
+                const float gy = fmaxf(fmaxf(lo[1] - A.y, A.y - hi[1]), 0.f);
+                const float gz = fmaxf(fmaxf(lo[2] - A.z, A.z - hi[2]), 0.f);
+                const float d2 = fmaf(gx, gx, fmaf(gy, gy, gz * gz));
+                code = __float_as_int(C.w);
+                if (LET) {
+                    acc = code == 0 || d2 >= C.y;
+                    leaf = code < 0;
+                } else {
+                    // A node containing the group is always opened: for theta >= 2/sqrt(3) its
+                    // multipole could otherwise include the group's own bodies.
+                    const int2 r = __ldg(&t.R[nd]);
+                    const bool contains = r.x <= g0 && g0 + gn <= r.x + r.y;
+                    acc = !contains && d2 > C.y;
+                    leaf = code < 0;
+                }
+            }
+            const unsigned m_acc = __ballot_sync(FULL_MASK, active && acc);
+            const bool open_leaf = active && !acc && leaf;
+            const unsigned m_leaf = __ballot_sync(FULL_MASK, open_leaf);
+            const bool open_int = active && !acc && !leaf;
+
+            const int nch = open_int ? (LET ? code : 2) : 0;
+            int incl = nch;
+#pragma unroll
+            for (int o2 = 1; o2 < 32; o2 <<= 1) {
+                const int v = __shfl_up_sync(FULL_MASK, incl, o2);
+                if (lane >= o2) incl += v;
+            }
+            const int pushed = __shfl_sync(FULL_MASK, incl, 31);
+            if (top + pushed > GSTACK) {
+                ovf = true;
+                break;
+            }
+            if (open_int) {
+                const int base = top + incl - nch, first = __float_as_int(C.z);
+                if (LET) {
+                    for (int c = 0; c < nch; ++c) S.stack[base + c] = first + c;
+                } else {
+                    S.stack[base] = first;
+                    S.stack[base + 1] = code;
+                }
+            }
+            top += pushed;
+
+            const int na = __popc(m_acc);
+            if (na) {
+                if (ncell + na > CELL_CAP) {
+                    eval_cells<NB, POT>(S, ncell, nslot, p, eps2, sx, sy, sz, sp, cnt);
+                    ncell = 0;
+                }
+                if (active && acc) {
+                    const int k = ncell + __popc(m_acc & lt);
+                    S.cA[k] = A;
+                    S.cB[k] = __ldg(&t.B[nd]);
+                    S.cQ[k] = C.x;
+                }
+                ncell += na;
+            }
+            const int nl = __popc(m_leaf);
+            if (nl) {
+                if (open_leaf) {
+                    const int k = __popc(m_leaf & lt);
+                    S.lf[k] = __float_as_int(C.z);
+                    S.lc[k] = ~code;
+                }
+                __syncwarp();
+                for (int r = 0; r < nl; ++r) {
+                    const int f = S.lf[r], c = S.lc[r];
+                    for (int off = 0; off < c; off += 32) {
+                        const int k = min(32, c - off);
+                        if (nbody + k > BODY_CAP) {
+                            eval_bodies<NB, POT>(S, nbody, nslot, p, idx, eps2, sx, sy, sz, sp, cnt);
+                            nbody = 0;
+                        }
+                        if (lane < k) {
+                            S.bP[nbody + lane] = __ldg(&t.body[f + off + lane]);
+                            S.bI[nbody + lane] = LET ? -1 : f + off + lane;
+                        }
+                        nbody += k;
+                    }
+                }
+            }
+        }
+        if (ovf && lane == 0) atomicExch(o.error, 1);
+        if (ncell) eval_cells<NB, POT>(S, ncell, nslot, p, eps2, sx, sy, sz, sp, cnt);
+        if (nbody) eval_bodies<NB, POT>(S, nbody, nslot, p, idx, eps2, sx, sy, sz, sp, cnt);
+#pragma unroll
+        for (int s = 0; s < NB; ++s) {
+            if (!act[s]) continue;
+            const int i = idx[s];
+            if (LET) {
+                o.ax[i] += G * sx[s];
+                o.ay[i] += G * sy[s];
+                o.az[i] += G * sz[s];
+                if (POT) o.pot[i] -= G * sp[s];
+                o.counts[i] += cnt[s];
+            } else {
+                o.ax[i] = G * sx[s];
+                o.ay[i] = G * sy[s];
+                o.az[i] = G * sz[s];
+                if (POT) o.pot[i] = -G * sp[s];
+                o.counts[i] = cnt[s];
+            }
+            total += cnt[s];
+        }
+    }
+    total = warp_sum(total);
+    if (lane == 0 && total) atomicAdd(o.inter, total);
+}
+
+// Groups for the local tree: node v is a group iff it holds <= gmax bodies and its parent more.
+// slot[first body] = v; slots of non-first bodies keep -1, and a select compacts them in body order.
+__global__ void mark_groups(const int2* __restrict__ R, const int* __restrict__ parent, int nodes, int gmax,
+                            int* __restrict__ slot) {
+    long long v = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= nodes) return;
+    const int2 r = R[v];
+    if (r.y > gmax) return;
+    if (v != 0 && R[parent[v]].y <= gmax) return;
+    slot[r.x] = static_cast<int>(v);
+}
+
+struct NonNegative {
+    __host__ __device__ bool operator()(int v) const { return v >= 0; }
+};
+
+__global__ void fill_u32(uint32_t* __restrict__ p, uint32_t v, int n) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) p[i] = v;
+}
+
+__global__ void gather_float4(const float4* __restrict__ src, const int* __restrict__ idx, float4* __restrict__ dst,
+                              int n) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[idx[i]];
 }
 
 // ---------------------------------------------------------------- backend
@@ -706,7 +1059,24 @@ public:
         cube_.reserve(sizeof(float4));
         bbox_part_.reserve(sizeof(float) * 6 * REDUCE_BLOCKS);
         diag_part_.reserve(sizeof(double) * DIAG_N * REDUCE_BLOCKS);
-        small_.reserve(64);
+        small_.reserve(128);
+        sms_ = prop.multiProcessorCount;
+        // LETTUCE_CUDA_WALK=body|group (default group) picks the local tree walk: one traversal per
+        // body, or one per group of consecutive sorted bodies. LETTUCE_CUDA_GROUP=64|32 (default 64)
+        // is the group size: 64 puts two bodies on each lane. Remote LETs always use the group walk.
+        if (const char* w = std::getenv("LETTUCE_CUDA_WALK")) {
+            const std::string v = w;
+            if (v != "body" && v != "group")
+                throw std::runtime_error("LETTUCE_CUDA_WALK must be body or group, not '" + v + "'");
+            walk_body_ = v == "body";
+        }
+        if (const char* g = std::getenv("LETTUCE_CUDA_GROUP")) {
+            const std::string v = g;
+            if (v != "32" && v != "64") throw std::runtime_error("LETTUCE_CUDA_GROUP must be 32 or 64, not '" + v + "'");
+            nb_ = v == "32" ? 1 : 2;
+        }
+        gmax_ = 32 * nb_;
+        name_ += walk_body_ ? ", per-body walk" : (nb_ == 2 ? ", group walk 64" : ", group walk 32");
     }
 
     std::string name() const override { return name_; }
@@ -720,6 +1090,7 @@ public:
         n_ = static_cast<int>(n);
         has_pe_ = false;
         kick_rec_ = drift_rec_ = false;
+        tree_ok_ = host_nodes_ok_ = costs_ok_ = false;
         t_ = PhaseTimes{};
         if (n == 0) return;
         const std::size_t fb = n * sizeof(float);
@@ -758,25 +1129,77 @@ public:
         CK(cudaStreamSynchronize(s));
     }
 
-    // Synchronises at the end (and once mid-build to read the leaf count), so the PhaseTimes are
-    // final when this returns and walk errors are reported here rather than at some later call.
+    // compute_forces = build_tree + compute_forces_with(no remote): one code path.
     void compute_forces(const ForceParams& p, bool potential) override {
+        build_tree(p);
+        compute_forces_with(p, potential, {});
+    }
+
+    Box3 local_bounds() override {
         CK(cudaSetDevice(dev_));
-        t_.sort_ms = t_.build_ms = t_.walk_ms = t_.force_ms = 0;
+        Box3 b;
+        if (n_ == 0) return b;
+        cudaStream_t s = stream_->s;
+        const int pb = static_cast<int>(std::min<long long>(grid_for(n_, BS), REDUCE_BLOCKS));
+        bbox_partial<<<pb, BS, 0, s>>>(x_.as<float>(), y_.as<float>(), z_.as<float>(), n_, bbox_part_.as<float>());
+        CK_LAUNCH();
+        std::vector<float> part(static_cast<std::size_t>(pb) * 6);
+        CK(cudaMemcpyAsync(part.data(), bbox_part_.as<float>(), part.size() * sizeof(float), cudaMemcpyDeviceToHost, s));
+        CK(cudaStreamSynchronize(s));
+        for (int c = 0; c < 3; ++c) { b.lo[c] = FLT_MAX; b.hi[c] = -FLT_MAX; }
+        for (int k = 0; k < pb; ++k)
+            for (int c = 0; c < 3; ++c) {
+                b.lo[c] = std::min(b.lo[c], part[static_cast<std::size_t>(k) * 6 + c]);
+                b.hi[c] = std::max(b.hi[c], part[static_cast<std::size_t>(k) * 6 + 3 + c]);
+            }
+        return b;
+    }
+
+    // Tree: sort, leaves, topology, moments and walk groups. Host-synchronises once (leaf count).
+    void build_tree(const ForceParams& p) override {
+        CK(cudaSetDevice(dev_));
+        tree_ok_ = host_nodes_ok_ = false;
+        t_.sort_ms = t_.build_ms = 0;
+        if (p.method != ForceMethod::tree || n_ == 0) return;
+        cudaStream_t s = stream_->s;
+        costs_ok_ = false;  // the sort reorders the bodies
+        CK(cudaEventRecord(ev_[0].e, s));
+        sort_bodies();
+        CK(cudaEventRecord(ev_[1].e, s));
+        K_ = build_tree_impl(p.theta);
+        make_groups();
+        CK(cudaEventRecord(ev_[2].e, s));
+        tree_ok_ = true;
+    }
+
+    // Synchronises at the end, so the PhaseTimes are final when this returns and walk errors are
+    // reported here rather than at some later call.
+    void compute_forces_with(const ForceParams& p, bool potential, const std::vector<const LetTree*>& remote) override {
+        CK(cudaSetDevice(dev_));
+        t_.walk_ms = t_.force_ms = 0;
         t_.interactions = 0;
+        costs_ok_ = false;
         if (n_ == 0) {
+            t_.sort_ms = t_.build_ms = 0;
             has_pe_ = potential;
             return;
         }
+        const bool tree = p.method == ForceMethod::tree;
+        if (tree && !tree_ok_)
+            throw std::logic_error("cuda compute_forces_with: call build_tree after the last upload/drift first");
         cudaStream_t s = stream_->s;
         const int n = n_;
         const float G = static_cast<float>(p.G), eps2 = static_cast<float>(p.eps * p.eps);
-        CK(cudaEventRecord(ev_[0].e, s));
-        if (p.method == ForceMethod::direct) {
+        int* err = small_.as<int>();
+        unsigned long long* inter = reinterpret_cast<unsigned long long*>(small_.as<char>() + 16);
+        CK(cudaMemsetAsync(small_.as<char>(), 0, 24, s));
+        const WalkOut out{ax_.as<float>(), ay_.as<float>(), az_.as<float>(), pot_.as<float>(), counts_.as<uint32_t>(),
+                          inter, err};
+        CK(cudaEventRecord(ev_[8].e, s));
+        if (!tree) {
             pack_posm<<<grid_for(n, BS), BS, 0, s>>>(x_.as<float>(), y_.as<float>(), z_.as<float>(), m_.as<float>(),
                                                      posm_.as<float4>(), n);
             CK_LAUNCH();
-            CK(cudaEventRecord(ev_[1].e, s));
             if (potential)
                 direct_kernel<true><<<grid_for(n, DIRECT_BS), DIRECT_BS, 0, s>>>(
                     posm_.as<float4>(), n, eps2, G, ax_.as<float>(), ay_.as<float>(), az_.as<float>(), pot_.as<float>());
@@ -784,43 +1207,147 @@ public:
                 direct_kernel<false><<<grid_for(n, DIRECT_BS), DIRECT_BS, 0, s>>>(
                     posm_.as<float4>(), n, eps2, G, ax_.as<float>(), ay_.as<float>(), az_.as<float>(), pot_.as<float>());
             CK_LAUNCH();
-            CK(cudaEventRecord(ev_[3].e, s));
-            CK(cudaEventSynchronize(ev_[3].e));
-            t_.walk_ms = elapsed(1, 3);
-            t_.force_ms = elapsed(0, 3);
-            t_.interactions = static_cast<uint64_t>(n) * static_cast<uint64_t>(n - 1);
-        } else {
-            sort_bodies();
-            CK(cudaEventRecord(ev_[1].e, s));
-            const int K = build_tree(p.theta);
-            CK(cudaEventRecord(ev_[2].e, s));
-            int* err = small_.as<int>();
-            unsigned long long* inter = reinterpret_cast<unsigned long long*>(small_.as<char>() + 16);
-            CK(cudaMemsetAsync(small_.as<char>(), 0, 24, s));
-            (void)K;
+            fill_u32<<<grid_for(n, BS), BS, 0, s>>>(counts_.as<uint32_t>(), static_cast<uint32_t>(n - 1), n);
+            CK_LAUNCH();
+        } else if (walk_body_) {
             if (potential)
                 walk_kernel<true><<<grid_for(n, WALK_BS), WALK_BS, 0, s>>>(
                     posm_.as<float4>(), n, nodeA_.as<float4>(), nodeB_.as<float4>(), nodeC_.as<float4>(), eps2, G,
-                    ax_.as<float>(), ay_.as<float>(), az_.as<float>(), pot_.as<float>(), inter, err);
+                    ax_.as<float>(), ay_.as<float>(), az_.as<float>(), pot_.as<float>(), counts_.as<uint32_t>(), inter, err);
             else
                 walk_kernel<false><<<grid_for(n, WALK_BS), WALK_BS, 0, s>>>(
                     posm_.as<float4>(), n, nodeA_.as<float4>(), nodeB_.as<float4>(), nodeC_.as<float4>(), eps2, G,
-                    ax_.as<float>(), ay_.as<float>(), az_.as<float>(), pot_.as<float>(), inter, err);
+                    ax_.as<float>(), ay_.as<float>(), az_.as<float>(), pot_.as<float>(), counts_.as<uint32_t>(), inter, err);
             CK_LAUNCH();
-            CK(cudaEventRecord(ev_[3].e, s));
-            struct { int err; int pad[3]; unsigned long long inter; } h{};
-            CK(cudaMemcpyAsync(&h, small_.as<char>(), 24, cudaMemcpyDeviceToHost, s));
-            CK(cudaStreamSynchronize(s));
-            if (h.err)
-                throw std::runtime_error("cuda tree walk: traversal stack overflow (depth > " +
-                                         std::to_string(STACK) + "); accelerations are invalid");
-            t_.sort_ms = elapsed(0, 1);
-            t_.build_ms = elapsed(1, 2);
-            t_.walk_ms = elapsed(2, 3);
-            t_.force_ms = elapsed(0, 3);
-            t_.interactions = h.inter;
+        } else {
+            const WalkSrc src{nodeA_.as<float4>(), nodeB_.as<float4>(), nodeC_.as<float4>(), nodeR_.as<int2>(),
+                              posm_.as<float4>(), nullptr, 0, GSTACK - STACK - 1, 1};
+            launch_group(potential, false, src, groups(tree), group_bound(tree), eps2, G, out);
         }
+        walk_remote(remote, tree, potential, eps2, G, out);
+        CK(cudaEventRecord(ev_[3].e, s));
+        struct { int err; int pad[3]; unsigned long long inter; } h{};
+        CK(cudaMemcpyAsync(&h, small_.as<char>(), 24, cudaMemcpyDeviceToHost, s));
+        CK(cudaStreamSynchronize(s));
+        if (h.err)
+            throw std::runtime_error("cuda tree walk: traversal stack overflow; accelerations are invalid");
+        t_.sort_ms = tree ? elapsed(0, 1) : 0.0;
+        t_.build_ms = tree ? elapsed(1, 2) : 0.0;
+        t_.walk_ms = elapsed(8, 3);
+        t_.force_ms = t_.sort_ms + t_.build_ms + t_.walk_ms;
+        t_.interactions = h.inter + (tree ? 0ull : static_cast<uint64_t>(n) * static_cast<uint64_t>(n - 1));
         has_pe_ = potential;
+        costs_ok_ = true;
+    }
+
+    // Tree: a host walk over a copy of the node arrays (downloaded once per build, ~48 B/node) plus a
+    // device gather of the exported leaf bodies. A device-side export would instead run a
+    // level-synchronous BFS on the GPU (frontier queue with atomic appends; children of a parent
+    // appended as one block to keep them contiguous), a scan to number the exported bodies, and
+    // one download of the finished LET: no full node copy over PCIe and no host loop.
+    LetTree export_let(const Box3& target, const ForceParams& p) override {
+        CK(cudaSetDevice(dev_));
+        LetTree out;
+        if (n_ == 0) return out;
+        cudaStream_t s = stream_->s;
+        const std::size_t n = static_cast<std::size_t>(n_);
+        if (p.method == ForceMethod::direct) {
+            out.bx.resize(n); out.by.resize(n); out.bz.resize(n); out.bm.resize(n);
+            CK(cudaMemcpyAsync(out.bx.data(), x_.as<float>(), n * 4, cudaMemcpyDeviceToHost, s));
+            CK(cudaMemcpyAsync(out.by.data(), y_.as<float>(), n * 4, cudaMemcpyDeviceToHost, s));
+            CK(cudaMemcpyAsync(out.bz.data(), z_.as<float>(), n * 4, cudaMemcpyDeviceToHost, s));
+            CK(cudaMemcpyAsync(out.bm.data(), m_.as<float>(), n * 4, cudaMemcpyDeviceToHost, s));
+            CK(cudaStreamSynchronize(s));
+            double m = 0, cx = 0, cy = 0, cz = 0;
+            for (std::size_t i = 0; i < n; ++i) {
+                m += out.bm[i]; cx += double(out.bm[i]) * out.bx[i]; cy += double(out.bm[i]) * out.by[i];
+                cz += double(out.bm[i]) * out.bz[i];
+            }
+            LetNode r{};
+            if (m > 0) { r.cx = float(cx / m); r.cy = float(cy / m); r.cz = float(cz / m); }
+            r.mass = float(m);
+            r.rcrit2 = 3.0e38f;
+            r.first_child = -1;
+            r.child_count = 0;
+            r.body_first = 0;
+            r.body_count = static_cast<int32_t>(n);
+            out.nodes.push_back(r);
+            return out;
+        }
+        if (!tree_ok_) throw std::logic_error("cuda export_let: call build_tree after the last upload/drift first");
+        const std::size_t nodes = 2 * static_cast<std::size_t>(K_) - 1;
+        if (!host_nodes_ok_) {
+            hA_.resize(nodes); hB_.resize(nodes); hC_.resize(nodes);
+            CK(cudaMemcpyAsync(hA_.data(), nodeA_.as<float4>(), nodes * sizeof(float4), cudaMemcpyDeviceToHost, s));
+            CK(cudaMemcpyAsync(hB_.data(), nodeB_.as<float4>(), nodes * sizeof(float4), cudaMemcpyDeviceToHost, s));
+            CK(cudaMemcpyAsync(hC_.data(), nodeC_.as<float4>(), nodes * sizeof(float4), cudaMemcpyDeviceToHost, s));
+            CK(cudaStreamSynchronize(s));
+            host_nodes_ok_ = true;
+        }
+        if (!(hA_[0].w > 0.f)) return out;
+        float lo[3], hi[3];
+        for (int c = 0; c < 3; ++c) { lo[c] = target.lo[c]; hi[c] = target.hi[c]; }
+        // out.nodes doubles as the BFS queue (src[k] = local node behind out.nodes[k]); a parent's
+        // children are appended together, so siblings are contiguous and children follow parents.
+        std::vector<int> src, gather;
+        auto emit = [&](int v) {
+            const float4 A = hA_[v], B = hB_[v], C = hC_[v];
+            LetNode l{};
+            l.cx = A.x; l.cy = A.y; l.cz = A.z; l.mass = A.w;
+            l.qxx = B.x; l.qyy = B.y; l.qxy = B.z; l.qxz = B.w; l.qyz = C.x; l.qzz = -(B.x + B.y);
+            l.rcrit2 = C.y;
+            l.first_child = -1; l.child_count = 0; l.body_first = -1; l.body_count = 0;
+            out.nodes.push_back(l);
+            src.push_back(v);
+        };
+        emit(0);
+        for (std::size_t k = 0; k < out.nodes.size(); ++k) {
+            const int v = src[k];
+            const float4 A = hA_[v], C = hC_[v];
+            const float gx = std::max(std::max(lo[0] - A.x, A.x - hi[0]), 0.f);
+            const float gy = std::max(std::max(lo[1] - A.y, A.y - hi[1]), 0.f);
+            const float gz = std::max(std::max(lo[2] - A.z, A.z - hi[2]), 0.f);
+            if (gx * gx + gy * gy + gz * gz >= C.y) continue;  // terminal
+            const int a = bits(C.z), b = bits(C.w);
+            if (b < 0) {
+                out.nodes[k].body_first = static_cast<int32_t>(gather.size());
+                out.nodes[k].body_count = ~b;
+                for (int j = a; j < a + ~b; ++j) gather.push_back(j);
+                continue;
+            }
+            const int32_t first = static_cast<int32_t>(out.nodes.size());
+            for (int c : {a, b})
+                if (hA_[c].w > 0.f) emit(c);
+            out.nodes[k].first_child = first;
+            out.nodes[k].child_count = static_cast<int32_t>(out.nodes.size()) - first;
+        }
+        const std::size_t nb = gather.size();
+        if (nb) {
+            letIdx_.reserve(nb * sizeof(int));
+            letGather_.reserve(nb * sizeof(float4));
+            std::vector<float4> hb(nb);
+            CK(cudaMemcpyAsync(letIdx_.as<int>(), gather.data(), nb * sizeof(int), cudaMemcpyHostToDevice, s));
+            gather_float4<<<grid_for(static_cast<long long>(nb), BS), BS, 0, s>>>(posm_.as<float4>(), letIdx_.as<int>(),
+                                                                               letGather_.as<float4>(), static_cast<int>(nb));
+            CK_LAUNCH();
+            CK(cudaMemcpyAsync(hb.data(), letGather_.as<float4>(), nb * sizeof(float4), cudaMemcpyDeviceToHost, s));
+            CK(cudaStreamSynchronize(s));
+            out.bx.resize(nb); out.by.resize(nb); out.bz.resize(nb); out.bm.resize(nb);
+            for (std::size_t j = 0; j < nb; ++j) {
+                out.bx[j] = hb[j].x; out.by[j] = hb[j].y; out.bz[j] = hb[j].z; out.bm[j] = hb[j].w;
+            }
+        }
+        return out;
+    }
+
+    bool body_costs(std::vector<float>& cost) override {
+        CK(cudaSetDevice(dev_));
+        if (!costs_ok_ || n_ == 0) return false;
+        std::vector<uint32_t> c(static_cast<std::size_t>(n_));
+        CK(cudaMemcpyAsync(c.data(), counts_.as<uint32_t>(), c.size() * 4, cudaMemcpyDeviceToHost, stream_->s));
+        CK(cudaStreamSynchronize(stream_->s));
+        cost.assign(c.begin(), c.end());
+        return true;
     }
 
     void kick(double dt) override {
@@ -845,6 +1372,7 @@ public:
         CK_LAUNCH();
         CK(cudaEventRecord(ev_[7].e, s));
         drift_rec_ = true;
+        tree_ok_ = host_nodes_ok_ = false;
     }
 
     Diag diagnostics() override {
@@ -903,7 +1431,153 @@ public:
     }
 
 private:
-    static constexpr int NEV = 8;  // force: 0 start, 1 sorted, 2 built, 3 walked; 4-5 kick; 6-7 drift
+    static constexpr int NEV = 9;  // 0 build start, 1 sorted, 2 built, 3 walked; 4-5 kick; 6-7 drift; 8 walk start
+
+    static int bits(float f) {
+        int i;
+        std::memcpy(&i, &f, sizeof i);
+        return i;
+    }
+    static float as_float(int i) {
+        float f;
+        std::memcpy(&f, &i, sizeof f);
+        return f;
+    }
+
+    // Tree: the groups made by make_groups (count on the device). Direct (remote walks only):
+    // fixed chunks of gmax_ bodies in the current, unsorted order.
+    WalkGroups groups(bool tree) {
+        int* next = reinterpret_cast<int*>(small_.as<char>() + 72);
+        if (tree)
+            return WalkGroups{groups_.as<int>(), nodeR_.as<int2>(), reinterpret_cast<int*>(small_.as<char>() + 64), 0,
+                              gmax_, n_, next};
+        return WalkGroups{nullptr, nullptr, nullptr, static_cast<int>((n_ + gmax_ - 1) / gmax_), gmax_, n_, next};
+    }
+    int group_bound(bool tree) const { return tree ? K_ : (n_ + gmax_ - 1) / gmax_; }
+
+    template <int NB, bool POT, bool LET>
+    void launch_group_t(const WalkSrc& t, const WalkGroups& g, int ub, float eps2, float G, const WalkOut& o) {
+        int& occ = occ_[(NB == 2 ? 4 : 0) + (POT ? 2 : 0) + (LET ? 1 : 0)];
+        if (occ == 0) {
+            int b = 0;
+            CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, group_walk_kernel<NB, POT, LET>, GW_BS, 0));
+            occ = std::max(b, 1);
+        }
+        // Persistent warps pull groups from a counter: groups differ a lot in cost, and pulling them
+        // in body order keeps the warps running at any moment on nearby groups (shared L1/L2 lines).
+        const long long want = (static_cast<long long>(ub) + GW_WARPS - 1) / GW_WARPS;
+        const int blocks = static_cast<int>(std::max<long long>(1, std::min<long long>(want, static_cast<long long>(occ) * sms_)));
+        cudaStream_t s = stream_->s;
+        CK(cudaMemsetAsync(g.next, 0, sizeof(int), s));
+        group_walk_kernel<NB, POT, LET><<<blocks, GW_BS, 0, s>>>(posm_.as<float4>(), t, g, eps2, G, o);
+        CK_LAUNCH();
+    }
+    void launch_group(bool pot, bool let, const WalkSrc& t, const WalkGroups& g, int ub, float eps2, float G,
+                      const WalkOut& o) {
+        if (nb_ == 2) {
+            if (pot) let ? launch_group_t<2, true, true>(t, g, ub, eps2, G, o) : launch_group_t<2, true, false>(t, g, ub, eps2, G, o);
+            else let ? launch_group_t<2, false, true>(t, g, ub, eps2, G, o) : launch_group_t<2, false, false>(t, g, ub, eps2, G, o);
+        } else {
+            if (pot) let ? launch_group_t<1, true, true>(t, g, ub, eps2, G, o) : launch_group_t<1, true, false>(t, g, ub, eps2, G, o);
+            else let ? launch_group_t<1, false, true>(t, g, ub, eps2, G, o) : launch_group_t<1, false, false>(t, g, ub, eps2, G, o);
+        }
+    }
+
+    // Uploads every remote LET into one set of grow-only device arrays (converted to the walk's
+    // node encoding, indices offset) and walks them with the local groups, adding to the forces.
+    // LETs arrive over MPI, so every index is validated before it can reach the device.
+    void walk_remote(const std::vector<const LetTree*>& remote, bool tree, bool potential, float eps2, float G,
+                     const WalkOut& out) {
+        std::size_t nn = 0, nbt = 0;
+        for (const LetTree* t : remote)
+            if (t && !t->nodes.empty()) { nn += t->nodes.size(); nbt += t->bx.size(); }
+        if (nn == 0) return;
+        if (nn >= static_cast<std::size_t>(INT32_MAX) || nbt >= static_cast<std::size_t>(INT32_MAX))
+            throw std::runtime_error("cuda compute_forces_with: remote LETs exceed 2^31 nodes or bodies");
+        hLA_.resize(nn); hLB_.resize(nn); hLC_.resize(nn); hLBody_.resize(nbt);
+        std::vector<int> roots, depth;
+        int cmax = 2, height = 0;
+        std::size_t off = 0, boff = 0;
+        for (const LetTree* t : remote) {
+            if (!t || t->nodes.empty()) continue;
+            const std::size_t m = t->nodes.size(), nb = t->bx.size();
+            if (t->by.size() != nb || t->bz.size() != nb || t->bm.size() != nb)
+                throw std::runtime_error("cuda compute_forces_with: LET body arrays differ in length");
+            depth.assign(m, 0);
+            roots.push_back(static_cast<int>(off));
+            for (std::size_t i = 0; i < m; ++i) {
+                const LetNode& L = t->nodes[i];
+                int first = 0, code = 0;
+                if (L.body_count > 0) {
+                    if (L.body_first < 0 || static_cast<std::size_t>(L.body_first) + L.body_count > nb)
+                        throw std::runtime_error("cuda compute_forces_with: LET node body range out of bounds");
+                    first = static_cast<int>(boff) + L.body_first;
+                    code = ~L.body_count;
+                } else if (L.first_child >= 0 && L.child_count > 0) {
+                    // Children after their parent (both exporters emit breadth-first): rules out
+                    // cycles and makes one forward pass compute every depth.
+                    if (static_cast<std::size_t>(L.first_child) <= i ||
+                        static_cast<std::size_t>(L.first_child) + L.child_count > m)
+                        throw std::runtime_error("cuda compute_forces_with: LET node children out of order or bounds");
+                    first = static_cast<int>(off) + L.first_child;
+                    code = L.child_count;
+                    cmax = std::max(cmax, static_cast<int>(L.child_count));
+                    for (int32_t c = L.first_child; c < L.first_child + L.child_count; ++c)
+                        depth[static_cast<std::size_t>(c)] = std::max(depth[static_cast<std::size_t>(c)], depth[i] + 1);
+                }
+                height = std::max(height, depth[i]);
+                hLA_[off + i] = make_float4(L.cx, L.cy, L.cz, L.mass);
+                hLB_[off + i] = make_float4(L.qxx, L.qyy, L.qxy, L.qxz);
+                hLC_[off + i] = make_float4(L.qyz, L.rcrit2, as_float(first), as_float(code));
+            }
+            for (std::size_t j = 0; j < nb; ++j) hLBody_[boff + j] = make_float4(t->bx[j], t->by[j], t->bz[j], t->bm[j]);
+            off += m;
+            boff += nb;
+        }
+        const long long thr = GSTACK - static_cast<long long>(height) * (cmax - 1) - 1;
+        if (thr < 64)
+            throw std::runtime_error("cuda compute_forces_with: LET too deep for the group walk stack (height " +
+                                     std::to_string(height) + ", up to " + std::to_string(cmax) + " children)");
+        cudaStream_t s = stream_->s;
+        letA_.reserve(nn * sizeof(float4));
+        letB_.reserve(nn * sizeof(float4));
+        letC_.reserve(nn * sizeof(float4));
+        letBody_.reserve(std::max<std::size_t>(nbt, 1) * sizeof(float4));
+        letRoots_.reserve(roots.size() * sizeof(int));
+        CK(cudaMemcpyAsync(letA_.as<float4>(), hLA_.data(), nn * sizeof(float4), cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(letB_.as<float4>(), hLB_.data(), nn * sizeof(float4), cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(letC_.as<float4>(), hLC_.data(), nn * sizeof(float4), cudaMemcpyHostToDevice, s));
+        if (nbt)
+            CK(cudaMemcpyAsync(letBody_.as<float4>(), hLBody_.data(), nbt * sizeof(float4), cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(letRoots_.as<int>(), roots.data(), roots.size() * sizeof(int), cudaMemcpyHostToDevice, s));
+        const WalkGroups g = groups(tree);
+        // At most 32 roots per launch: the walk seeds its stack with one root per lane.
+        for (std::size_t r0 = 0; r0 < roots.size(); r0 += 32) {
+            const int cnt = static_cast<int>(std::min<std::size_t>(32, roots.size() - r0));
+            const WalkSrc src{letA_.as<float4>(), letB_.as<float4>(), letC_.as<float4>(), nullptr,
+                              letBody_.as<float4>(), letRoots_.as<int>() + r0, cnt, static_cast<int>(thr), cmax - 1};
+            launch_group(potential, true, src, g, group_bound(tree), eps2, G, out);
+        }
+        // The host staging vectors are reused by the next call; the copies above are pageable, so
+        // they have completed (staged) by the time cudaMemcpyAsync returns.
+    }
+
+    void make_groups() {
+        cudaStream_t s = stream_->s;
+        const int n = n_;
+        const int nodes = 2 * K_ - 1;
+        int* slot = idx_[scratch_sel_].as<int>();  // free after the build
+        CK(cudaMemsetAsync(slot, 0xff, static_cast<std::size_t>(n) * sizeof(int), s));
+        mark_groups<<<grid_for(nodes, BS), BS, 0, s>>>(nodeR_.as<int2>(), parent_.as<int>(), nodes, gmax_, slot);
+        CK_LAUNCH();
+        groups_.reserve(static_cast<std::size_t>(K_) * sizeof(int));
+        int* ng = reinterpret_cast<int*>(small_.as<char>() + 64);
+        std::size_t need = 0;
+        CK(cub::DeviceSelect::If(nullptr, need, slot, groups_.as<int>(), ng, n, NonNegative(), s));
+        reserve_temp(need);
+        need = temp_bytes_;
+        CK(cub::DeviceSelect::If(temp_.as<void>(), need, slot, groups_.as<int>(), ng, n, NonNegative(), s));
+    }
 
     double elapsed(int a, int b) const {
         float ms = 0;
@@ -918,7 +1592,7 @@ private:
 
     void reserve_bodies(std::size_t n) {
         const std::size_t f = n * 4;
-        for (DevBuf* b : {&x_, &y_, &z_, &vx_, &vy_, &vz_, &m_, &id_, &ax_, &ay_, &az_, &pot_, &idx_[0], &idx_[1]})
+        for (DevBuf* b : {&x_, &y_, &z_, &vx_, &vy_, &vz_, &m_, &id_, &ax_, &ay_, &az_, &pot_, &counts_, &idx_[0], &idx_[1]})
             b->reserve(f);
         posm_.reserve(n * sizeof(float4));
         // +1 entry: the alternate key buffer also holds leaf starts [0, K] with K <= n.
@@ -968,7 +1642,7 @@ private:
     }
 
     // Returns the number of leaves K. Host-synchronises once to read K for sizing.
-    int build_tree(double theta) {
+    int build_tree_impl(double theta) {
         cudaStream_t s = stream_->s;
         const int n = n_;
         const unsigned g = grid_for(n, BS);
@@ -1003,17 +1677,20 @@ private:
         const std::size_t nodes = 2 * static_cast<std::size_t>(K) - 1;
         for (DevBuf* b : {&nodeA_, &nodeB_, &nodeC_, &bmin_, &bmax_}) b->reserve(nodes * sizeof(float4));
         parent_.reserve(nodes * sizeof(int));
+        nodeR_.reserve(nodes * sizeof(int2));
         counter_.reserve(std::max<std::size_t>(K - 1, 1) * sizeof(int));
         CK(cudaMemsetAsync(parent_.as<int>(), 0xff, sizeof(int), s));  // root's parent = -1
         if (K > 1) {
             CK(cudaMemsetAsync(counter_.as<int>(), 0, static_cast<std::size_t>(K - 1) * sizeof(int), s));
-            build_radix<<<grid_for(K - 1, BS), BS, 0, s>>>(keys, start, K, nodeC_.as<float4>(), parent_.as<int>());
+            build_radix<<<grid_for(K - 1, BS), BS, 0, s>>>(keys, start, K, nodeC_.as<float4>(), parent_.as<int>(),
+                                                           nodeR_.as<int2>());
             CK_LAUNCH();
         }
         const float inv_theta = theta > 1.0 / RCRIT_MAX ? static_cast<float>(1.0 / theta) : RCRIT_MAX;
         moments_kernel<<<grid_for(K, BS), BS, 0, s>>>(posm_.as<float4>(), start, K, inv_theta, parent_.as<int>(),
                                                       counter_.as<int>(), nodeA_.as<float4>(), nodeB_.as<float4>(),
-                                                      nodeC_.as<float4>(), bmin_.as<float4>(), bmax_.as<float4>());
+                                                      nodeC_.as<float4>(), bmin_.as<float4>(), bmax_.as<float4>(),
+                                                      nodeR_.as<int2>());
         CK_LAUNCH();
         return K;
     }
@@ -1026,12 +1703,22 @@ private:
     bool has_pe_ = false;
     bool kick_rec_ = false, drift_rec_ = false;
     PhaseTimes t_{};
+    int sms_ = 1;
+    bool walk_body_ = false;
+    int nb_ = 2, gmax_ = 64;      // bodies per lane in the group walk, group size
+    int occ_[8] = {};            // resident blocks/SM per group-walk instantiation (lazy)
+    int K_ = 0;                  // leaves of the current tree
+    bool tree_ok_ = false;       // tree (and groups) match the current positions
+    bool host_nodes_ok_ = false; // hA_/hB_/hC_ hold the current tree
+    bool costs_ok_ = false;      // counts_ are the last force call's, in the current body order
+    std::vector<float4> hA_, hB_, hC_, hLA_, hLB_, hLC_, hLBody_;
     int key_sel_ = 0, scratch_sel_ = 1;
     std::size_t temp_bytes_ = 0;
 
     DevBuf x_, y_, z_, vx_, vy_, vz_, m_, id_, ax_, ay_, az_, pot_, posm_;
     DevBuf keys_[2], idx_[2];
-    DevBuf nodeA_, nodeB_, nodeC_, bmin_, bmax_, parent_, counter_;
+    DevBuf nodeA_, nodeB_, nodeC_, bmin_, bmax_, parent_, counter_, nodeR_, groups_, counts_;
+    DevBuf letA_, letB_, letC_, letBody_, letRoots_, letIdx_, letGather_;
     DevBuf cube_, bbox_part_, diag_part_, small_, temp_;
 };
 
@@ -1062,3 +1749,12 @@ std::unique_ptr<Backend> make_cuda_backend(int device, std::string& why) {
 }
 
 bool cuda_compiled() { return true; }
+
+int cuda_device_count() {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess) {
+        cudaGetLastError();
+        return 0;
+    }
+    return count;
+}

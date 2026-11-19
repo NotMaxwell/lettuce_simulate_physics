@@ -7,3 +7,5 @@ std::unique_ptr<Backend> make_cuda_backend(int, std::string& why) {
 }
 
 bool cuda_compiled() { return false; }
+
+int cuda_device_count() { return 0; }

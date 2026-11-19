@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -136,6 +138,27 @@ ForceParams params(ForceMethod m, double eps, double theta = 0.6) {
     std::string why;                           \
     auto be = make_cuda_backend(0, why);       \
     if (!be) SKIP(why)
+
+// Sets an environment variable for the guard's lifetime (the CUDA backend reads its walk
+// settings when constructed), restoring the previous value afterwards.
+struct EnvGuard {
+    std::string name, old;
+    bool had;
+    EnvGuard(const char* n, const char* v) : name(n) {
+        const char* o = std::getenv(n);
+        had = o != nullptr;
+        if (had) old = o;
+        if (v) setenv(n, v, 1); else unsetenv(n);
+    }
+    ~EnvGuard() {
+        if (had) setenv(name.c_str(), old.c_str(), 1); else unsetenv(name.c_str());
+    }
+};
+
+std::unique_ptr<Backend> cuda_with(const char* walk, const char* group, std::string& why) {
+    EnvGuard w("LETTUCE_CUDA_WALK", walk), g("LETTUCE_CUDA_GROUP", group);
+    return make_cuda_backend(0, why);
+}
 
 }  // namespace
 
@@ -373,4 +396,64 @@ TEST("cuda: 1M-body tree force call") {
     PhaseTimes t = be->times();
     std::fprintf(stderr, "  1M tree: wall %.2f ms, force %.2f ms (sort %.2f, build %.2f, walk %.2f), %.1f interactions/body\n",
                  wall, t.force_ms, t.sort_ms, t.build_ms, t.walk_ms, double(t.interactions) / double(n));
+}
+
+TEST("cuda: group walk agrees with the per-body walk, 20k Plummer") {
+    CUDA_BACKEND(be);
+    std::string w;
+    auto body = cuda_with("body", nullptr, w);
+    auto g64 = cuda_with("group", "64", w);
+    auto g32 = cuda_with("group", "32", w);
+    CHECK(body && g64 && g32);
+    if (!body || !g64 || !g32) return;
+    Bodies b = plummer(20000, 8);
+    const double eps = 0.01;
+    Got d = accel(*be, b, params(ForceMethod::direct, eps), true);
+    for (double theta : {0.3, 0.6, 0.9}) {
+        const ForceParams p = params(ForceMethod::tree, eps, theta);
+        Got tb = accel(*body, b, p, true);
+        const double eb = rel_rms(tb.a, d.a);
+        std::fprintf(stderr, "  theta %.1f body: err %.3g, %.1f int/body, walk %.3f ms\n", theta, eb,
+                     double(tb.times.interactions) / 20000, tb.times.walk_ms);
+        for (Backend* gb : {g64.get(), g32.get()}) {
+            Got tg = accel(*gb, b, p, true);
+            const double eg = rel_rms(tg.a, d.a), egb = rel_rms(tg.a, tb.a);
+            std::fprintf(stderr, "  theta %.1f %s: err %.3g, vs body %.3g, %.1f int/body, walk %.3f ms\n", theta,
+                         gb->name().c_str(), eg, egb, double(tg.times.interactions) / 20000, tg.times.walk_ms);
+            CHECK(all_finite(tg.a));
+            // The box test opens every node some body of the group would open: per body, at least
+            // the per-body walk's interactions, and no larger error (2% slack for rounding).
+            CHECK(tg.times.interactions >= tb.times.interactions);
+            CHECK(eg <= 1.02 * eb + 1e-6);
+            CHECK(egb <= eg + eb + 1e-6);
+            CHECK_NEAR(tg.diag.pe / d.diag.pe, 1.0, std::max(1e-3, std::fabs(tb.diag.pe / d.diag.pe - 1) * 1.02 + 1e-6));
+            std::vector<float> cost;
+            CHECK(gb->body_costs(cost));
+            double sum = 0;
+            for (float c : cost) sum += c;
+            CHECK(cost.size() == b.size());
+            CHECK(sum == double(tg.times.interactions));
+        }
+    }
+}
+
+TEST("cuda: group walk at theta 0 is exact, with groups split by duplicate keys") {
+    CUDA_BACKEND(be);
+    std::string w;
+    auto g32 = cuda_with("group", "32", w);
+    CHECK(g32 != nullptr);
+    if (!g32) return;
+    Bodies b = cube(3000, 9);
+    for (std::size_t i = 0; i < 200; ++i) { b.x[i] = 0.25f; b.y[i] = -0.5f; b.z[i] = 0.125f; }
+    const double eps = 0.05;
+    Ref ref = brute(b, 1, eps);
+    for (Backend* gb : {be.get(), g32.get()}) {
+        Got g = accel(*gb, b, params(ForceMethod::tree, eps, 0.0), true);
+        const double e = rel_rms(g.a, ref.a);
+        std::fprintf(stderr, "  %s: rel rms %.3g\n", gb->name().c_str(), e);
+        CHECK(all_finite(g.a));
+        CHECK(e <= 1e-5);
+        CHECK(g.times.interactions == 3000ull * 2999ull);
+        CHECK_NEAR(g.diag.pe / ref.pe, 1.0, 1e-5);
+    }
 }

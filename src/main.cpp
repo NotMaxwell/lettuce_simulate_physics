@@ -6,6 +6,7 @@
 #include <string>
 
 #include "config.hpp"
+#include "parallel.hpp"
 #include "scenarios.hpp"
 #include "simulation.hpp"
 
@@ -23,12 +24,16 @@ constexpr const char* usage =
     "  lettuce configs/plummer.ini restart=out/snap_00001000.snap steps=1000\n"
     "  lettuce configs/collision.ini steps=0 live=8080      watch in a browser at http://localhost:8080/\n"
     "\n"
+    "  mpirun -n 4 lettuce configs/plummer.ini n=1e7 method=tree   one GPU per rank\n"
+    "\n"
     "Every key a config file accepts can be given on the command line; later ones win.\n"
     "See configs/README.md for the keys and each scenario's parameters.\n";
 
 }  // namespace
 
 int main(int argc, char** argv) {
+    par::init(&argc, &argv);
+    const bool root = par::root();
     try {
         Config cfg;
         bool print_only = false;
@@ -36,11 +41,14 @@ int main(int argc, char** argv) {
         for (int i = 1; i < argc; ++i) {
             const char* a = argv[i];
             if (!std::strcmp(a, "-h") || !std::strcmp(a, "--help")) {
-                std::fputs(usage, stdout);
+                if (root) std::fputs(usage, stdout);
+                par::finalize();
                 return 0;
             }
             if (!std::strcmp(a, "--list")) {
-                for (auto& s : scenarios()) std::printf("  %-12s %s\n", s.name, s.summary);
+                if (root)
+                    for (auto& s : scenarios()) std::printf("  %-12s %s\n", s.name, s.summary);
+                par::finalize();
                 return 0;
             }
             if (!std::strcmp(a, "--print")) {
@@ -51,19 +59,24 @@ int main(int argc, char** argv) {
                 cfg = load_config(a);
                 have_file = true;
             } else {
-                std::fprintf(stderr, "lettuce: unexpected argument '%s' (overrides are key=value)\n%s", a, usage);
+                if (root) std::fprintf(stderr, "lettuce: unexpected argument '%s' (overrides are key=value)\n%s", a, usage);
+                par::finalize();
                 return 2;
             }
         }
         validate(cfg);
         if (print_only) {
-            std::fputs(dump_config(cfg).c_str(), stdout);
+            if (root) std::fputs(dump_config(cfg).c_str(), stdout);
+            par::finalize();
             return 0;
         }
         run_simulation(cfg, stdout);
+        par::finalize();
         return 0;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "lettuce: %s\n", e.what());
-        return 1;
+        std::fprintf(stderr, "lettuce: %s%s\n", par::size() > 1 ? ("rank " + std::to_string(par::rank()) + ": ").c_str() : "",
+                     e.what());
+        // Other ranks may be blocked in a collective waiting for this one.
+        par::abort(1);
     }
 }

@@ -132,6 +132,7 @@ void set_key(Config& c, const std::string& key, const std::string& v) {
     else if (key == "backend") c.backend = parse_backend(v);
     else if (key == "device") c.device = parse_int(key, v);
     else if (key == "threads") c.threads = parse_int(key, v);
+    else if (key == "rebalance_every") c.rebalance_every = parse_uint(key, v);
     else if (key == "diag_every") c.diag_every = parse_uint(key, v);
     else if (key == "exact_pe") c.exact_pe = parse_bool(key, v);
     else if (key == "out_dir") c.out_dir = v;
@@ -201,6 +202,7 @@ void validate(const Config& c) {
     if (c.render_height < 16 || c.render_height > 16384) fail("render_height must be in 16..16384");
     if (!(c.render_extent >= 0)) fail("render_extent must be >= 0");
     if (c.threads < 0) fail("threads must be >= 0");
+    if (c.rebalance_every < 1) fail("rebalance_every must be >= 1");
     if (c.live < 0 || c.live > 65535) fail("live must be a TCP port 1..65535, or 0 for off");
     if (c.live_width < 64 || c.live_width > 4096) fail("live_width must be in 64..4096");
     if (c.live_height < 64 || c.live_height > 4096) fail("live_height must be in 64..4096");
@@ -225,6 +227,7 @@ std::string dump_config(const Config& c) {
     kv("backend", to_string(c.backend));
     kv("device", std::to_string(c.device));
     kv("threads", std::to_string(c.threads));
+    kv("rebalance_every", std::to_string(c.rebalance_every));
     kv("diag_every", std::to_string(c.diag_every));
     kv("exact_pe", b(c.exact_pe));
     kv("out_dir", c.out_dir);

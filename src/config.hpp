@@ -30,6 +30,8 @@ struct Config {
     BackendKind backend = BackendKind::auto_;
     int device = 0;           // CUDA device ordinal
     int threads = 0;          // CPU backend threads, 0 = all hardware threads
+    // Multi-rank (MPI) runs: force calls between re-splitting the bodies across ranks by cost.
+    uint64_t rebalance_every = 10;
 
     uint64_t diag_every = 100;  // 0 = only at start and end
     // Exact O(N^2) potential energy for diagnostics; off by default above auto_direct_max,

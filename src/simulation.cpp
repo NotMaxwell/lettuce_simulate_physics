@@ -1,12 +1,15 @@
 #include "simulation.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <regex>
 #include <stdexcept>
 
 #include "live.hpp"
+#include "parallel.hpp"
 #include "render.hpp"
 #include "scenarios.hpp"
 #include "snapshot.hpp"
@@ -15,8 +18,17 @@ namespace fs = std::filesystem;
 
 std::unique_ptr<Backend> select_backend(const Config& cfg, std::string& note) {
     if (cfg.backend != BackendKind::cpu) {
+        // One GPU per rank. Under Slurm with --gpus-per-task each rank sees exactly one device
+        // (CUDA_VISIBLE_DEVICES), so device 0; otherwise ranks on a node take consecutive devices.
+        int device = cfg.device;
+        int count = cuda_device_count();
+        if (par::size() > 1 && count > 1) {
+            device = (cfg.device + par::local_rank()) % count;
+            if (par::local_size() > count && par::local_rank() == 0)
+                std::fprintf(stderr, "lettuce: warning: %d ranks on this node share %d GPUs\n", par::local_size(), count);
+        }
         std::string why;
-        auto be = make_cuda_backend(cfg.device, why);
+        auto be = make_cuda_backend(device, why);
         if (be) {
             note = "backend " + be->name();
             return be;
@@ -40,10 +52,48 @@ ForceMethod resolve_method(const Config& cfg, uint64_t n) {
 
 namespace {
 
-std::string numbered(const std::string& dir, const char* stem, uint64_t step, const char* ext) {
-    char name[64];
-    std::snprintf(name, sizeof name, "%s_%08llu.%s", stem, static_cast<unsigned long long>(step), ext);
+std::string numbered(const std::string& dir, const char* stem, uint64_t step, const char* ext, int piece = -1) {
+    char name[80];
+    if (piece < 0)
+        std::snprintf(name, sizeof name, "%s_%08llu.%s", stem, static_cast<unsigned long long>(step), ext);
+    else
+        std::snprintf(name, sizeof name, "%s_%08llu_r%d.%s", stem, static_cast<unsigned long long>(step), piece, ext);
     return (fs::path(dir) / name).string();
+}
+
+// A multi-rank run writes one snapshot piece per rank (snap_<step>_r<k>.snap). Naming any piece
+// restarts from all of them, with any number of ranks.
+std::vector<std::string> restart_pieces(const std::string& path) {
+    static const std::regex piece(R"((.*)_r(\d+)\.snap)");
+    std::smatch m;
+    if (!std::regex_match(path, m, piece)) return {path};
+    const std::string prefix = fs::path(m[1].str()).filename().string();
+    fs::path dir = fs::path(path).parent_path();
+    std::vector<std::pair<int, std::string>> found;
+    for (auto& e : fs::directory_iterator(dir.empty() ? fs::path(".") : dir)) {
+        std::string fname = e.path().filename().string();
+        std::smatch q;
+        if (std::regex_match(fname, q, piece) && q[1].str() == prefix)
+            found.emplace_back(std::stoi(q[2].str()), (dir / fname).string());
+    }
+    std::sort(found.begin(), found.end());
+    std::vector<std::string> out;
+    for (size_t k = 0; k < found.size(); ++k) {
+        if (found[k].first != int(k)) throw std::runtime_error("restart: snapshot piece _r" + std::to_string(k) + " is missing");
+        out.push_back(found[k].second);
+    }
+    return out;
+}
+
+// Appends the bodies with global index in [first, last) from `src`, whose first body has global index `base`.
+void keep_range(const Bodies& src, uint64_t base, uint64_t first, uint64_t last, Bodies& dst) {
+    uint64_t lo = std::max(first, base), hi = std::min(last, base + src.size());
+    for (uint64_t g = lo; g < hi; ++g) {
+        size_t i = size_t(g - base);
+        dst.x.push_back(src.x[i]); dst.y.push_back(src.y[i]); dst.z.push_back(src.z[i]);
+        dst.vx.push_back(src.vx[i]); dst.vy.push_back(src.vy[i]); dst.vz.push_back(src.vz[i]);
+        dst.m.push_back(src.m[i]); dst.id.push_back(src.id[i]);
+    }
 }
 
 double norm3(double a, double b, double c) { return std::sqrt(a * a + b * b + c * c); }
@@ -53,44 +103,91 @@ struct DiagRow {
     double time, e, ke, pe, virial, p, l;
 };
 
+// Frames and the live view render on rank 0 from a gathered subsample of at most this many bodies.
+constexpr uint64_t frame_sample_max = 16'000'000;
+
 }  // namespace
 
-RunSummary run_simulation(const Config& cfg, std::FILE* log) {
+RunSummary run_simulation(const Config& cfg, std::FILE* log_in) {
     validate(cfg);
+    const bool root = par::root();
+    const int nranks = par::size();
+    std::FILE* devnull = root ? nullptr : std::fopen("/dev/null", "w");
+    std::FILE* log = root ? log_in : devnull;
 
+    // Every rank ends up with an even share of the bodies; the first tree force call rebalances.
     Bodies bodies;
     uint64_t step0 = 0;
     double time = 0;
     if (!cfg.restart.empty()) {
-        SnapshotHeader h = read_snapshot(cfg.restart, bodies);
+        auto pieces = restart_pieces(cfg.restart);
+        // Pass 1: counts and the header; pass 2: keep this rank's range. One piece in memory at a time.
+        std::vector<uint64_t> counts;
+        SnapshotHeader h;
+        for (auto& p : pieces) {
+            Bodies tmp;
+            h = read_snapshot(p, tmp);
+            counts.push_back(tmp.size());
+        }
+        uint64_t total = 0;
+        for (auto c : counts) total += c;
+        uint64_t first, last;
+        par::even_share(total, first, last);
+        uint64_t base = 0;
+        for (size_t k = 0; k < pieces.size(); ++k) {
+            if (base < last && base + counts[k] > first) {
+                Bodies tmp;
+                read_snapshot(pieces[k], tmp);
+                keep_range(tmp, base, first, last, bodies);
+            }
+            base += counts[k];
+        }
         step0 = h.step;
         time = h.time;
-        std::fprintf(log, "# restart from %s: %s, n=%llu, step %llu, t=%.6g\n", cfg.restart.c_str(), h.scenario.c_str(),
-                     static_cast<unsigned long long>(h.n), static_cast<unsigned long long>(h.step), h.time);
+        std::fprintf(log, "# restart from %s (%zu piece%s): %s, n=%llu, step %llu, t=%.6g\n", cfg.restart.c_str(),
+                     pieces.size(), pieces.size() == 1 ? "" : "s", h.scenario.c_str(),
+                     static_cast<unsigned long long>(total), static_cast<unsigned long long>(h.step), h.time);
         if (h.G != cfg.G || h.eps != cfg.eps || h.dt != cfg.dt)
             std::fprintf(log, "# note: snapshot had G=%g eps=%g dt=%g; using the config's G=%g eps=%g dt=%g\n", h.G, h.eps,
                          h.dt, cfg.G, cfg.eps, cfg.dt);
     } else {
-        bodies = build_scenario(cfg);
+        // Deterministic from the seed, so every rank builds the same set and keeps its share.
+        // Costs N bodies of host memory per rank at start-up (distributed generation would fix that).
+        Bodies all = build_scenario(cfg);
         auto unused = cfg.unused_params();
         if (!unused.empty()) {
             std::string msg = "unknown parameter(s) for scenario '" + cfg.scenario + "':";
             for (auto& k : unused) msg += " " + k;
             throw std::runtime_error(msg);
         }
+        if (nranks == 1) {
+            bodies = std::move(all);
+        } else {
+            uint64_t first, last;
+            par::even_share(all.size(), first, last);
+            keep_range(all, 0, first, last, bodies);
+        }
     }
-    const uint64_t n = bodies.size();
+    const uint64_t n = par::sum(uint64_t(bodies.size()));
+    if (n < uint64_t(nranks)) throw std::runtime_error("fewer bodies than MPI ranks");
 
-    fs::create_directories(cfg.out_dir);
-    {
+    std::FILE* csv = nullptr;
+    if (root) {
+        fs::create_directories(cfg.out_dir);
         std::ofstream(fs::path(cfg.out_dir) / "config.ini") << dump_config(cfg);
+        csv = std::fopen((fs::path(cfg.out_dir) / "diag.csv").string().c_str(), step0 ? "a" : "w");
+        if (!csv) throw std::runtime_error("cannot write " + (fs::path(cfg.out_dir) / "diag.csv").string());
+        if (!step0)
+            std::fprintf(csv, "step,time,energy,kinetic,potential,virial,momentum,angular_momentum,ms_per_step,interactions\n");
     }
-    std::FILE* csv = std::fopen((fs::path(cfg.out_dir) / "diag.csv").string().c_str(), step0 ? "a" : "w");
-    if (!csv) throw std::runtime_error("cannot write " + (fs::path(cfg.out_dir) / "diag.csv").string());
-    if (!step0) std::fprintf(csv, "step,time,energy,kinetic,potential,virial,momentum,angular_momentum,ms_per_step,interactions\n");
+    par::barrier();  // out_dir exists before any rank writes into it
 
     std::string note;
-    auto be = select_backend(cfg, note);
+    auto local = select_backend(cfg, note);
+    par::DistOptions dopt;
+    dopt.rebalance_every = cfg.rebalance_every;
+    auto be = par::make_distributed(std::move(local), dopt);
+    if (nranks > 1) note = std::to_string(nranks) + " MPI ranks; rank 0 " + note;
     ForceParams fp;
     fp.G = cfg.G;
     fp.eps = cfg.eps;
@@ -118,9 +215,11 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log) {
     uint64_t interval_steps = 0;
     double diag_virial = 0;
 
+    // Collective: every rank calls it at the same steps.
     auto diagnose = [&](uint64_t step, bool have_tree_pe) {
         Diag d = be->diagnostics();
         double pe = exact_pe ? be->exact_potential_energy(cfg.G, cfg.eps) : (have_tree_pe && d.has_pe ? d.pe : NAN);
+        uint64_t inter = be->times().interactions;
         DiagRow r{step, time, d.ke + pe, d.ke, pe, 2 * d.ke / std::fabs(pe), norm3(d.px, d.py, d.pz),
                   norm3(d.lx, d.ly, d.lz)};
         if (!have_ref) {
@@ -128,30 +227,33 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log) {
             l0 = r.l;
             have_ref = true;
         }
-        double ms = interval_steps ? 1e3 * interval_s / double(interval_steps) : 0;
+        // The slowest rank sets the pace.
+        double ms = par::max(interval_steps ? 1e3 * interval_s / double(interval_steps) : 0);
         double de = e0 != 0 ? (r.e - e0) / std::fabs(e0) : 0;
         double dl = l0 > 0 ? (r.l - l0) / l0 : 0;
         std::fprintf(log, "%10llu %12.6g %14.8g %11.3e %12.6g %12.6g %8.4f %11.3e %11.3e %10.3f\n",
                      static_cast<unsigned long long>(step), time, r.e, de, r.ke, r.pe, r.virial, r.p, dl, ms);
         std::fflush(log);
-        std::fprintf(csv, "%llu,%.17g,%.17g,%.17g,%.17g,%.9g,%.9g,%.9g,%.6g,%llu\n", static_cast<unsigned long long>(step),
-                     time, r.e, r.ke, r.pe, r.virial, r.p, r.l, ms,
-                     static_cast<unsigned long long>(be->times().interactions));
-        std::fflush(csv);
+        if (csv) {
+            std::fprintf(csv, "%llu,%.17g,%.17g,%.17g,%.17g,%.9g,%.9g,%.9g,%.6g,%llu\n",
+                         static_cast<unsigned long long>(step), time, r.e, r.ke, r.pe, r.virial, r.p, r.l, ms,
+                         static_cast<unsigned long long>(inter));
+            std::fflush(csv);
+        }
         sum.e1 = r.e;
         diag_virial = r.virial;
         interval_s = 0;
         interval_steps = 0;
     };
 
+    // Collective.
     auto write_outputs = [&](uint64_t step, bool final_step) {
         bool snap = (cfg.snap_every && step % cfg.snap_every == 0) || (final_step && cfg.snap_final);
         bool frame = cfg.render_every && step % cfg.render_every == 0;
-        if (!snap && !frame) return;
-        be->download(bodies);
         if (snap) {
+            be->download(bodies);
             SnapshotHeader h;
-            h.n = n;
+            h.n = bodies.size();
             h.step = step;
             h.time = time;
             h.G = cfg.G;
@@ -159,15 +261,19 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log) {
             h.dt = cfg.dt;
             h.seed = cfg.seed;
             h.scenario = cfg.scenario;
-            write_snapshot(numbered(cfg.out_dir, "snap", step, "snap"), h, bodies);
+            write_snapshot(numbered(cfg.out_dir, "snap", step, "snap", nranks > 1 ? par::rank() : -1), h, bodies);
         }
         if (frame) {
-            RenderOptions ro;
-            ro.width = cfg.render_width;
-            ro.height = cfg.render_height;
-            ro.view = cfg.view;
-            ro.extent = cfg.render_extent;
-            render_png(bodies, ro, numbered(cfg.out_dir, "frame", step, "png"));
+            Bodies sample;
+            par::gather_sample(*be, sample, frame_sample_max);
+            if (root) {
+                RenderOptions ro;
+                ro.width = cfg.render_width;
+                ro.height = cfg.render_height;
+                ro.view = cfg.view;
+                ro.extent = cfg.render_extent;
+                render_png(sample, ro, numbered(cfg.out_dir, "frame", step, "png"));
+            }
         }
     };
 
@@ -178,10 +284,11 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log) {
         return step == last || (cfg.diag_every && step % cfg.diag_every == 0);
     };
 
+    // The live view runs on rank 0; its decisions (run/stop, frame due) are broadcast each step.
     std::unique_ptr<LiveView> live;
     Bodies live_buf;
     LiveStats ls;
-    if (cfg.live) {
+    if (cfg.live && root) {
         LiveOptions lo;
         lo.port = cfg.live;
         lo.bind = cfg.live_bind;
@@ -201,21 +308,25 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log) {
         ls.n = n;
         ls.last_step = unbounded ? 0 : last;
     }
-    // Last diagnostic, for the live view's status line.
     double last_de = 0, last_virial = 0, last_ms = 0;
     uint64_t last_diag_step = step0;
+    // Collective when cfg.live is set.
     auto publish = [&](uint64_t step, bool force_frame) {
-        if (!live) return;
-        ls.step = step;
-        ls.time = time;
-        ls.diag_step = last_diag_step;
-        ls.de = last_de;
-        ls.virial = last_virial;
-        ls.ms_per_step = last_ms;
-        live->set_stats(ls);
-        if (force_frame || live->frame_due()) {
-            be->download(live_buf);
-            live->submit(live_buf);
+        if (!cfg.live) return;
+        int want = 0;
+        if (live) {
+            ls.step = step;
+            ls.time = time;
+            ls.diag_step = last_diag_step;
+            ls.de = last_de;
+            ls.virial = last_virial;
+            ls.ms_per_step = last_ms;
+            live->set_stats(ls);
+            want = force_frame || live->frame_due();
+        }
+        if (par::broadcast(want)) {
+            par::gather_sample(*be, live_buf, frame_sample_max);
+            if (live) live->submit(live_buf);
         }
     };
 
@@ -229,9 +340,12 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log) {
     uint64_t done = 0;
     bool stopped = false;
     for (uint64_t step = step0 + 1; step <= last; ++step) {
-        if (live && !live->gate()) {
-            stopped = true;
-            break;
+        if (cfg.live) {
+            int go = live ? int(live->gate()) : 0;
+            if (!par::broadcast(go)) {
+                stopped = true;
+                break;
+            }
         }
         bool due = diag_due(step);
         auto t0 = std::chrono::steady_clock::now();
@@ -248,7 +362,7 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log) {
         ++interval_steps;
         ++done;
         time += cfg.dt;
-        if (live) last_ms = 0.9 * last_ms + 0.1 * 1e3 * s;
+        last_ms = 0.9 * last_ms + 0.1 * 1e3 * s;
         if (due) {
             diagnose(step, true);
             last_de = e0 != 0 ? (sum.e1 - e0) / std::fabs(e0) : 0;
@@ -266,19 +380,23 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log) {
             if (!exact_pe) be->compute_forces(fp, true);
             diagnose(step0 + done, true);
         }
-    } else if (live && cfg.live_hold) {
+    } else if (cfg.live && cfg.live_hold) {
         publish(step0 + done, true);
-        std::fprintf(log, "# run finished; still serving %s (press Stop in the browser or Ctrl-C to exit)\n",
-                     live->url().c_str());
-        std::fflush(log);
-        live->hold();
+        if (live) {
+            std::fprintf(log, "# run finished; still serving %s (press Stop in the browser or Ctrl-C to exit)\n",
+                         live->url().c_str());
+            std::fflush(log);
+            live->hold();
+        }
+        par::barrier();
     }
-    std::fclose(csv);
+    if (csv) std::fclose(csv);
     sum.steps = done;
-    sum.wall_s = integrate_s;
-    sum.ms_per_step = done ? 1e3 * integrate_s / double(done) : 0;
+    sum.wall_s = par::max(integrate_s);
+    sum.ms_per_step = done ? 1e3 * sum.wall_s / double(done) : 0;
     std::fprintf(log, "# done: %llu steps in %.3f s (%.3f ms/step), dE/E0 = %.3e\n",
                  static_cast<unsigned long long>(sum.steps), sum.wall_s, sum.ms_per_step,
                  e0 != 0 ? (sum.e1 - sum.e0) / std::fabs(sum.e0) : 0.0);
+    if (devnull) std::fclose(devnull);
     return sum;
 }

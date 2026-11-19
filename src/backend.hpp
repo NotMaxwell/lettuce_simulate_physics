@@ -37,6 +37,8 @@ struct PhaseTimes {
     double walk_ms = 0;      // tree: traversal; direct: the pair loop
     double step_ms = 0;      // last kick + drift
     uint64_t interactions = 0;  // body-body plus body-node evaluations in the last force call (0 if not counted)
+    double comm_ms = 0;         // multi-rank only: LET export + exchange (host-staged)
+    double balance_ms = 0;      // multi-rank only: domain rebalance in this call (0 when none)
 };
 
 // --- Distributed (multi-GPU) support -----------------------------------------------------------
@@ -64,7 +66,7 @@ struct LetNode {
     int32_t body_first;   // index of the first body in LetTree::b*, bodies contiguous; -1 if none
     int32_t body_count;
 };
-static_assert(sizeof(LetNode) == 64, "LetNode is sent over MPI as raw bytes");
+static_assert(sizeof(LetNode) == 60, "LetNode is sent over MPI as raw bytes");
 
 // Receiver walk, per target x, starting at nodes[0]:
 //   if (first_child < 0 && body_count == 0) or |x - com|^2 >= rcrit2: add the node's multipole
@@ -126,3 +128,5 @@ std::unique_ptr<Backend> make_cpu_backend(int threads);
 // Returns nullptr and sets `why` when CUDA support was not compiled in or no usable device exists.
 std::unique_ptr<Backend> make_cuda_backend(int device, std::string& why);
 bool cuda_compiled();
+// CUDA devices visible to this process (0 without CUDA support or a driver).
+int cuda_device_count();
