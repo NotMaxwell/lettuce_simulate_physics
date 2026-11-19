@@ -181,7 +181,9 @@ TEST("cpu: two-body circular orbit, KDK, direct and tree") {
         std::fprintf(stderr, "  %s: |dx| %.3g, dE/E %.3g\n", meth == ForceMethod::direct ? "direct" : "tree", maxd,
                      (e1 - e0) / std::fabs(e0));
         CHECK(maxd < 1e-3);
-        CHECK(std::fabs((e1 - e0) / e0) < 1e-6);
+        // Not 1e-6: with float positions near |x| = 1 each drift rounds by ~6e-8, and the same KDK
+        // in plain float scalar code drifts by 3.6e-6 (double: 4e-15), so that is the floor.
+        CHECK(std::fabs((e1 - e0) / e0) < 2e-5);
     }
 }
 

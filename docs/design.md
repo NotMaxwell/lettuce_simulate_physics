@@ -29,8 +29,10 @@ per-body time steps yet.
      backend's arrays are permuted and `Bodies::id` carries identity.
   3. Tree over the sorted keys, leaves of up to ~32 consecutive bodies.
   4. Monopole plus traceless quadrupole moments, bottom-up.
-  5. Per-body walk (consecutive sorted bodies traverse near-identical paths, which keeps GPU
-     warps coherent). A node is opened if `d < l/θ + |com − centre|` (l = node side), the
+  5. Walk. CUDA: one thread per body in sorted order (neighbouring threads traverse
+     near-identical paths, which keeps warps coherent). CPU: one interaction list per group of
+     ≤128 sorted bodies, opening a node if it is too close to the group's bounding box (2.4x
+     faster than per-body lists on the CPU). A node is opened if `d < l/θ + |com − centre|` (l = node side), the
      offset term guarding against lopsided cells. θ = 0.6 gives ~1e-3 rms relative force
      error at quadrupole order (the measured prototype numbers are in the `gpu-physics` branch).
 
@@ -48,7 +50,8 @@ except a few reduction results on diagnostic steps.
 Precision: positions, velocities and accelerations are `float` (fast on every GPU, and
 H100 FP32 throughput is 2x FP64). Reductions for diagnostics use `double`. `float` positions limit
 dynamic range to ~1e-7 of the system size. Fine for clusters and galaxies; the Solar System scenario
-loses ~1 km resolution at 30 AU, and long integrations there will show it.
+resolves positions to ~300 km at Neptune (30 AU), and long integrations there will show it. `float` also sets an energy-error floor of a few 1e-6
+per orbit (the Kepler test measures 5e-6; the same orbit in double drifts 4e-15).
 
 ## Toolchain
 Clang/LLVM is the primary toolchain: clang++ compiles both host code (C++23, libc++, libomp, lld)

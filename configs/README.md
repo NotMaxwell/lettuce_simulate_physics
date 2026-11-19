@@ -12,6 +12,9 @@ Each file is a ready-to-run scenario: `build/lettuce configs/disk.ini`.
 | solar.ini | solar | 2009 | real Solar System plus asteroid belt (AU, yr, Msun) |
 | systems.ini | systems | 10000 | Plummer cluster of stars with planetary systems |
 
+On a 4-core CPU the defaults take 1 s (kepler) to 2 min (cold_collapse); collision.ini (40k
+bodies, direct) is sized for a GPU and takes ~12 min on that CPU, so add `n=4000` there.
+
 ## Format
 
 `key = value` lines; `#` or `;` start a comment (whole line or trailing). `[section]` prefixes
@@ -26,4 +29,6 @@ Arguments after the file are `key=value` and win over the file, using the same k
 
     lettuce configs/disk.ini n=1000000 method=tree disk.thickness=0.1
 
-Scenario parameters that no scenario reads are reported as unused.
+A scenario parameter the chosen scenario does not read (e.g. a typo like `plummer.cutt`) stops
+the run with an error. The effective configuration is written to `<out_dir>/config.ini`, which
+reruns the same thing.

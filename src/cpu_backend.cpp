@@ -1,6 +1,9 @@
 // OpenMP CPU backend: blocked direct summation and a Barnes-Hut octree with quadrupoles.
 // It is also the reference the CUDA backend is validated against.
 #include <omp.h>
+#if defined(__AVX__)
+#include <immintrin.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -16,7 +19,10 @@ namespace {
 using clk = std::chrono::steady_clock;
 double ms_since(clk::time_point t0) { return std::chrono::duration<double, std::milli>(clk::now() - t0).count(); }
 
-constexpr int kLeafMax = 16;      // bodies per leaf bucket; also the walk group size
+constexpr int kLeafMax = 16;      // bodies per leaf bucket (multipole granularity)
+// Walk groups are the largest subtrees with at most this many bodies. Groups bigger than a leaf
+// amortise the list build over more bodies (measured at N=100k, theta 0.6: group 16 -> 128 cuts the walk 2.4x).
+constexpr int kGroupMax = 128;
 constexpr int kMaxLevel = 21;     // Morton bits per axis
 constexpr int kSmallLeaf = 4;     // accepted leaves this small are summed directly: exact and no dearer
 constexpr int kRadixBits = 11;
@@ -36,7 +42,7 @@ static_assert(sizeof(Node) == 64);
 
 struct Geo { float gx, gy, gz, half; };     // geometric cell centre and half side
 
-// A walk group is one leaf: its bodies share an interaction list, built against the group's
+// A walk group is a subtree of consecutive sorted bodies: its bodies share an interaction list, built against the group's
 // bounding box, so any node that some body of the group would open is opened for all of them.
 struct Group { float bx, by, bz, hx, hy, hz; uint32_t lo, hi; };
 
@@ -48,6 +54,51 @@ inline uint64_t spread21(uint64_t v) {
     v = (v | v << 4) & 0x10c30c30c30c30c3ULL;
     v = (v | v << 2) & 0x1249249249249249ULL;
     return v;
+}
+
+
+// 8-wide kernels in GCC/Clang vector extensions. The point is rsqrt + one Newton step instead of
+// sqrt + div (about 2x the pair rate on AVX2); relative error after the step is ~1e-7.
+typedef float v8f __attribute__((vector_size(32)));
+typedef int32_t v8i __attribute__((vector_size(32)));
+
+inline v8f load8(const float* p) { v8f v; std::memcpy(&v, p, sizeof v); return v; }
+inline v8i load8(const int32_t* p) { v8i v; std::memcpy(&v, p, sizeof v); return v; }
+inline float hsum(v8f v) { return ((v[0] + v[4]) + (v[1] + v[5])) + ((v[2] + v[6]) + (v[3] + v[7])); }
+
+// 1/sqrt(r2) where mask is set, exactly 0 elsewhere (also where r2 == 0, which gives inf/NaN
+// before masking).
+inline v8f rsqrt_masked(v8f r2, v8i mask) {
+#if defined(__AVX__)
+    v8f y = (v8f)_mm256_rsqrt_ps((__m256)r2);
+    y = y * (1.5f - 0.5f * r2 * y * y);
+#else
+    v8f y;
+    for (int l = 0; l < 8; ++l) y[l] = 1.f / std::sqrt(r2[l]);
+#endif
+    return (v8f)((v8i)y & mask);
+}
+
+// Body-body: sums m_j d / r^3 and m_j / r over j in [0, n), skipping j whose index equals self.
+// Index of entry k is idx[k] if idx, else base + k. n must be a multiple of 8.
+template <bool POT>
+inline void p2p8(const float* bx, const float* by, const float* bz, const float* bm, const int32_t* idx, int32_t base,
+                 long n, float xi, float yi, float zi, int32_t self, float e2, float& oax, float& oay, float& oaz,
+                 float& op) {
+    v8f ax = {}, ay = {}, az = {}, p = {};
+    const v8i lane = {0, 1, 2, 3, 4, 5, 6, 7};
+    for (long k = 0; k < n; k += 8) {
+        v8f dx = load8(bx + k) - xi, dy = load8(by + k) - yi, dz = load8(bz + k) - zi;
+        v8f r2 = dx * dx + dy * dy + dz * dz + e2;
+        v8i j = idx ? load8(idx + k) : lane + int32_t(base + k);
+        v8f inv = rsqrt_masked(r2, (v8i)(r2 > 0.f) & (j != self));
+        v8f mi = load8(bm + k) * inv;
+        v8f f = mi * inv * inv;
+        ax += f * dx; ay += f * dy; az += f * dz;
+        if constexpr (POT) p += mi;
+    }
+    oax += hsum(ax); oay += hsum(ay); oaz += hsum(az);
+    if constexpr (POT) op += hsum(p);
 }
 
 template <class T>
@@ -211,8 +262,10 @@ private:
                     const float xi = X[i], yi = Y[i], zi = Z[i];
                     const int32_t ii = int32_t(i);
                     float ax = 0, ay = 0, az = 0, p = 0;
-#pragma omp simd reduction(+ : ax, ay, az, p)
-                    for (std::size_t j = j0; j < j1; ++j) {
+                    const std::size_t jv = j0 + ((j1 - j0) & ~std::size_t(7));
+                    p2p8<POT>(X + j0, Y + j0, Z + j0, M + j0, nullptr, int32_t(j0), long(jv - j0), xi, yi, zi, ii, e2,
+                              ax, ay, az, p);
+                    for (std::size_t j = jv; j < j1; ++j) {
                         float dx = X[j] - xi, dy = Y[j] - yi, dz = Z[j] - zi;
                         float r2 = dx * dx + dy * dy + dz * dz + e2;
                         // Excluding by index keeps phi correct for distinct coincident bodies
@@ -239,7 +292,7 @@ private:
         const std::size_t n = n_;
         const long ln = long(n);
         float mnx = x_[0], mny = y_[0], mnz = z_[0], mxx = mnx, mxy = mny, mxz = mnz;
-#pragma omp parallel for simd num_threads(nt_) reduction(min : mnx, mny, mnz) reduction(max : mxx, mxy, mxz)
+#pragma omp parallel for num_threads(nt_) reduction(min : mnx, mny, mnz) reduction(max : mxx, mxy, mxz)
         for (long i = 0; i < ln; ++i) {
             mnx = std::min(mnx, x_[i]); mny = std::min(mny, y_[i]); mnz = std::min(mnz, z_[i]);
             mxx = std::max(mxx, x_[i]); mxy = std::max(mxy, y_[i]); mxz = std::max(mxz, z_[i]);
@@ -319,14 +372,18 @@ private:
     }
 
     // ---- build -----------------------------------------------------------------------------
-    void build_node(uint32_t ni, int level, double gx, double gy, double gz, double half) {
+    void build_node(uint32_t ni, int level, double gx, double gy, double gz, double half, bool in_group) {
         const uint32_t lo = nodes_[ni].lo, hi = nodes_[ni].hi;
         geo_[ni] = {float(gx), float(gy), float(gz), float(half)};
-        if (hi - lo <= uint32_t(kLeafMax) || level == kMaxLevel) {
+        const bool leaf = hi - lo <= uint32_t(kLeafMax) || level == kMaxLevel;
+        if (!in_group && (hi - lo <= uint32_t(kGroupMax) || leaf)) {
+            groups_.push_back({0, 0, 0, 0, 0, 0, lo, hi});
+            in_group = true;
+        }
+        if (leaf) {
             nodes_[ni].first = lo;
             nodes_[ni].nchild = 0;
-            groups_.push_back({0, 0, 0, 0, 0, 0, lo, hi});
-            leaf_of_group_.push_back(ni);
+            leaves_.push_back(ni);
             return;
         }
         const int shift = 3 * (kMaxLevel - 1 - level);
@@ -353,18 +410,19 @@ private:
         uint32_t c = first;
         for (int o = 0; o < 8; ++o) {
             if (bound[o + 1] == bound[o]) continue;
-            build_node(c++, level + 1, gx + ((o & 4) ? q : -q), gy + ((o & 2) ? q : -q), gz + ((o & 1) ? q : -q), q);
+            build_node(c++, level + 1, gx + ((o & 4) ? q : -q), gy + ((o & 2) ? q : -q), gz + ((o & 1) ? q : -q), q,
+                       in_group);
         }
     }
 
     void build_tree(double theta) {
-        nodes_.clear(); geo_.clear(); groups_.clear(); leaf_of_group_.clear();
+        nodes_.clear(); geo_.clear(); groups_.clear(); leaves_.clear();
         Node root{};
         root.lo = 0; root.hi = uint32_t(n_);
         nodes_.push_back(root);
         geo_.resize(1);
         const double h = 0.5 * side_;
-        build_node(0, 0, ox_ + h, oy_ + h, oz_ + h, h);
+        build_node(0, 0, ox_ + h, oy_ + h, oz_ + h, h, false);
 
         const float inv_theta = theta > 0 ? float(1.0 / theta) : std::numeric_limits<float>::max();
         auto finish = [&](Node& nd, const Geo& g) {
@@ -373,26 +431,33 @@ private:
             nd.rcrit2 = float(std::min(r * r, double(std::numeric_limits<float>::max())));
         };
 
-        // Leaf moments (the O(N) part) in parallel, about each leaf's centre of mass in double.
         const long ng = long(groups_.size());
-#pragma omp parallel for num_threads(nt_) schedule(dynamic, 64)
+#pragma omp parallel for num_threads(nt_) schedule(dynamic, 16)
         for (long g = 0; g < ng; ++g) {
             Group& gr = groups_[g];
-            Node& nd = nodes_[leaf_of_group_[g]];
-            double M = 0, sx = 0, sy = 0, sz = 0;
             float mnx = x_[gr.lo], mny = y_[gr.lo], mnz = z_[gr.lo], mxx = mnx, mxy = mny, mxz = mnz;
             for (uint32_t i = gr.lo; i < gr.hi; ++i) {
-                double m = m_[i];
-                M += m; sx += m * x_[i]; sy += m * y_[i]; sz += m * z_[i];
                 mnx = std::min(mnx, x_[i]); mny = std::min(mny, y_[i]); mnz = std::min(mnz, z_[i]);
                 mxx = std::max(mxx, x_[i]); mxy = std::max(mxy, y_[i]); mxz = std::max(mxz, z_[i]);
             }
             gr.bx = 0.5f * (mnx + mxx); gr.by = 0.5f * (mny + mxy); gr.bz = 0.5f * (mnz + mxz);
             gr.hx = 0.5f * (mxx - mnx); gr.hy = 0.5f * (mxy - mny); gr.hz = 0.5f * (mxz - mnz);
-            const Geo& ge = geo_[leaf_of_group_[g]];
+        }
+
+        // Leaf moments (the O(N) part) in parallel, about each leaf's centre of mass in double.
+        const long nl = long(leaves_.size());
+#pragma omp parallel for num_threads(nt_) schedule(dynamic, 64)
+        for (long l = 0; l < nl; ++l) {
+            Node& nd = nodes_[leaves_[l]];
+            double M = 0, sx = 0, sy = 0, sz = 0;
+            for (uint32_t i = nd.lo; i < nd.hi; ++i) {
+                double m = m_[i];
+                M += m; sx += m * x_[i]; sy += m * y_[i]; sz += m * z_[i];
+            }
+            const Geo& ge = geo_[leaves_[l]];
             double cx = M > 0 ? sx / M : ge.gx, cy = M > 0 ? sy / M : ge.gy, cz = M > 0 ? sz / M : ge.gz;
             double qxx = 0, qxy = 0, qxz = 0, qyy = 0, qyz = 0, qzz = 0;
-            for (uint32_t i = gr.lo; i < gr.hi; ++i) {
+            for (uint32_t i = nd.lo; i < nd.hi; ++i) {
                 double m = m_[i], dx = x_[i] - cx, dy = y_[i] - cy, dz = z_[i] - cz, r2 = dx * dx + dy * dy + dz * dz;
                 qxx += m * (3 * dx * dx - r2); qyy += m * (3 * dy * dy - r2); qzz += m * (3 * dz * dz - r2);
                 qxy += m * 3 * dx * dy; qxz += m * 3 * dx * dz; qyz += m * 3 * dy * dz;
@@ -442,11 +507,23 @@ private:
 #pragma omp for schedule(dynamic, 4)
             for (long g = 0; g < ng; ++g) {
                 build_list(groups_[g], s);
+                pad_lists(s);
                 eval_group<POT>(groups_[g], s, G, e2);
                 inter += uint64_t(s.nb + s.nn) * (groups_[g].hi - groups_[g].lo);
             }
         }
         return inter;
+    }
+
+    // Zero-mass padding to a multiple of 8 (index -1 never matches a body, Q = 0) lets the kernels
+    // run without tails; padding is not counted as interactions.
+    static void pad_lists(WalkScratch& s) {
+        const std::size_t nb8 = (s.nb + 7) & ~std::size_t(7), nn8 = (s.nn + 7) & ~std::size_t(7);
+        s.need_bodies(nb8);
+        s.need_nodes(nn8);
+        for (std::size_t k = s.nb; k < nb8; ++k) { s.bx[k] = s.by[k] = s.bz[k] = s.bm[k] = 0; s.bi[k] = -1; }
+        for (std::size_t k = s.nn; k < nn8; ++k)
+            for (auto* v : {&s.nx, &s.ny, &s.nz, &s.nm, &s.qxx, &s.qxy, &s.qxz, &s.qyy, &s.qyz, &s.qzz}) (*v)[k] = 0;
     }
 
     void push_bodies(WalkScratch& s, uint32_t lo, uint32_t hi) {
@@ -495,36 +572,32 @@ private:
         const float *nx = s.nx.data(), *ny = s.ny.data(), *nz = s.nz.data(), *nm = s.nm.data();
         const float *Qxx = s.qxx.data(), *Qxy = s.qxy.data(), *Qxz = s.qxz.data();
         const float *Qyy = s.qyy.data(), *Qyz = s.qyz.data(), *Qzz = s.qzz.data();
-        const long nb = long(s.nb), nn = long(s.nn);
+        const long nb = long((s.nb + 7) & ~std::size_t(7)), nn = long((s.nn + 7) & ~std::size_t(7));
         for (uint32_t i = gr.lo; i < gr.hi; ++i) {
             const float xi = x_[i], yi = y_[i], zi = z_[i];
             const int32_t ii = int32_t(i);
             float ax = 0, ay = 0, az = 0, p = 0;
-#pragma omp simd reduction(+ : ax, ay, az, p)
-            for (long k = 0; k < nb; ++k) {
-                float dx = bx[k] - xi, dy = by[k] - yi, dz = bz[k] - zi;
-                float r2 = dx * dx + dy * dy + dz * dz + e2;
-                float inv = (r2 > 0.f && bi[k] != ii) ? 1.f / std::sqrt(r2) : 0.f;
-                float mi = bm[k] * inv;
-                float f = mi * inv * inv;
-                ax += f * dx; ay += f * dy; az += f * dz;
-                if constexpr (POT) p += mi;
-            }
-#pragma omp simd reduction(+ : ax, ay, az, p)
-            for (long k = 0; k < nn; ++k) {
-                float dx = nx[k] - xi, dy = ny[k] - yi, dz = nz[k] - zi;
-                float r2 = dx * dx + dy * dy + dz * dz + e2;
-                float inv = r2 > 0.f ? 1.f / std::sqrt(r2) : 0.f;
-                float inv2 = inv * inv, inv3 = inv * inv2, inv5 = inv3 * inv2;
+            p2p8<POT>(bx, by, bz, bm, bi, 0, nb, xi, yi, zi, ii, e2, ax, ay, az, p);
+            v8f vax = {}, vay = {}, vaz = {}, vp = {};
+            for (long k = 0; k < nn; k += 8) {
+                v8f dx = load8(nx + k) - xi, dy = load8(ny + k) - yi, dz = load8(nz + k) - zi;
+                v8f r2 = dx * dx + dy * dy + dz * dz + e2;
+                v8f inv = rsqrt_masked(r2, (v8i)(r2 > 0.f));
+                v8f inv2 = inv * inv, inv3 = inv * inv2, inv5 = inv3 * inv2;
+                v8f xx = load8(Qxx + k), xy = load8(Qxy + k), xz = load8(Qxz + k);
+                v8f yy = load8(Qyy + k), yz = load8(Qyz + k), zz = load8(Qzz + k);
                 // d points from the body to the node: a = G [M d/r^3 - Q d/r^5 + 5/2 (dQd) d/r^7]
-                float qx = Qxx[k] * dx + Qxy[k] * dy + Qxz[k] * dz;
-                float qy = Qxy[k] * dx + Qyy[k] * dy + Qyz[k] * dz;
-                float qz = Qxz[k] * dx + Qyz[k] * dy + Qzz[k] * dz;
-                float dqd = dx * qx + dy * qy + dz * qz;
-                float f = nm[k] * inv3 + 2.5f * dqd * inv5 * inv2;
-                ax += f * dx - qx * inv5; ay += f * dy - qy * inv5; az += f * dz - qz * inv5;
-                if constexpr (POT) p += nm[k] * inv + 0.5f * dqd * inv5;
+                v8f qx = xx * dx + xy * dy + xz * dz;
+                v8f qy = xy * dx + yy * dy + yz * dz;
+                v8f qz = xz * dx + yz * dy + zz * dz;
+                v8f dqd = dx * qx + dy * qy + dz * qz;
+                v8f mk = load8(nm + k);
+                v8f f = mk * inv3 + 2.5f * dqd * inv5 * inv2;
+                vax += f * dx - qx * inv5; vay += f * dy - qy * inv5; vaz += f * dz - qz * inv5;
+                if constexpr (POT) vp += mk * inv + 0.5f * dqd * inv5;
             }
+            ax += hsum(vax); ay += hsum(vay); az += hsum(vaz);
+            if constexpr (POT) p += hsum(vp);
             ax_[i] = G * ax; ay_[i] = G * ay; az_[i] = G * az;
             if constexpr (POT) pot_[i] = -G * p;
         }
@@ -547,7 +620,7 @@ private:
     std::vector<Node> nodes_;
     std::vector<Geo> geo_;
     std::vector<Group> groups_;
-    std::vector<uint32_t> leaf_of_group_;
+    std::vector<uint32_t> leaves_;
     std::vector<WalkScratch> scratch_;
 };
 

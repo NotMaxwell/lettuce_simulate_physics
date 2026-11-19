@@ -1,67 +1,93 @@
-# physics_simulation
+# lettuce: celestial-body gravity simulation
 
-A merge-sandbox with bouncy balls, written in **Zig 0.17 + SDL3** and built to run thousands of
-balls at 60 fps. Click anywhere empty to spawn a ball with random size, mass, bounciness and
-friction. Balls merge with balls of the same image into a bigger, higher-level ball; 38 is the
-highest level. Balls bounce off the walls and each other (mass-based elastic collisions) and are
-gravitationally attracted to each other. Balls can be set on fire, which spreads by temperature
-and impact; explosions knock balls away and set the ones near the centre alight. Burning balls
-turn to ash unless you click them to cool them down. The play area grows as you add balls.
+A 3D Newtonian N-body simulation in **C++23 + CUDA**, built with **Clang/LLVM**, aimed at NVIDIA
+H100 GPUs. Bodies interact only through softened gravity (no collisions or destruction) and are
+integrated with a kick-drift-kick leapfrog. Forces come from exact direct summation or a
+Barnes-Hut tree with quadrupole moments, on the GPU (CUDA) or the CPU (OpenMP). Runs are
+headless: they print conservation diagnostics and write a CSV, binary snapshots (restartable) and
+PNG density renders.
 
-It started as a Python/pygame learning project; that version lives on in [`python/`](python/).
+It grew out of a Python/pygame bouncing-ball toy, which is kept in [`python/`](python/) for history.
 
-## Run
-
-A prebuilt Linux x86-64 binary is in `bin/`. Run it from the repo root so it finds `assets/`:
+## Quick start
 
 ```bash
-./bin/lettuce-linux-x86_64
+cmake --preset clang-release          # or clang-cpu without the CUDA toolkit
+cmake --build --preset clang-release
+ctest --preset clang-release
+build/clang-release/lettuce configs/plummer.ini
 ```
 
-It needs SDL3 installed and a CPU with AVX2 (2013 or newer), and was built on Arch against a
-recent glibc, so older distros may need to build from source.
+Needs CMake ≥ 3.24, Ninja, Clang ≥ 17 with libc++ and libomp, lld, and for the GPU build CUDA
+≥ 12.0. If CUDA is not in `/usr/local/cuda`, add
+`-DCUDAToolkit_ROOT=<cuda> -DCMAKE_CUDA_FLAGS=--cuda-path=<cuda>`. The `nvcc-release` preset
+(GCC + nvcc) is the fallback where Clang is older than the installed CUDA. Running on Brev and the
+ASA-X cluster: [docs/running.md](docs/running.md).
 
-## Build
+## Starting configurations
 
-Needs Zig 0.17 and the SDL3 development package.
+Each file in [`configs/`](configs/) is a ready-to-run setup, and any key can be overridden on the
+command line:
 
 ```bash
-zig build run                 # play (optimized build)
-zig build run -Doptimize=debug  # with bounds and overflow checks
-zig build bench -- 1000 600   # headless physics timing: <balls> <ticks>
-zig build test-bench          # physics unit tests
+build/clang-release/lettuce configs/disk.ini n=1000000 method=tree disk.thickness=0.1 render_every=50
+build/clang-release/lettuce scenario=kepler kepler.e=0.9 steps=50000 dt=0.0005 eps=0
+build/clang-release/lettuce --list                     # scenarios
+build/clang-release/lettuce configs/solar.ini --print  # effective configuration
 ```
 
-## Controls
+| Scenario | What it is |
+|---|---|
+| `plummer` | star cluster in virial equilibrium |
+| `kepler` | two-body orbit (integrator accuracy check) |
+| `uniform` | uniform sphere/cube, cold collapse, optional spin |
+| `disk` | rotating exponential disk galaxy around a central mass |
+| `collision` | two inclined disk galaxies colliding |
+| `solar` | the Sun, eight planets (J2000 elements) and an asteroid belt; AU, years, solar masses |
+| `systems` | star cluster in which every star has its own planets |
 
-- **Left click empty space:** spawn balls (balls per click shown bottom-left)
-- **Right click a ball:** set it on fire
-- **Left click a ball:** cool it down; hold and drag to move it, release to throw it
-- **Hold Shift and drag around balls:** lasso them to make them explode
-- **Hold G and left click:** attract balls toward the mouse while energy lasts
-- **F:** switch between downward gravity and attraction between balls
-- **+ / -:** change balls per click (hold Ctrl to step by 25)
-- **T:** stress test, adds 1000 balls and turns merging off
-- **N:** toggle merging
-- **P:** toggle the performance overlay
-- **M:** toggle background music
+Keys, units and per-scenario parameters: [configs/README.md](configs/README.md).
+
+## Output
+
+Everything goes to `out_dir` (default `out/`):
+
+- stdout and `diag.csv`: energy, relative energy error, kinetic/potential energy, virial ratio
+  2K/|W|, momentum, angular-momentum error and ms/step, every `diag_every` steps
+- `config.ini`: the effective configuration (rerun it to reproduce the run)
+- `snap_<step>.snap` every `snap_every` steps; resume with `restart=<file>`
+- `frame_<step>.png` every `render_every` steps; `lettuce-render <snap> <png> view=30,60`
+  renders a snapshot afterwards
+
+## Benchmark
+
+```bash
+build/clang-release/lettuce-bench backend=cuda,cpu n=1e4,1e5,1e6 method=direct,tree steps=5
+```
+
+Prints force time split into sort/build/walk, ms per full step, and interactions per second.
+Measured on a 4-core 2.1 GHz Xeon, CPU backend only (no GPU numbers yet):
+
+| method | n | ms / force | Ginteractions/s |
+|---|---|---|---|
+| direct | 1e4 | 13.2 | 7.6 |
+| direct | 1e5 | 1166 | 8.6 |
+| tree θ=0.6 | 1e5 | 98 | 3.4 |
+| tree θ=0.6 | 1e6 | 929 | 3.7 |
 
 ## Layout
 
-- `src/main.zig` — window, input, fixed-timestep game loop
-- `src/physics.zig` — simulation tick: SIMD gravity, grid collisions, merging, heat, hoop
-- `src/effects.zig` — fire particles, ash, explosions
-- `src/render.zig` — batched GPU drawing, zooming camera, HUD
-- `src/audio.zig` — sound effects and music
-- `src/world.zig`, `src/config.zig` — shared data and tuning constants
-- `vendor/` — single-header image and MP3 decoders
-- `python/` — the original pygame version
+- `src/` — `bodies.hpp`, `config.*`, `scenarios.*`, `backend.hpp`, `cpu_backend.cpp`,
+  `cuda_backend.cu`, `simulation.*`, `snapshot.*`, `render.*`, `main.cpp`, `bench.cpp`, `render_main.cpp`
+- `tests/` — unit and physics tests (`build/<preset>/lettuce-tests [filter]`); CUDA tests skip without a GPU
+- `configs/` — starting configurations · `cluster/` — Brev setup and ASA-X Slurm job
+- `docs/design.md` — physics, algorithms, precision · `vendor/` — stb_image_write
 
-## Original Python version
+## CLion
 
-```bash
-python3 -m venv venv
-source venv/bin/activate      # on Windows: venv\Scripts\activate
-pip install -r python/requirements.txt
-python python/main.py         # run from the repo root so it finds assets/
-```
+Open the repository folder. CLion reads `CMakePresets.json` and offers the presets as CMake
+profiles (`clang-release`, `clang-debug`, `clang-cpu`, ...). Enable the ones you want under
+Settings → Build, Execution, Deployment → CMake. Without a local CUDA toolkit, use
+`clang-cpu`. For the GPU build, set `CUDAToolkit_ROOT` in the profile's CMake options if
+CUDA is not in `/usr/local/cuda`. To build and run on a Brev instance from your machine, add it
+as a Remote Development host or a remote toolchain over SSH.

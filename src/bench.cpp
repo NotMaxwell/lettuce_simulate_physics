@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <exception>
+#include <stdexcept>
 #include <sstream>
 #include <string>
 #include <vector>
