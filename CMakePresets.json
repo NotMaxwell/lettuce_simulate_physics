@@ -1,0 +1,82 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": { "CMAKE_EXPORT_COMPILE_COMMANDS": "ON" }
+    },
+    {
+      "name": "clang",
+      "hidden": true,
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_CUDA_COMPILER": "clang++",
+        "LETTUCE_LIBCXX": "ON",
+        "LETTUCE_LLD": "ON"
+      }
+    },
+    {
+      "name": "clang-release",
+      "displayName": "Clang/LLVM Release (CUDA via clang, sm_90)",
+      "description": "Default. Clang compiles host and CUDA code, libc++, lld. Set CUDAToolkit_ROOT if CUDA is not in /usr/local/cuda.",
+      "inherits": "clang",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "LETTUCE_CUDA": "AUTO" }
+    },
+    {
+      "name": "clang-debug",
+      "displayName": "Clang/LLVM Debug",
+      "inherits": "clang",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "LETTUCE_CUDA": "AUTO" }
+    },
+    {
+      "name": "clang-cpu",
+      "displayName": "Clang/LLVM Release, CPU only",
+      "description": "No CUDA: for laptops and machines without the CUDA toolkit.",
+      "inherits": "clang",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "LETTUCE_CUDA": "OFF" }
+    },
+    {
+      "name": "clang-cpu-debug",
+      "displayName": "Clang/LLVM Debug, CPU only, sanitizers",
+      "inherits": "clang",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LETTUCE_CUDA": "OFF",
+        "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined"
+      }
+    },
+    {
+      "name": "nvcc-release",
+      "displayName": "GCC + nvcc Release (fallback)",
+      "description": "For clusters whose Clang is too old for the installed CUDA: GCC host code, nvcc for .cu files.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "g++",
+        "CMAKE_CUDA_COMPILER": "nvcc",
+        "CMAKE_BUILD_TYPE": "Release",
+        "LETTUCE_CUDA": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "clang-release", "configurePreset": "clang-release" },
+    { "name": "clang-debug", "configurePreset": "clang-debug" },
+    { "name": "clang-cpu", "configurePreset": "clang-cpu" },
+    { "name": "clang-cpu-debug", "configurePreset": "clang-cpu-debug" },
+    { "name": "nvcc-release", "configurePreset": "nvcc-release" }
+  ],
+  "testPresets": [
+    { "name": "clang-release", "configurePreset": "clang-release", "output": { "outputOnFailure": true } },
+    { "name": "clang-debug", "configurePreset": "clang-debug", "output": { "outputOnFailure": true } },
+    { "name": "clang-cpu", "configurePreset": "clang-cpu", "output": { "outputOnFailure": true } },
+    { "name": "clang-cpu-debug", "configurePreset": "clang-cpu-debug", "output": { "outputOnFailure": true } },
+    { "name": "nvcc-release", "configurePreset": "nvcc-release", "output": { "outputOnFailure": true } }
+  ]
+}

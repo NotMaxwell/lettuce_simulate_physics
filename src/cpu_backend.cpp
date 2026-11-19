@@ -1,0 +1,556 @@
+// OpenMP CPU backend: blocked direct summation and a Barnes-Hut octree with quadrupoles.
+// It is also the reference the CUDA backend is validated against.
+#include <omp.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <vector>
+
+#include "backend.hpp"
+
+namespace {
+
+using clk = std::chrono::steady_clock;
+double ms_since(clk::time_point t0) { return std::chrono::duration<double, std::milli>(clk::now() - t0).count(); }
+
+constexpr int kLeafMax = 16;      // bodies per leaf bucket; also the walk group size
+constexpr int kMaxLevel = 21;     // Morton bits per axis
+constexpr int kSmallLeaf = 4;     // accepted leaves this small are summed directly: exact and no dearer
+constexpr int kRadixBits = 11;
+constexpr int kRadixBuckets = 1 << kRadixBits;
+
+// One cache line. Children of a node are contiguous and have larger indices than the node,
+// so a reverse index sweep is a valid bottom-up order.
+struct alignas(64) Node {
+    float cx, cy, cz, m;                    // centre of mass, mass
+    float qxx, qxy, qxz, qyy, qyz, qzz;     // traceless quadrupole about the centre of mass
+    float rcrit2;                           // open if (distance to group)^2 < rcrit2
+    uint32_t first;                         // first child (internal) or first body (leaf)
+    uint32_t nchild;                        // 0 for a leaf
+    uint32_t lo, hi;                        // body range [lo, hi) in sorted order
+};
+static_assert(sizeof(Node) == 64);
+
+struct Geo { float gx, gy, gz, half; };     // geometric cell centre and half side
+
+// A walk group is one leaf: its bodies share an interaction list, built against the group's
+// bounding box, so any node that some body of the group would open is opened for all of them.
+struct Group { float bx, by, bz, hx, hy, hz; uint32_t lo, hi; };
+
+inline uint64_t spread21(uint64_t v) {
+    v &= 0x1fffff;
+    v = (v | v << 32) & 0x1f00000000ffffULL;
+    v = (v | v << 16) & 0x1f0000ff0000ffULL;
+    v = (v | v << 8) & 0x100f00f00f00f00fULL;
+    v = (v | v << 4) & 0x10c30c30c30c30c3ULL;
+    v = (v | v << 2) & 0x1249249249249249ULL;
+    return v;
+}
+
+template <class T>
+void grow(std::vector<T>& v, std::size_t n) {
+    if (v.size() < n) v.resize(n);
+}
+
+struct WalkScratch {
+    std::vector<float> bx, by, bz, bm;
+    std::vector<int32_t> bi;
+    std::vector<float> nx, ny, nz, nm, qxx, qxy, qxz, qyy, qyz, qzz;
+    std::vector<uint32_t> stack;
+    std::size_t nb = 0, nn = 0;
+    void need_bodies(std::size_t n) {
+        if (bx.size() >= n) return;
+        std::size_t c = std::max<std::size_t>(n, 2 * bx.size());
+        bx.resize(c); by.resize(c); bz.resize(c); bm.resize(c); bi.resize(c);
+    }
+    void need_nodes(std::size_t n) {
+        if (nx.size() >= n) return;
+        std::size_t c = std::max<std::size_t>(n, 2 * nx.size());
+        for (auto* v : {&nx, &ny, &nz, &nm, &qxx, &qxy, &qxz, &qyy, &qyz, &qzz}) v->resize(c);
+    }
+};
+
+class CpuBackend final : public Backend {
+public:
+    explicit CpuBackend(int threads) : nt_(threads > 0 ? threads : omp_get_max_threads()) {
+        scratch_.resize(nt_);
+    }
+
+    std::string name() const override { return "cpu: " + std::to_string(nt_) + " threads (OpenMP)"; }
+
+    void upload(const Bodies& b) override {
+        n_ = b.size();
+        x_ = b.x; y_ = b.y; z_ = b.z;
+        vx_ = b.vx; vy_ = b.vy; vz_ = b.vz;
+        m_ = b.m; id_ = b.id;
+        ax_.assign(n_, 0.f); ay_.assign(n_, 0.f); az_.assign(n_, 0.f); pot_.assign(n_, 0.f);
+        has_pot_ = false;
+    }
+
+    void download(Bodies& b) override {
+        b.x = x_; b.y = y_; b.z = z_;
+        b.vx = vx_; b.vy = vy_; b.vz = vz_;
+        b.m = m_; b.id = id_;
+    }
+
+    void compute_forces(const ForceParams& p, bool potential) override {
+        auto t0 = clk::now();
+        times_ = PhaseTimes{times_.step_ms};
+        if (n_ == 0) { has_pot_ = potential; return; }
+        if (p.method == ForceMethod::direct) {
+            auto tw = clk::now();
+            if (potential) direct<true>(float(p.G), float(p.eps * p.eps));
+            else direct<false>(float(p.G), float(p.eps * p.eps));
+            times_.walk_ms = ms_since(tw);
+            times_.interactions = uint64_t(n_) * n_;
+        } else {
+            auto ts = clk::now();
+            sort_bodies();
+            times_.sort_ms = ms_since(ts);
+            auto tb = clk::now();
+            build_tree(p.theta);
+            times_.build_ms = ms_since(tb);
+            auto tw = clk::now();
+            times_.interactions =
+                potential ? walk<true>(float(p.G), float(p.eps * p.eps)) : walk<false>(float(p.G), float(p.eps * p.eps));
+            times_.walk_ms = ms_since(tw);
+        }
+        has_pot_ = potential;
+        times_.force_ms = ms_since(t0);
+    }
+
+    void kick(double dt) override {
+        auto t0 = clk::now();
+        const float h = float(dt);
+        float *vx = vx_.data(), *vy = vy_.data(), *vz = vz_.data();
+        const float *ax = ax_.data(), *ay = ay_.data(), *az = az_.data();
+#pragma omp parallel for simd num_threads(nt_) schedule(static)
+        for (std::size_t i = 0; i < n_; ++i) {
+            vx[i] += ax[i] * h; vy[i] += ay[i] * h; vz[i] += az[i] * h;
+        }
+        kick_ms_ = ms_since(t0);
+        times_.step_ms = kick_ms_ + drift_ms_;
+    }
+
+    void drift(double dt) override {
+        auto t0 = clk::now();
+        const float h = float(dt);
+        float *x = x_.data(), *y = y_.data(), *z = z_.data();
+        const float *vx = vx_.data(), *vy = vy_.data(), *vz = vz_.data();
+#pragma omp parallel for simd num_threads(nt_) schedule(static)
+        for (std::size_t i = 0; i < n_; ++i) {
+            x[i] += vx[i] * h; y[i] += vy[i] * h; z[i] += vz[i] * h;
+        }
+        has_pot_ = false;
+        drift_ms_ = ms_since(t0);
+        times_.step_ms = kick_ms_ + drift_ms_;
+    }
+
+    Diag diagnostics() override {
+        double mass = 0, ke = 0, pe = 0, px = 0, py = 0, pz = 0, lx = 0, ly = 0, lz = 0, cx = 0, cy = 0, cz = 0;
+        const long n = long(n_);
+#pragma omp parallel for num_threads(nt_) schedule(static) \
+    reduction(+ : mass, ke, pe, px, py, pz, lx, ly, lz, cx, cy, cz)
+        for (long i = 0; i < n; ++i) {
+            double m = m_[i], x = x_[i], y = y_[i], z = z_[i], vx = vx_[i], vy = vy_[i], vz = vz_[i];
+            mass += m;
+            ke += 0.5 * m * (vx * vx + vy * vy + vz * vz);
+            pe += 0.5 * m * double(pot_[i]);
+            px += m * vx; py += m * vy; pz += m * vz;
+            lx += m * (y * vz - z * vy); ly += m * (z * vx - x * vz); lz += m * (x * vy - y * vx);
+            cx += m * x; cy += m * y; cz += m * z;
+        }
+        Diag d;
+        d.mass = mass; d.ke = ke;
+        d.has_pe = has_pot_;
+        d.pe = has_pot_ ? pe : 0;
+        d.px = px; d.py = py; d.pz = pz;
+        d.lx = lx; d.ly = ly; d.lz = lz;
+        if (mass > 0) { d.cx = cx / mass; d.cy = cy / mass; d.cz = cz / mass; }
+        return d;
+    }
+
+    double exact_potential_energy(double G, double eps) override {
+        const double e2 = eps * eps;
+        const long n = long(n_);
+        double pe = 0;
+#pragma omp parallel for num_threads(nt_) schedule(dynamic, 64) reduction(+ : pe)
+        for (long i = 0; i < n; ++i) {
+            const double xi = x_[i], yi = y_[i], zi = z_[i];
+            double s = 0;
+            for (long j = i + 1; j < n; ++j) {
+                double dx = x_[j] - xi, dy = y_[j] - yi, dz = z_[j] - zi;
+                double r2 = dx * dx + dy * dy + dz * dz + e2;
+                if (r2 > 0) s += double(m_[j]) / std::sqrt(r2);
+            }
+            pe -= double(m_[i]) * s;
+        }
+        return G * pe;
+    }
+
+    PhaseTimes times() const override { return times_; }
+
+private:
+    // ---- direct ----------------------------------------------------------------------------
+    template <bool POT>
+    void direct(float G, float e2) {
+        constexpr std::size_t kIB = 128, kJT = 4096;  // j tile: 4096 * 16 B fits in L1+L2 comfortably
+        const std::size_t n = n_;
+        const float *X = x_.data(), *Y = y_.data(), *Z = z_.data(), *M = m_.data();
+        const long nblk = long((n + kIB - 1) / kIB);
+#pragma omp parallel for num_threads(nt_) schedule(dynamic, 1)
+        for (long b = 0; b < nblk; ++b) {
+            const std::size_t i0 = std::size_t(b) * kIB, i1 = std::min(n, i0 + kIB);
+            float sax[kIB] = {}, say[kIB] = {}, saz[kIB] = {}, sp[kIB] = {};
+            for (std::size_t j0 = 0; j0 < n; j0 += kJT) {
+                const std::size_t j1 = std::min(n, j0 + kJT);
+                for (std::size_t i = i0; i < i1; ++i) {
+                    const float xi = X[i], yi = Y[i], zi = Z[i];
+                    const int32_t ii = int32_t(i);
+                    float ax = 0, ay = 0, az = 0, p = 0;
+#pragma omp simd reduction(+ : ax, ay, az, p)
+                    for (std::size_t j = j0; j < j1; ++j) {
+                        float dx = X[j] - xi, dy = Y[j] - yi, dz = Z[j] - zi;
+                        float r2 = dx * dx + dy * dy + dz * dz + e2;
+                        // Excluding by index keeps phi correct for distinct coincident bodies
+                        // with eps > 0; r2 > 0 guards eps = 0.
+                        float inv = (r2 > 0.f && int32_t(j) != ii) ? 1.f / std::sqrt(r2) : 0.f;
+                        float mi = M[j] * inv;
+                        float f = mi * inv * inv;
+                        ax += f * dx; ay += f * dy; az += f * dz;
+                        if constexpr (POT) p += mi;
+                    }
+                    sax[i - i0] += ax; say[i - i0] += ay; saz[i - i0] += az;
+                    if constexpr (POT) sp[i - i0] += p;
+                }
+            }
+            for (std::size_t i = i0; i < i1; ++i) {
+                ax_[i] = G * sax[i - i0]; ay_[i] = G * say[i - i0]; az_[i] = G * saz[i - i0];
+                if constexpr (POT) pot_[i] = -G * sp[i - i0];
+            }
+        }
+    }
+
+    // ---- sort ------------------------------------------------------------------------------
+    void sort_bodies() {
+        const std::size_t n = n_;
+        const long ln = long(n);
+        float mnx = x_[0], mny = y_[0], mnz = z_[0], mxx = mnx, mxy = mny, mxz = mnz;
+#pragma omp parallel for simd num_threads(nt_) reduction(min : mnx, mny, mnz) reduction(max : mxx, mxy, mxz)
+        for (long i = 0; i < ln; ++i) {
+            mnx = std::min(mnx, x_[i]); mny = std::min(mny, y_[i]); mnz = std::min(mnz, z_[i]);
+            mxx = std::max(mxx, x_[i]); mxy = std::max(mxy, y_[i]); mxz = std::max(mxz, z_[i]);
+        }
+        double side = std::max({double(mxx) - mnx, double(mxy) - mny, double(mxz) - mnz});
+        side = side > 0 ? side * (1 + 1e-6) : 1.0;  // margin keeps the max coordinate below 2^21
+        ox_ = mnx; oy_ = mny; oz_ = mnz; side_ = side;
+
+        grow(key_, n); grow(key2_, n); grow(idx_, n); grow(idx2_, n);
+        const double s = double(1u << kMaxLevel) / side;
+        const double lim = double((1u << kMaxLevel) - 1);
+#pragma omp parallel for num_threads(nt_) schedule(static)
+        for (long i = 0; i < ln; ++i) {
+            auto q = [&](float v, double o) { return uint64_t(std::clamp((double(v) - o) * s, 0.0, lim)); };
+            key_[i] = spread21(q(x_[i], ox_)) << 2 | spread21(q(y_[i], oy_)) << 1 | spread21(q(z_[i], oz_));
+            idx_[i] = uint32_t(i);
+        }
+        radix_sort();
+
+        // Gather every array into sorted order; bodies stay sorted between calls, so the next
+        // sort starts from nearly sorted input and the permute is close to a streaming copy.
+        grow(tmpf_, n); grow(tmpu_, n);
+        for (auto* a : {&x_, &y_, &z_, &vx_, &vy_, &vz_, &m_}) {
+            float* src = a->data();
+            float* dst = tmpf_.data();
+#pragma omp parallel for num_threads(nt_) schedule(static)
+            for (long i = 0; i < ln; ++i) dst[i] = src[idx_[i]];
+            std::memcpy(src, dst, n * sizeof(float));
+        }
+#pragma omp parallel for num_threads(nt_) schedule(static)
+        for (long i = 0; i < ln; ++i) tmpu_[i] = id_[idx_[i]];
+        std::memcpy(id_.data(), tmpu_.data(), n * sizeof(uint32_t));
+    }
+
+    // Stable parallel LSD radix sort of (key_, idx_); passes whose digit is constant are skipped.
+    void radix_sort() {
+        const std::size_t n = n_;
+        const int T = nt_;
+        hist_.assign(std::size_t(T) * kRadixBuckets, 0);
+        uint64_t *ks = key_.data(), *kd = key2_.data();
+        uint32_t *is = idx_.data(), *id = idx2_.data();
+        for (int shift = 0; shift < 63; shift += kRadixBits) {
+            bool skip = false;
+#pragma omp parallel num_threads(T)
+            {
+                const int t = omp_get_thread_num(), nth = omp_get_num_threads();
+                const std::size_t lo = n * t / nth, hi = n * (t + 1) / nth;
+                std::size_t* h = &hist_[std::size_t(t) * kRadixBuckets];
+                std::fill(h, h + kRadixBuckets, 0);
+                for (std::size_t i = lo; i < hi; ++i) ++h[(ks[i] >> shift) & (kRadixBuckets - 1)];
+#pragma omp barrier
+#pragma omp single
+                {
+                    std::size_t off = 0;
+                    for (int d = 0; d < kRadixBuckets; ++d) {
+                        std::size_t tot = 0;
+                        for (int u = 0; u < nth; ++u) {
+                            std::size_t c = hist_[std::size_t(u) * kRadixBuckets + d];
+                            hist_[std::size_t(u) * kRadixBuckets + d] = off;
+                            off += c;
+                            tot += c;
+                        }
+                        if (tot == n) skip = true;
+                    }
+                }
+                if (!skip) {
+                    for (std::size_t i = lo; i < hi; ++i) {
+                        std::size_t dst = h[(ks[i] >> shift) & (kRadixBuckets - 1)]++;
+                        kd[dst] = ks[i];
+                        id[dst] = is[i];
+                    }
+                }
+            }
+            if (!skip) { std::swap(ks, kd); std::swap(is, id); }
+        }
+        if (ks != key_.data()) { key_.swap(key2_); idx_.swap(idx2_); }
+    }
+
+    // ---- build -----------------------------------------------------------------------------
+    void build_node(uint32_t ni, int level, double gx, double gy, double gz, double half) {
+        const uint32_t lo = nodes_[ni].lo, hi = nodes_[ni].hi;
+        geo_[ni] = {float(gx), float(gy), float(gz), float(half)};
+        if (hi - lo <= uint32_t(kLeafMax) || level == kMaxLevel) {
+            nodes_[ni].first = lo;
+            nodes_[ni].nchild = 0;
+            groups_.push_back({0, 0, 0, 0, 0, 0, lo, hi});
+            leaf_of_group_.push_back(ni);
+            return;
+        }
+        const int shift = 3 * (kMaxLevel - 1 - level);
+        const uint64_t* k = key_.data();
+        uint32_t bound[9];
+        bound[0] = lo;
+        for (int o = 1; o < 8; ++o)
+            bound[o] = uint32_t(std::partition_point(k + bound[o - 1], k + hi,
+                                                     [&](uint64_t v) { return int((v >> shift) & 7) < o; }) - k);
+        bound[8] = hi;
+        const uint32_t first = uint32_t(nodes_.size());
+        uint32_t nc = 0;
+        for (int o = 0; o < 8; ++o)
+            if (bound[o + 1] > bound[o]) {
+                Node c{};
+                c.lo = bound[o]; c.hi = bound[o + 1];
+                nodes_.push_back(c);
+                ++nc;
+            }
+        geo_.resize(nodes_.size());
+        nodes_[ni].first = first;
+        nodes_[ni].nchild = nc;
+        const double q = 0.5 * half;
+        uint32_t c = first;
+        for (int o = 0; o < 8; ++o) {
+            if (bound[o + 1] == bound[o]) continue;
+            build_node(c++, level + 1, gx + ((o & 4) ? q : -q), gy + ((o & 2) ? q : -q), gz + ((o & 1) ? q : -q), q);
+        }
+    }
+
+    void build_tree(double theta) {
+        nodes_.clear(); geo_.clear(); groups_.clear(); leaf_of_group_.clear();
+        Node root{};
+        root.lo = 0; root.hi = uint32_t(n_);
+        nodes_.push_back(root);
+        geo_.resize(1);
+        const double h = 0.5 * side_;
+        build_node(0, 0, ox_ + h, oy_ + h, oz_ + h, h);
+
+        const float inv_theta = theta > 0 ? float(1.0 / theta) : std::numeric_limits<float>::max();
+        auto finish = [&](Node& nd, const Geo& g) {
+            float dx = nd.cx - g.gx, dy = nd.cy - g.gy, dz = nd.cz - g.gz;
+            double r = double(2 * g.half) * inv_theta + std::sqrt(double(dx * dx + dy * dy + dz * dz));
+            nd.rcrit2 = float(std::min(r * r, double(std::numeric_limits<float>::max())));
+        };
+
+        // Leaf moments (the O(N) part) in parallel, about each leaf's centre of mass in double.
+        const long ng = long(groups_.size());
+#pragma omp parallel for num_threads(nt_) schedule(dynamic, 64)
+        for (long g = 0; g < ng; ++g) {
+            Group& gr = groups_[g];
+            Node& nd = nodes_[leaf_of_group_[g]];
+            double M = 0, sx = 0, sy = 0, sz = 0;
+            float mnx = x_[gr.lo], mny = y_[gr.lo], mnz = z_[gr.lo], mxx = mnx, mxy = mny, mxz = mnz;
+            for (uint32_t i = gr.lo; i < gr.hi; ++i) {
+                double m = m_[i];
+                M += m; sx += m * x_[i]; sy += m * y_[i]; sz += m * z_[i];
+                mnx = std::min(mnx, x_[i]); mny = std::min(mny, y_[i]); mnz = std::min(mnz, z_[i]);
+                mxx = std::max(mxx, x_[i]); mxy = std::max(mxy, y_[i]); mxz = std::max(mxz, z_[i]);
+            }
+            gr.bx = 0.5f * (mnx + mxx); gr.by = 0.5f * (mny + mxy); gr.bz = 0.5f * (mnz + mxz);
+            gr.hx = 0.5f * (mxx - mnx); gr.hy = 0.5f * (mxy - mny); gr.hz = 0.5f * (mxz - mnz);
+            const Geo& ge = geo_[leaf_of_group_[g]];
+            double cx = M > 0 ? sx / M : ge.gx, cy = M > 0 ? sy / M : ge.gy, cz = M > 0 ? sz / M : ge.gz;
+            double qxx = 0, qxy = 0, qxz = 0, qyy = 0, qyz = 0, qzz = 0;
+            for (uint32_t i = gr.lo; i < gr.hi; ++i) {
+                double m = m_[i], dx = x_[i] - cx, dy = y_[i] - cy, dz = z_[i] - cz, r2 = dx * dx + dy * dy + dz * dz;
+                qxx += m * (3 * dx * dx - r2); qyy += m * (3 * dy * dy - r2); qzz += m * (3 * dz * dz - r2);
+                qxy += m * 3 * dx * dy; qxz += m * 3 * dx * dz; qyz += m * 3 * dy * dz;
+            }
+            nd.cx = float(cx); nd.cy = float(cy); nd.cz = float(cz); nd.m = float(M);
+            nd.qxx = float(qxx); nd.qxy = float(qxy); nd.qxz = float(qxz);
+            nd.qyy = float(qyy); nd.qyz = float(qyz); nd.qzz = float(qzz);
+            finish(nd, ge);
+        }
+
+        // Internal nodes: few (~N/kLeafMax), so a serial reverse sweep is cheap. Combined in double
+        // via the parallel-axis theorem for the traceless quadrupole.
+        for (long ni = long(nodes_.size()) - 1; ni >= 0; --ni) {
+            Node& nd = nodes_[ni];
+            if (nd.nchild == 0) continue;
+            double M = 0, sx = 0, sy = 0, sz = 0;
+            for (uint32_t c = nd.first; c < nd.first + nd.nchild; ++c) {
+                const Node& ch = nodes_[c];
+                M += ch.m; sx += double(ch.m) * ch.cx; sy += double(ch.m) * ch.cy; sz += double(ch.m) * ch.cz;
+            }
+            const Geo& ge = geo_[ni];
+            double cx = M > 0 ? sx / M : ge.gx, cy = M > 0 ? sy / M : ge.gy, cz = M > 0 ? sz / M : ge.gz;
+            double qxx = 0, qxy = 0, qxz = 0, qyy = 0, qyz = 0, qzz = 0;
+            for (uint32_t c = nd.first; c < nd.first + nd.nchild; ++c) {
+                const Node& ch = nodes_[c];
+                double m = ch.m, dx = ch.cx - cx, dy = ch.cy - cy, dz = ch.cz - cz, r2 = dx * dx + dy * dy + dz * dz;
+                qxx += ch.qxx + m * (3 * dx * dx - r2); qyy += ch.qyy + m * (3 * dy * dy - r2);
+                qzz += ch.qzz + m * (3 * dz * dz - r2);
+                qxy += ch.qxy + m * 3 * dx * dy; qxz += ch.qxz + m * 3 * dx * dz; qyz += ch.qyz + m * 3 * dy * dz;
+            }
+            nd.cx = float(cx); nd.cy = float(cy); nd.cz = float(cz); nd.m = float(M);
+            nd.qxx = float(qxx); nd.qxy = float(qxy); nd.qxz = float(qxz);
+            nd.qyy = float(qyy); nd.qyz = float(qyz); nd.qzz = float(qzz);
+            finish(nd, ge);
+        }
+    }
+
+    // ---- walk ------------------------------------------------------------------------------
+    template <bool POT>
+    uint64_t walk(float G, float e2) {
+        const long ng = long(groups_.size());
+        uint64_t inter = 0;
+#pragma omp parallel num_threads(nt_) reduction(+ : inter)
+        {
+            WalkScratch& s = scratch_[omp_get_thread_num()];
+            if (s.stack.size() < 8 * (kMaxLevel + 2)) s.stack.resize(8 * (kMaxLevel + 2));
+#pragma omp for schedule(dynamic, 4)
+            for (long g = 0; g < ng; ++g) {
+                build_list(groups_[g], s);
+                eval_group<POT>(groups_[g], s, G, e2);
+                inter += uint64_t(s.nb + s.nn) * (groups_[g].hi - groups_[g].lo);
+            }
+        }
+        return inter;
+    }
+
+    void push_bodies(WalkScratch& s, uint32_t lo, uint32_t hi) {
+        s.need_bodies(s.nb + (hi - lo));
+        for (uint32_t j = lo; j < hi; ++j, ++s.nb) {
+            s.bx[s.nb] = x_[j]; s.by[s.nb] = y_[j]; s.bz[s.nb] = z_[j]; s.bm[s.nb] = m_[j];
+            s.bi[s.nb] = int32_t(j);
+        }
+    }
+
+    void build_list(const Group& gr, WalkScratch& s) {
+        s.nb = s.nn = 0;
+        uint32_t sp = 0;
+        s.stack[sp++] = 0;
+        while (sp) {
+            const Node& nd = nodes_[s.stack[--sp]];
+            float dx = std::max(std::fabs(nd.cx - gr.bx) - gr.hx, 0.f);
+            float dy = std::max(std::fabs(nd.cy - gr.by) - gr.hy, 0.f);
+            float dz = std::max(std::fabs(nd.cz - gr.bz) - gr.hz, 0.f);
+            // A node containing the group is always opened: with a huge theta its multipole would
+            // otherwise include the group's own bodies.
+            bool contains = nd.lo <= gr.lo && gr.hi <= nd.hi;
+            if (!contains && dx * dx + dy * dy + dz * dz >= nd.rcrit2) {
+                if (nd.nchild == 0 && nd.hi - nd.lo <= uint32_t(kSmallLeaf)) {
+                    push_bodies(s, nd.lo, nd.hi);
+                } else {
+                    s.need_nodes(s.nn + 1);
+                    const std::size_t k = s.nn++;
+                    s.nx[k] = nd.cx; s.ny[k] = nd.cy; s.nz[k] = nd.cz; s.nm[k] = nd.m;
+                    s.qxx[k] = nd.qxx; s.qxy[k] = nd.qxy; s.qxz[k] = nd.qxz;
+                    s.qyy[k] = nd.qyy; s.qyz[k] = nd.qyz; s.qzz[k] = nd.qzz;
+                }
+            } else if (nd.nchild == 0) {
+                push_bodies(s, nd.lo, nd.hi);
+            } else {
+                // Depth-first with at most 7 pending siblings per level: bounded by 8*(levels+1).
+                for (uint32_t c = nd.first + nd.nchild; c-- > nd.first;) s.stack[sp++] = c;
+            }
+        }
+    }
+
+    template <bool POT>
+    void eval_group(const Group& gr, const WalkScratch& s, float G, float e2) {
+        const float *bx = s.bx.data(), *by = s.by.data(), *bz = s.bz.data(), *bm = s.bm.data();
+        const int32_t* bi = s.bi.data();
+        const float *nx = s.nx.data(), *ny = s.ny.data(), *nz = s.nz.data(), *nm = s.nm.data();
+        const float *Qxx = s.qxx.data(), *Qxy = s.qxy.data(), *Qxz = s.qxz.data();
+        const float *Qyy = s.qyy.data(), *Qyz = s.qyz.data(), *Qzz = s.qzz.data();
+        const long nb = long(s.nb), nn = long(s.nn);
+        for (uint32_t i = gr.lo; i < gr.hi; ++i) {
+            const float xi = x_[i], yi = y_[i], zi = z_[i];
+            const int32_t ii = int32_t(i);
+            float ax = 0, ay = 0, az = 0, p = 0;
+#pragma omp simd reduction(+ : ax, ay, az, p)
+            for (long k = 0; k < nb; ++k) {
+                float dx = bx[k] - xi, dy = by[k] - yi, dz = bz[k] - zi;
+                float r2 = dx * dx + dy * dy + dz * dz + e2;
+                float inv = (r2 > 0.f && bi[k] != ii) ? 1.f / std::sqrt(r2) : 0.f;
+                float mi = bm[k] * inv;
+                float f = mi * inv * inv;
+                ax += f * dx; ay += f * dy; az += f * dz;
+                if constexpr (POT) p += mi;
+            }
+#pragma omp simd reduction(+ : ax, ay, az, p)
+            for (long k = 0; k < nn; ++k) {
+                float dx = nx[k] - xi, dy = ny[k] - yi, dz = nz[k] - zi;
+                float r2 = dx * dx + dy * dy + dz * dz + e2;
+                float inv = r2 > 0.f ? 1.f / std::sqrt(r2) : 0.f;
+                float inv2 = inv * inv, inv3 = inv * inv2, inv5 = inv3 * inv2;
+                // d points from the body to the node: a = G [M d/r^3 - Q d/r^5 + 5/2 (dQd) d/r^7]
+                float qx = Qxx[k] * dx + Qxy[k] * dy + Qxz[k] * dz;
+                float qy = Qxy[k] * dx + Qyy[k] * dy + Qyz[k] * dz;
+                float qz = Qxz[k] * dx + Qyz[k] * dy + Qzz[k] * dz;
+                float dqd = dx * qx + dy * qy + dz * qz;
+                float f = nm[k] * inv3 + 2.5f * dqd * inv5 * inv2;
+                ax += f * dx - qx * inv5; ay += f * dy - qy * inv5; az += f * dz - qz * inv5;
+                if constexpr (POT) p += nm[k] * inv + 0.5f * dqd * inv5;
+            }
+            ax_[i] = G * ax; ay_[i] = G * ay; az_[i] = G * az;
+            if constexpr (POT) pot_[i] = -G * p;
+        }
+    }
+
+    int nt_;
+    std::size_t n_ = 0;
+    std::vector<float> x_, y_, z_, vx_, vy_, vz_, m_, ax_, ay_, az_, pot_;
+    std::vector<uint32_t> id_;
+    bool has_pot_ = false;
+    PhaseTimes times_;
+    double kick_ms_ = 0, drift_ms_ = 0;
+
+    // Tree buffers, reused across calls (grow-only).
+    double ox_ = 0, oy_ = 0, oz_ = 0, side_ = 1;
+    std::vector<uint64_t> key_, key2_;
+    std::vector<uint32_t> idx_, idx2_, tmpu_;
+    std::vector<float> tmpf_;
+    std::vector<std::size_t> hist_;
+    std::vector<Node> nodes_;
+    std::vector<Geo> geo_;
+    std::vector<Group> groups_;
+    std::vector<uint32_t> leaf_of_group_;
+    std::vector<WalkScratch> scratch_;
+};
+
+}  // namespace
+
+std::unique_ptr<Backend> make_cpu_backend(int threads) { return std::make_unique<CpuBackend>(threads); }

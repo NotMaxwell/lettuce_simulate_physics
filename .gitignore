@@ -5,7 +5,11 @@ __pycache__/
 .env
 venv/
 ENV/
-.zig-cache/
-zig-out/
+build/
 .scratch/
 .venv/
+out/
+*.snap
+build/
+cmake-build-*/
+.idea/
