@@ -93,6 +93,10 @@ endif()
 if(lettuce_use_cuda)
   target_sources(lettuce_core PRIVATE src/cuda_backend.cu)
   if(CMAKE_CUDA_COMPILER_ID STREQUAL "Clang")
+    # CUDA 12.8's crt/host_defines.h #errors on libc++ for x86 unless _ALLOW_UNSUPPORTED_LIBCPP is
+    # defined (the opt-out the header itself checks; CUDA 12.0 has no such check). Building the .cu TU against libstdc++ instead would
+    # mix two C++ ABIs across the backend.hpp boundary, so we keep libc++ everywhere.
+    target_compile_definitions(lettuce_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:_ALLOW_UNSUPPORTED_LIBCPP>)
     target_compile_options(lettuce_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-ffast-math -fcuda-flush-denormals-to-zero -gline-tables-only>)
   else()
     target_compile_options(lettuce_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math -lineinfo --expt-relaxed-constexpr>)
