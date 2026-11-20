@@ -62,6 +62,25 @@ int main(int argc, char** argv) {
             else if (k == "csv") csv_path = v;
             else set_key(cfg, k, v);  // scenario, eps, theta, G, seed, threads, device, scenario params
         }
+        // A tiny dry build reads the scenario's parameters, so typos fail before memcheck can skip
+        // every n. If it cannot run (a parameter it rejects first), the check after each real build
+        // still applies; reporting unused keys from a build that stopped early would be wrong.
+        std::vector<std::string> unused;
+        try {
+            Config dry = cfg;
+            dry.n = 64;
+            if (dry.params.count("systems.stars")) dry.params["systems.stars"] = "1";
+            if (scenario_body_count(dry) <= 4096) {
+                build_scenario(dry);
+                unused = dry.unused_params();
+            }
+        } catch (const std::exception&) {
+        }
+        if (!unused.empty()) {
+            std::string msg = "unknown parameter(s) for scenario '" + cfg.scenario + "':";
+            for (auto& k : unused) msg += " " + k;
+            throw std::runtime_error(msg);
+        }
 
         std::FILE* csv = nullptr;
         if (!csv_path.empty() && root) {

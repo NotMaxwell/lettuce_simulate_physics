@@ -20,8 +20,9 @@ Code: `src/parallel.{hpp,cpp}`, which follows the Bonsai GPU tree code (Bédorf 
    which is still correct, just slightly less efficient. No rank takes more than 3/2 of an even
    share of the bodies (`par::max_rank_bodies`): equal cost puts more bodies on ranks over cheap
    outer regions (measured worst 1.24× an even share at 8 ranks, 1.45× at 16), and the cap is what
-   the memory pre-flight plans for. A range over the cap is trimmed by global position, so domains
-   can then overlap a little.
+   the memory pre-flight plans for. A range over the cap is split at global positions in key order
+   (a collective bisection on the key), so ranks still own contiguous key ranges and neighbours
+   share at most the finest Morton cell at their boundary.
 2. **Locally essential trees.** Each rank builds its own tree, then sends every other rank the part
    of that tree that any point in the receiver's bounding box could need:
    - distant regions as single multipole nodes;
