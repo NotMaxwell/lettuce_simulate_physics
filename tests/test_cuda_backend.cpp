@@ -160,6 +160,13 @@ std::unique_ptr<Backend> cuda_with(const char* walk, const char* group, std::str
     return make_cuda_backend(0, why);
 }
 
+// "group walk 64", "group walk 32" or "per-body walk": the last part of the backend name.
+std::string walk_label(const Backend& be) {
+    const std::string n = be.name();
+    const auto c = n.rfind(", ");
+    return c == std::string::npos ? n : n.substr(c + 2);
+}
+
 }  // namespace
 
 TEST("cuda: name and compiled flag") {
@@ -214,22 +221,37 @@ TEST("cuda: small and odd N, direct and tree(theta=0) vs brute force") {
 
 TEST("cuda: tree with coincident bodies (duplicate Morton keys)") {
     CUDA_BACKEND(be);
+    std::string w;
+    auto g32 = cuda_with("group", "32", w);
+    auto body = cuda_with("body", nullptr, w);
+    CHECK(g32 && body);
+    if (!g32 || !body) return;
     // 150 bodies at one point force a > 32 identical-key run; plus a clump of 40 within 1e-7.
     Bodies b = cube(300, 7);
     for (std::size_t i = 0; i < 150; ++i) { b.x[i] = 0.25f; b.y[i] = -0.5f; b.z[i] = 0.125f; }
     for (std::size_t i = 150; i < 190; ++i) { b.x[i] = -0.3f + 1e-7f * float(i - 150); b.y[i] = 0.1f; b.z[i] = 0.2f; }
     const double eps = 0.05;
     Ref ref = brute(b, 1, eps);
-    Got g0 = accel(*be, b, params(ForceMethod::tree, eps, 0.0), true);
-    CHECK(all_finite(g0.a));
-    double e0 = rel_rms(g0.a, ref.a);
-    std::fprintf(stderr, "  theta=0 rel rms %.3g\n", e0);
-    CHECK(e0 <= 1e-5);
-    Got g1 = accel(*be, b, params(ForceMethod::tree, eps, 0.6), true);
-    CHECK(all_finite(g1.a));
-    double e1 = rel_rms(g1.a, ref.a);
-    std::fprintf(stderr, "  theta=0.6 rel rms %.3g\n", e1);
-    CHECK(e1 <= 1e-2);
+    // Each variant's log line comes before its checks, so a CHECK failure belongs to the line above it.
+    for (Backend* tb : {be.get(), g32.get(), body.get()}) {
+        const std::string wl = walk_label(*tb);
+        Got g0 = accel(*tb, b, params(ForceMethod::tree, eps, 0.0), true);
+        double e0 = rel_rms(g0.a, ref.a);
+        std::fprintf(stderr, "  [%s] theta=0: rel rms %.3g, pe-1 %.3g, interactions %llu (exact %llu)\n", wl.c_str(),
+                     e0, g0.diag.pe / ref.pe - 1, (unsigned long long)g0.times.interactions, 300ull * 299ull);
+        CHECK(all_finite(g0.a));
+        CHECK(e0 <= 1e-5);
+        // Zero-extent cells too must be opened at theta 0.
+        CHECK(g0.times.interactions == 300ull * 299ull);
+        Got g1 = accel(*tb, b, params(ForceMethod::tree, eps, 0.6), true);
+        double e1 = rel_rms(g1.a, ref.a);
+        std::fprintf(stderr, "  [%s] theta=0.6: rel rms %.3g, pe-1 %.3g\n", wl.c_str(), e1, g1.diag.pe / ref.pe - 1);
+        CHECK(all_finite(g1.a));
+        CHECK(e1 <= 1e-2);
+        // A coincident cell taken as a far field by its own bodies adds their self pairs (m/eps
+        // each), a pe error of ~1e-3 here; without it the theta-0.6 pe error is ~2e-5.
+        CHECK_NEAR(g1.diag.pe / ref.pe, 1.0, 2e-4);
+    }
 }
 
 TEST("cuda: tree vs cuda direct, 20k Plummer, theta 0.6") {
@@ -450,7 +472,10 @@ TEST("cuda: group walk at theta 0 is exact, with groups split by duplicate keys"
     for (Backend* gb : {be.get(), g32.get()}) {
         Got g = accel(*gb, b, params(ForceMethod::tree, eps, 0.0), true);
         const double e = rel_rms(g.a, ref.a);
-        std::fprintf(stderr, "  %s: rel rms %.3g\n", gb->name().c_str(), e);
+        // Logged before the checks, so a CHECK failure belongs to the line above it.
+        std::fprintf(stderr, "  [%s] theta=0: rel rms %.3g, pe-1 %.3g, interactions %llu (exact %llu)\n",
+                     walk_label(*gb).c_str(), e, g.diag.pe / ref.pe - 1, (unsigned long long)g.times.interactions,
+                     3000ull * 2999ull);
         CHECK(all_finite(g.a));
         CHECK(e <= 1e-5);
         CHECK(g.times.interactions == 3000ull * 2999ull);

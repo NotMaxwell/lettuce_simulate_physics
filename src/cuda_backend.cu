@@ -499,12 +499,16 @@ struct Moments {
 constexpr float RCRIT_MAX = 1.8e19f;  // RCRIT_MAX^2 < FLT_MAX
 
 __device__ __forceinline__ float rcrit2(const Moments& M, float inv_theta) {
+    // theta = 0 arrives as inv_theta = RCRIT_MAX and means "always open". It must not go through
+    // l * inv_theta: a cell of coincident bodies has l = 0, which would give rcrit ~ 0 and let the
+    // walk accept it as a far field. RCRIT_MAX^2 is finite (no inf under finite-math) and larger
+    // than any d^2 of a sane system.
+    if (inv_theta >= RCRIT_MAX) return RCRIT_MAX * RCRIT_MAX;
     const float sx = M.hi.x - M.lo.x, sy = M.hi.y - M.lo.y, sz = M.hi.z - M.lo.z;
     const float l = fmaxf(sx, fmaxf(sy, sz));
     const float cx = 0.5f * (M.lo.x + M.hi.x) - M.com.x, cy = 0.5f * (M.lo.y + M.hi.y) - M.com.y,
                 cz = 0.5f * (M.lo.z + M.hi.z) - M.com.z;
-    // theta = 0 arrives as inv_theta = RCRIT_MAX; clamping keeps r^2 finite (no inf under
-    // finite-math) while still larger than any d^2 of a sane system, i.e. "always open".
+    // Clamped for tiny theta: keeps r^2 finite while still "always open".
     const float a = l < RCRIT_MAX / inv_theta ? l * inv_theta : RCRIT_MAX;
     const float r = fminf(a + sqrtf(cx * cx + cy * cy + cz * cz), RCRIT_MAX);
     return r * r;
@@ -638,14 +642,17 @@ __device__ __forceinline__ void cell_term(const float4 p, const float4 A, const 
 
 // Per-body walk (LETTUCE_CUDA_WALK=body), kept for comparison with the group walk.
 // One thread per body in Morton order, so a warp's bodies are close and follow similar paths.
-// Accept a node iff |com - x|^2 > rcrit^2 with rcrit = l/theta + |com - box centre|. The strict
-// comparison makes a single-body leaf (rcrit = 0) at the body's own position open instead of
-// being taken as a far field. For theta < 2/sqrt(3) a body's own cell is always opened.
+// Accept a node iff |com - x|^2 > rcrit^2 with rcrit = l/theta + |com - box centre|, and the
+// node does not hold body i. For theta < 2/sqrt(3) the distance test alone rejects a body's own
+// cell, except for a cell of coincident bodies: l = 0 makes it the equality |com - x| = |com -
+// centre| (x = centre), decided by rounding, and accepting it adds the self pair (phi += m/eps).
+// The range is loaded only for nodes that pass the distance test.
 template <bool POT>
 __global__ void __launch_bounds__(WALK_BS) walk_kernel(const float4* __restrict__ pm, int n,
                                                        const float4* __restrict__ nodeA,
                                                        const float4* __restrict__ nodeB,
-                                                       const float4* __restrict__ nodeC, float eps2, float G,
+                                                       const float4* __restrict__ nodeC,
+                                                       const int2* __restrict__ R, float eps2, float G,
                                                        float* __restrict__ ax, float* __restrict__ ay,
                                                        float* __restrict__ az, float* __restrict__ pot,
                                                        uint32_t* __restrict__ counts,
@@ -667,7 +674,12 @@ __global__ void __launch_bounds__(WALK_BS) walk_kernel(const float4* __restrict_
             const float d2 = fmaf(dx, dx, fmaf(dy, dy, dz * dz));
             const int cb = __float_as_int(C.w);
             bool descend = false;
-            if (d2 > C.y) {
+            bool acc = d2 > C.y;
+            if (acc) {
+                const int2 r = __ldg(&R[node]);
+                acc = i < r.x || i >= r.x + r.y;
+            }
+            if (acc) {
                 cell_term<POT>(p, A, __ldg(&nodeB[node]), C.x, eps2, sx, sy, sz, sp);
                 ++count;
             } else if (cb < 0) {
@@ -904,11 +916,15 @@ __global__ void __launch_bounds__(GW_BS) group_walk_kernel(const float4* __restr
                     acc = code == 0 || d2 >= C.y;
                     leaf = code < 0;
                 } else {
-                    // A node containing the group is always opened: for theta >= 2/sqrt(3) its
-                    // multipole could otherwise include the group's own bodies.
+                    // A node sharing bodies with the group is always opened. Groups are tree
+                    // nodes, so that is a node containing the group (for theta >= 2/sqrt(3) its
+                    // multipole could otherwise include the group's own bodies) or one inside it.
+                    // The latter's com is in the group box only up to rounding: for coincident
+                    // bodies (l = 0, rcrit ~ 0) a com rounded just outside passes the box test
+                    // and the group's own bodies, self pairs included, would enter as a cell.
                     const int2 r = __ldg(&t.R[nd]);
-                    const bool contains = r.x <= g0 && g0 + gn <= r.x + r.y;
-                    acc = !contains && d2 > C.y;
+                    const bool shares = r.x < g0 + gn && g0 < r.x + r.y;
+                    acc = !shares && d2 > C.y;
                     leaf = code < 0;
                 }
             }
@@ -1212,11 +1228,13 @@ public:
         } else if (walk_body_) {
             if (potential)
                 walk_kernel<true><<<grid_for(n, WALK_BS), WALK_BS, 0, s>>>(
-                    posm_.as<float4>(), n, nodeA_.as<float4>(), nodeB_.as<float4>(), nodeC_.as<float4>(), eps2, G,
+                    posm_.as<float4>(), n, nodeA_.as<float4>(), nodeB_.as<float4>(), nodeC_.as<float4>(),
+                    nodeR_.as<int2>(), eps2, G,
                     ax_.as<float>(), ay_.as<float>(), az_.as<float>(), pot_.as<float>(), counts_.as<uint32_t>(), inter, err);
             else
                 walk_kernel<false><<<grid_for(n, WALK_BS), WALK_BS, 0, s>>>(
-                    posm_.as<float4>(), n, nodeA_.as<float4>(), nodeB_.as<float4>(), nodeC_.as<float4>(), eps2, G,
+                    posm_.as<float4>(), n, nodeA_.as<float4>(), nodeB_.as<float4>(), nodeC_.as<float4>(),
+                    nodeR_.as<int2>(), eps2, G,
                     ax_.as<float>(), ay_.as<float>(), az_.as<float>(), pot_.as<float>(), counts_.as<uint32_t>(), inter, err);
             CK_LAUNCH();
         } else {
