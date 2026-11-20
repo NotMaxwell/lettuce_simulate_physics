@@ -17,7 +17,11 @@ Code: `src/parallel.{hpp,cpp}`, which follows the Bonsai GPU tree code (Bédorf 
 1. **Domains.** Bodies are split into contiguous ranges along a global Morton curve (a sample sort).
    Each range holds equal *cost*: the backends report per-body interaction counts. Rebalancing
    happens every `rebalance_every` force calls (default 10); the domains drift a little in between,
-   which is still correct, just slightly less efficient.
+   which is still correct, just slightly less efficient. No rank takes more than 3/2 of an even
+   share of the bodies (`par::max_rank_bodies`): equal cost puts more bodies on ranks over cheap
+   outer regions (measured worst 1.24× an even share at 8 ranks, 1.45× at 16), and the cap is what
+   the memory pre-flight plans for. A range over the cap is trimmed by global position, so domains
+   can then overlap a little.
 2. **Locally essential trees.** Each rank builds its own tree, then sends every other rank the part
    of that tree that any point in the receiver's bounding box could need:
    - distant regions as single multipole nodes;
@@ -30,8 +34,12 @@ Code: `src/parallel.{hpp,cpp}`, which follows the Bonsai GPU tree code (Bédorf 
    direct summation, the same as one rank; energy error 1.1e-6 over 100 steps with rebalancing.
 4. **Everything else.**
    - Diagnostics are summed over ranks.
-   - Each rank writes its own snapshot piece (`snap_<step>_r<k>.snap`). Restart from any piece:
-     `restart=out/snap_00000200_r0.snap` reads all of them, with any number of ranks.
+   - Each rank writes its own snapshot piece (`snap_<step>_r<k>.snap`) and records the piece count
+     in its header. Restart from any piece: `restart=out/snap_00000200_r0.snap` reads exactly the
+     pieces piece 0 records, with any number of ranks; higher-numbered pieces left in the directory
+     by an earlier run with more ranks are ignored with a warning (never deleted). Snapshots
+     written before the count existed fall back to every piece found.
+   - On restart, rank 0 drops the diag.csv rows at or after the restart step before appending.
    - Frames and the live view are drawn on rank 0 from a gathered subsample (at most 16M bodies).
 
 The exchange is staged through host memory with plain MPI, so it needs no CUDA-aware MPI or

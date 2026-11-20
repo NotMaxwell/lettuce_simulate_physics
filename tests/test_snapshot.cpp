@@ -91,3 +91,26 @@ TEST("snapshot: rejects bad files") {
     try { read_snapshot(tmp_path("does_not_exist.bin"), r); } catch (const std::runtime_error&) { missing = true; }
     CHECK(missing);
 }
+
+TEST("snapshot: piece count round trip and header-only read") {
+    Config c;
+    c.n = 300;
+    Bodies b = build_scenario(c), r;
+    SnapshotHeader h;
+    h.step = 40;
+    h.pieces = 3;
+    std::string path = tmp_path("snap_hdr.bin");
+    write_snapshot(path, h, b);
+    SnapshotHeader g = read_snapshot_header(path);
+    CHECK(g.n == 300 && g.step == 40 && g.pieces == 3);
+    CHECK(read_snapshot(path, r).pieces == 3 && r.size() == 300);
+    // Older files have zeros where the count now lives.
+    h.pieces = 0;
+    write_snapshot(path, h, b);
+    CHECK(read_snapshot_header(path).pieces == 0);
+    // The header reader still checks the body count against the file size.
+    std::filesystem::resize_file(path, 4096);
+    bool threw = false;
+    try { read_snapshot_header(path); } catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
+}

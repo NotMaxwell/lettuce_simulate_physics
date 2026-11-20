@@ -32,6 +32,13 @@ void subsample(const Bodies& in, uint64_t k, Bodies& out) {
 
 }  // namespace
 
+uint64_t max_rank_bodies(uint64_t n) {
+    const uint64_t p = uint64_t(size());
+    if (p == 1) return n;
+    const uint64_t even = (n + p - 1) / p;
+    return even + (even + 1) / 2;
+}
+
 void even_share(uint64_t n, uint64_t& first, uint64_t& last) {
     const uint64_t p = uint64_t(size()), r = uint64_t(rank());
     first = n / p * r + std::min(r, n % p);
@@ -356,12 +363,13 @@ private:
         }
 
         std::vector<std::vector<char>> send(P), recv;
-        std::vector<size_t> per(P, 0);
+        std::vector<uint64_t> per(P, 0);
         std::vector<int> dest(n);
         for (size_t i = 0; i < n; ++i) {
             dest[i] = int(std::upper_bound(split.begin(), split.end(), key[i]) - split.begin());
             ++per[dest[i]];
         }
+        cap_destinations(order, per, dest);
         for (int r = 0; r < P; ++r) send[r].reserve(per[r] * sizeof(Rec));
         for (size_t i : order) {
             Rec rec;
@@ -382,6 +390,40 @@ private:
         }
         local_->upload(nb);
         balance_ms_ = ms_since(t0);
+    }
+
+    // Enforces max_rank_bodies: if a key range drew more bodies than the cap, bodies are reassigned
+    // by global position (range, then source rank, then key order within a rank) so that no rank
+    // exceeds it. Domains may then overlap slightly; the LET exchange stays exact for any split.
+    void cap_destinations(const std::vector<uint32_t>& order, std::vector<uint64_t>& per, std::vector<int>& dest) {
+        const int P = g_size;
+        std::vector<uint64_t> tot(P), pre(P, 0);
+        check(MPI_Allreduce(per.data(), tot.data(), P, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD), "Allreduce");
+        uint64_t ntot = 0;
+        for (auto t : tot) ntot += t;
+        const uint64_t cap = max_rank_bodies(ntot);
+        if (*std::max_element(tot.begin(), tot.end()) <= cap) return;
+        check(MPI_Exscan(per.data(), pre.data(), P, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD), "Exscan");
+        if (g_rank == 0) std::fill(pre.begin(), pre.end(), 0);  // Exscan leaves rank 0's undefined
+        // Range d starts at start[d] in the global order; bound[d] is where capped rank d starts.
+        // Each bound is clamped to within cap of the previous one and high enough that the ranks
+        // after it can still take the rest, which cap * P >= ntot guarantees is possible.
+        std::vector<uint64_t> start(P + 1, 0), bound(P + 1, 0);
+        for (int d = 0; d < P; ++d) start[d + 1] = start[d] + tot[d];
+        bound[P] = ntot;
+        for (int d = 1; d < P; ++d) {
+            uint64_t rest = uint64_t(P - d) * cap;
+            uint64_t lo = std::max(bound[d - 1], ntot > rest ? ntot - rest : 0);
+            bound[d] = std::clamp(start[d], lo, bound[d - 1] + cap);
+        }
+        std::vector<uint64_t> seen(P, 0);
+        std::fill(per.begin(), per.end(), 0);
+        for (uint32_t i : order) {
+            int d = dest[i];
+            uint64_t g = start[d] + pre[d] + seen[d]++;
+            dest[i] = int(std::upper_bound(bound.begin() + 1, bound.begin() + P, g) - (bound.begin() + 1));
+            ++per[dest[i]];
+        }
     }
 
     std::unique_ptr<Backend> local_;

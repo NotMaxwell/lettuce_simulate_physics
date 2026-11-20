@@ -108,17 +108,22 @@ std::string memory_preflight(Backend& be, uint64_t ntotal, ForceMethod m, const 
     uint64_t dfree = 0, dtotal = 0;
     const bool dev = be.device_memory(dfree, dtotal);
 
+    // Bodies one rank may come to hold: an even share, until a tree rebalance moves them (capped).
+    const bool rebalances = P > 1 && m == ForceMethod::tree;
+    auto rank_bodies = [&](uint64_t n) { return rebalances ? par::max_rank_bodies(n) : (n + P - 1) / P; };
     // Per node: every rank on it builds all n bodies (generation is deterministic, each rank keeps its
-    // share), then holds its share while the backend allocates. The node peak is the worst phase.
+    // share), then holds its share while the backend allocates; a rebalance stages its bodies on the
+    // host while the backend still holds them. The node peak is the worst phase.
     auto host_rank = [&](uint64_t n) {
-        const uint64_t nl = (n + P - 1) / P;
+        const uint64_t nl = (n + P - 1) / P, nc = rank_bodies(n);
         const uint64_t gen = scenario.empty() ? 32 * n : scenario_peak_bytes(n, scenario);
         const uint64_t split = 32 * n + (P > 1 ? 32 * nl : 0);
-        const uint64_t run = 32 * nl + be.memory_need(nl, m).host;
+        // The driver's own copy (32 B) is refilled at rank size by every snapshot download.
+        const uint64_t run = 32 * nc + be.memory_need(nc, m).host + (rebalances ? par::kRebalanceHostBytesPerBody * nc : 0);
         return std::max({gen, split, run});
     };
     // One rank per GPU, as the launch scripts set up; ranks sharing a device are not detected.
-    auto dev_need = [&](uint64_t n) { return be.memory_need((n + P - 1) / P, m).device; };
+    auto dev_need = [&](uint64_t n) { return be.memory_need(rank_bodies(n), m).device; };
     const uint64_t havail = host_available_bytes();
     auto host_ok = [&](uint64_t n) { return havail == 0 || double(R * host_rank(n)) <= kHostUse * double(havail); };
     auto dev_ok = [&](uint64_t n) { return !dev || double(dev_need(n)) <= kDeviceUse * double(dfree); };
@@ -139,7 +144,9 @@ std::string memory_preflight(Backend& be, uint64_t ntotal, ForceMethod m, const 
             << "plan to use at most " << int(kHostUse * 100) << "% of it";
     } else if (!dev_ok(ntotal)) {
         msg << "n=" << ntotal << " needs ~" << gb(dev_need(ntotal)) << " of GPU memory per device ("
-            << dev_need(ntotal) / std::max<uint64_t>((ntotal + P - 1) / P, 1) << " B/body), but " << gb(dfree)
+            << dev_need(ntotal) / std::max<uint64_t>(rank_bodies(ntotal), 1) << " B/body"
+            << (rebalances ? ", planning for " + std::to_string(rank_bodies(ntotal)) + " bodies per rank after rebalancing" : "")
+            << "), but " << gb(dfree)
             << " of " << gb(dtotal) << " is free (counting what this run already holds)";
     }
     if (!msg.str().empty())

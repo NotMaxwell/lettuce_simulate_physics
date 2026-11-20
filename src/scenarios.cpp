@@ -338,11 +338,16 @@ Bodies build_solar(const Config& c) {
     return finish(std::move(p));
 }
 
-Bodies build_systems(const Config& c) {
-    uint64_t per = count_param(c, "systems.planets", 4);
-    uint64_t stars = count_param(c, "systems.stars", 0);
+void systems_counts(const Config& c, uint64_t& stars, uint64_t& per) {
+    per = count_param(c, "systems.planets", 4);
+    stars = count_param(c, "systems.stars", 0);
     if (stars == 0) stars = c.n / (1 + per);
     if (stars == 0) throw std::runtime_error("n is too small for even one planetary system");
+}
+
+Bodies build_systems(const Config& c) {
+    uint64_t per, stars;
+    systems_counts(c, stars, per);
     double Mc = positive(c, "systems.cluster_mass", 1), ac = positive(c, "systems.cluster_a", 1);
     double fm = positive(c, "systems.planet_mass", 1e-3);
     double rmin = positive(c, "systems.r_min", 0.002), rmax = positive(c, "systems.r_max", 0.02);
@@ -391,6 +396,16 @@ const std::vector<ScenarioInfo>& scenarios() {
         {"systems", "Plummer star cluster where every star carries circular-orbit planets"},
     };
     return list;
+}
+
+uint64_t scenario_body_count(const Config& cfg) {
+    if (cfg.scenario == "kepler") return 2;
+    if (cfg.scenario == "systems") {
+        uint64_t stars, per;
+        systems_counts(cfg, stars, per);
+        return stars * (1 + per);
+    }
+    return cfg.n;
 }
 
 Bodies build_scenario(const Config& cfg) {

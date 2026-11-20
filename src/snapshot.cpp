@@ -7,6 +7,8 @@
 #include <memory>
 #include <stdexcept>
 
+#include <unistd.h>
+
 static_assert(std::endian::native == std::endian::little, "snapshots are little-endian on disk");
 
 namespace {
@@ -16,8 +18,10 @@ constexpr uint32_t kVersion = 3;
 constexpr uint32_t kHeaderBytes = 256;
 constexpr uint64_t kAlign = 4096;
 constexpr int kArrays = 8;
-constexpr size_t kOffN = 16, kOffScenario = 72, kOffOffsets = 104;
+// kOffPieces was spare (zero) in files written before it existed, so 0 reads as "unrecorded".
+constexpr size_t kOffN = 16, kOffScenario = 72, kOffOffsets = 104, kOffPieces = 168;
 
+// Only for reads and error paths: a successful write closes explicitly and checks fclose.
 struct FileCloser { void operator()(std::FILE* f) const { if (f) std::fclose(f); } };
 using File = std::unique_ptr<std::FILE, FileCloser>;
 
@@ -61,6 +65,7 @@ void write_snapshot(const std::string& path, const SnapshotHeader& h, const Bodi
     put<uint64_t>(hdr, 64, h.seed);
     std::memcpy(hdr + kOffScenario, h.scenario.data(), std::min<size_t>(h.scenario.size(), 31));
     std::memcpy(hdr + kOffOffsets, offsets, sizeof offsets);
+    put<uint32_t>(hdr, kOffPieces, h.pieces);
 
     const std::string tmp = path + ".tmp";
     bool ok = false;
@@ -81,10 +86,14 @@ void write_snapshot(const std::string& path, const SnapshotHeader& h, const Bodi
         }
         ok = (std::fflush(f.get()) == 0) && ok;
         if (std::ferror(f.get())) ok = false;
+        // Without fsync a crash after the rename can leave the final name pointing at an empty or
+        // partial file; fclose reports write-back errors (NFS, quota) that fflush may not.
+        ok = ok && ::fsync(fileno(f.get())) == 0;
+        ok = (std::fclose(f.release()) == 0) && ok;
     }
     if (!ok) {
         std::remove(tmp.c_str());
-        fail(path, "write failed (disk full?)");
+        fail(path, "write failed (disk full or I/O error)");
     }
     if (std::rename(tmp.c_str(), path.c_str()) != 0) {
         std::remove(tmp.c_str());
@@ -92,8 +101,11 @@ void write_snapshot(const std::string& path, const SnapshotHeader& h, const Bodi
     }
 }
 
-SnapshotHeader read_snapshot(const std::string& path, Bodies& b) {
-    File f(std::fopen(path.c_str(), "rb"));
+namespace {
+
+// Opens and validates `path`; leaves the array offsets in `offsets`.
+SnapshotHeader read_header(const std::string& path, File& f, uint64_t (&offsets)[kArrays]) {
+    f.reset(std::fopen(path.c_str(), "rb"));
     if (!f) fail(path, "cannot open");
     if (std::fseek(f.get(), 0, SEEK_END) != 0) fail(path, "cannot seek");
     const long end = std::ftell(f.get());
@@ -118,15 +130,29 @@ SnapshotHeader read_snapshot(const std::string& path, Bodies& b) {
     h.seed = get<uint64_t>(hdr, 64);
     h.scenario.assign(reinterpret_cast<const char*>(hdr + kOffScenario),
                       strnlen(reinterpret_cast<const char*>(hdr + kOffScenario), 32));
+    h.pieces = get<uint32_t>(hdr, kOffPieces);
 
     // Bound n before multiplying so a corrupt count cannot overflow the size arithmetic.
     if (h.n > file_size / 4) fail(path, "body count exceeds file size");
-    uint64_t offsets[kArrays];
     std::memcpy(offsets, hdr + kOffOffsets, sizeof offsets);
     for (int i = 0; i < kArrays; ++i)
         if (offsets[i] < kHeaderBytes || offsets[i] > file_size || file_size - offsets[i] < h.n * 4)
             fail(path, "array " + std::to_string(i) + " extends past end of file");
+    return h;
+}
 
+}  // namespace
+
+SnapshotHeader read_snapshot_header(const std::string& path) {
+    File f;
+    uint64_t offsets[kArrays];
+    return read_header(path, f, offsets);
+}
+
+SnapshotHeader read_snapshot(const std::string& path, Bodies& b) {
+    File f;
+    uint64_t offsets[kArrays];
+    SnapshotHeader h = read_header(path, f, offsets);
     Bodies tmp;
     tmp.resize(h.n);
     void* data[kArrays] = {tmp.x.data(),  tmp.y.data(),  tmp.z.data(),  tmp.vx.data(),

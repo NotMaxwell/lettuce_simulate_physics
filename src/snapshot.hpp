@@ -15,8 +15,13 @@ struct SnapshotHeader {
     double dt = 0;
     uint64_t seed = 0;
     std::string scenario;  // at most 31 bytes are stored
+    // Number of pieces (one per rank) the snapshot was written in; 0 in files that predate the field.
+    uint32_t pieces = 0;
 };
 
-// Both throw std::runtime_error with the path on I/O failure or a bad/foreign file.
+// All throw std::runtime_error with the path on I/O failure or a bad/foreign file. The file is
+// written to <path>.tmp, fsync'ed and renamed into place, so `path` is never left half-written.
 void write_snapshot(const std::string& path, const SnapshotHeader& h, const Bodies& b);
 SnapshotHeader read_snapshot(const std::string& path, Bodies& b);
+// The header only (validated against the file size), without reading the arrays.
+SnapshotHeader read_snapshot_header(const std::string& path);
