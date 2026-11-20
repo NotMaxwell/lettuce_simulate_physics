@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <regex>
@@ -63,8 +64,10 @@ std::string numbered(const std::string& dir, const char* stem, uint64_t step, co
 }
 
 // A multi-rank run writes one snapshot piece per rank (snap_<step>_r<k>.snap). Naming any piece
-// restarts from all of them, with any number of ranks.
-std::vector<std::string> restart_pieces(const std::string& path) {
+// restarts from all of them, with any number of ranks. Piece 0's header says how many pieces the
+// snapshot has: a later run with fewer ranks into the same out_dir overwrites only the low pieces,
+// and the stale high ones must not be read. Files without the count fall back to every piece found.
+std::vector<std::string> restart_pieces(const std::string& path, std::FILE* log) {
     static const std::regex piece(R"((.*)_r(\d+)\.snap)");
     std::smatch m;
     if (!std::regex_match(path, m, piece)) return {path};
@@ -78,12 +81,57 @@ std::vector<std::string> restart_pieces(const std::string& path) {
             found.emplace_back(std::stoi(q[2].str()), (dir / fname).string());
     }
     std::sort(found.begin(), found.end());
+    size_t want = found.size();
+    if (!found.empty() && found[0].first == 0) {
+        uint32_t recorded = read_snapshot_header(found[0].second).pieces;
+        if (recorded > 0) want = recorded;
+    }
     std::vector<std::string> out;
+    size_t extra = 0;
     for (size_t k = 0; k < found.size(); ++k) {
+        if (k >= want) {
+            ++extra;
+            continue;
+        }
         if (found[k].first != int(k)) throw std::runtime_error("restart: snapshot piece _r" + std::to_string(k) + " is missing");
         out.push_back(found[k].second);
     }
+    if (out.size() < want) throw std::runtime_error("restart: snapshot piece _r" + std::to_string(out.size()) + " is missing");
+    if (extra)
+        std::fprintf(log, "# warning: ignoring %zu stale snapshot piece%s beyond _r%zu (piece 0 records %zu pieces)\n", extra,
+                     extra == 1 ? "" : "s", want - 1, want);
     return out;
+}
+
+// On restart, drops the rows at or after the restart step (a previous run's, about to be redone)
+// and returns diag.csv open for appending; a fresh run starts the file over.
+std::FILE* open_diag(const fs::path& path, uint64_t step0, const char* header) {
+    if (step0 && fs::exists(path)) {
+        const fs::path tmp = path.string() + ".tmp";
+        {
+            std::ifstream in(path);
+            std::ofstream out(tmp, std::ios::trunc);
+            bool have_header = false;
+            for (std::string line; std::getline(in, line);) {
+                if (line.rfind("step,", 0) == 0) {
+                    if (!have_header) out << line << '\n';
+                    have_header = true;
+                    continue;
+                }
+                char* end = nullptr;
+                unsigned long long s = std::strtoull(line.c_str(), &end, 10);
+                if (end != line.c_str() && *end == ',' && s < step0) out << line << '\n';
+            }
+            if (!have_header) throw std::runtime_error("unexpected contents in " + path.string() + " (no header line)");
+            out.flush();
+            if (!out) throw std::runtime_error("cannot write " + tmp.string());
+        }
+        fs::rename(tmp, path);
+        return std::fopen(path.string().c_str(), "a");
+    }
+    std::FILE* f = std::fopen(path.string().c_str(), "w");
+    if (f) std::fprintf(f, "%s\n", header);
+    return f;
 }
 
 // Appends the bodies with global index in [first, last) from `src`, whose first body has global index `base`.
@@ -129,14 +177,18 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log_in) {
     uint64_t step0 = 0;
     double time = 0;
     if (!cfg.restart.empty()) {
-        auto pieces = restart_pieces(cfg.restart);
-        // Pass 1: counts and the header; pass 2: keep this rank's range. One piece in memory at a time.
+        auto pieces = restart_pieces(cfg.restart, log);
+        // Pass 1: counts from the headers; pass 2: keep this rank's range. One piece in memory at a time.
         std::vector<uint64_t> counts;
-        SnapshotHeader h;
+        const SnapshotHeader h = read_snapshot_header(pieces[0]);
         for (auto& p : pieces) {
-            Bodies tmp;
-            h = read_snapshot(p, tmp);
-            counts.push_back(tmp.size());
+            SnapshotHeader hp = read_snapshot_header(p);
+            if (hp.step != h.step || hp.pieces != h.pieces)
+                throw std::runtime_error("restart: " + p + " is from a different snapshot than " + pieces[0] +
+                                         " (step " + std::to_string(hp.step) + ", " + std::to_string(hp.pieces) +
+                                         " pieces recorded vs step " + std::to_string(h.step) + ", " +
+                                         std::to_string(h.pieces) + ")");
+            counts.push_back(hp.n);
         }
         uint64_t total = 0;
         for (auto c : counts) total += c;
@@ -163,7 +215,7 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log_in) {
     } else {
         // Deterministic from the seed, so every rank builds the same set and keeps its share.
         // Costs N bodies of host memory per rank at start-up (distributed generation would fix that).
-        preflight(cfg.n, cfg.scenario);
+        preflight(scenario_body_count(cfg), cfg.scenario);
         Bodies all = build_scenario(cfg);
         auto unused = cfg.unused_params();
         if (!unused.empty()) {
@@ -186,10 +238,10 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log_in) {
     if (root) {
         fs::create_directories(cfg.out_dir);
         std::ofstream(fs::path(cfg.out_dir) / "config.ini") << dump_config(cfg);
-        csv = std::fopen((fs::path(cfg.out_dir) / "diag.csv").string().c_str(), step0 ? "a" : "w");
-        if (!csv) throw std::runtime_error("cannot write " + (fs::path(cfg.out_dir) / "diag.csv").string());
-        if (!step0)
-            std::fprintf(csv, "step,time,energy,kinetic,potential,virial,momentum,angular_momentum,ms_per_step,interactions\n");
+        const fs::path diag = fs::path(cfg.out_dir) / "diag.csv";
+        csv = open_diag(diag, step0,
+                        "step,time,energy,kinetic,potential,virial,momentum,angular_momentum,ms_per_step,interactions");
+        if (!csv) throw std::runtime_error("cannot write " + diag.string());
     }
     par::barrier();  // out_dir exists before any rank writes into it
 
@@ -255,23 +307,26 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log_in) {
         interval_steps = 0;
     };
 
+    auto periodic_snap = [&](uint64_t step) { return cfg.snap_every && step % cfg.snap_every == 0; };
+    // Collective.
+    auto write_snap = [&](uint64_t step) {
+        be->download(bodies);
+        SnapshotHeader h;
+        h.n = bodies.size();
+        h.step = step;
+        h.time = time;
+        h.G = cfg.G;
+        h.eps = cfg.eps;
+        h.dt = cfg.dt;
+        h.seed = cfg.seed;
+        h.scenario = cfg.scenario;
+        h.pieces = uint32_t(nranks);
+        write_snapshot(numbered(cfg.out_dir, "snap", step, "snap", nranks > 1 ? par::rank() : -1), h, bodies);
+    };
     // Collective.
     auto write_outputs = [&](uint64_t step, bool final_step) {
-        bool snap = (cfg.snap_every && step % cfg.snap_every == 0) || (final_step && cfg.snap_final);
         bool frame = cfg.render_every && step % cfg.render_every == 0;
-        if (snap) {
-            be->download(bodies);
-            SnapshotHeader h;
-            h.n = bodies.size();
-            h.step = step;
-            h.time = time;
-            h.G = cfg.G;
-            h.eps = cfg.eps;
-            h.dt = cfg.dt;
-            h.seed = cfg.seed;
-            h.scenario = cfg.scenario;
-            write_snapshot(numbered(cfg.out_dir, "snap", step, "snap", nranks > 1 ? par::rank() : -1), h, bodies);
-        }
+        if (periodic_snap(step) || (final_step && cfg.snap_final)) write_snap(step);
         if (frame) {
             Bodies sample;
             par::gather_sample(*be, sample, frame_sample_max);
@@ -389,6 +444,9 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log_in) {
             if (!exact_pe) be->compute_forces(fp, true);
             diagnose(step0 + done, true);
         }
+        // The step's periodic outputs went out in the loop; only the final snapshot is still owed.
+        // The stop decision was broadcast, so every rank takes this branch.
+        if (cfg.snap_final && !periodic_snap(step0 + done)) write_snap(step0 + done);
     } else if (cfg.live && cfg.live_hold) {
         publish(step0 + done, true);
         if (live) {

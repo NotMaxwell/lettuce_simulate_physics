@@ -49,4 +49,17 @@ void gather_sample(Backend& be, Bodies& out, uint64_t max_total);
 // This rank's share [first, last) of `n` items split evenly.
 void even_share(uint64_t n, uint64_t& first, uint64_t& last);
 
+// The most bodies one rank may hold after a rebalance: 3/2 of an even share (n itself on one rank).
+// The balancer equalises measured cost, so ranks over cheap outer regions take more bodies than
+// even. Measured worst max/even share (plummer, uniform, disk, collision, systems; 2e5-4e5 bodies):
+// 1.03-1.14 at 4 ranks, 1.09-1.24 at 8, 1.45 (disk) at 16. 3/2 leaves that free while bounding
+// what the memory pre-flight must plan for and keeping coincident bodies (one Morton key) from
+// piling onto one rank.
+uint64_t max_rank_bodies(uint64_t n);
+
+// Host bytes per body a rebalance stages, counted at max_rank_bodies: download 32, cost 4, key 8,
+// order 4, dest 4, send buffers 32, receive buffers 32 (including the copy to itself), the new
+// Bodies 32.
+constexpr uint64_t kRebalanceHostBytesPerBody = 148;
+
 }  // namespace par

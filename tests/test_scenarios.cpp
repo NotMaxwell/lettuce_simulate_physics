@@ -162,3 +162,20 @@ TEST("scenarios: disk is rotating and bound by enclosed mass") {
     c.params["collision.retrograde"] = "1";
     check_sane(build_scenario(c));
 }
+
+TEST("scenarios: scenario_body_count is the generated size") {
+    for (auto& info : scenarios()) {
+        Config c = make(info.name, 1000);
+        CHECK(scenario_body_count(c) == build_scenario(c).size());
+    }
+    Config k = make("kepler", 5000);
+    CHECK(scenario_body_count(k) == 2);
+    // systems.stars overrides n: the count follows stars * (1 + planets), not n.
+    Config s = make("systems", 100);
+    s.params["systems.stars"] = "40";
+    s.params["systems.planets"] = "3";
+    CHECK(scenario_body_count(s) == 160);
+    CHECK(build_scenario(s).size() == 160);
+    Config d = make("systems", 1003);
+    CHECK(scenario_body_count(d) == 1000);  // 200 stars x (1 + 4)
+}

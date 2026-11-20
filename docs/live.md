@@ -18,7 +18,7 @@ ms/step above it.
 | `s` / Step | advance one step (pauses) |
 | `f` / Fit | refit the view to the bodies |
 | `c` / Colour | density, or speed (blue slow, red fast) |
-| Stop | end the run; outputs so far are kept and a final diagnostic is printed |
+| Stop | end the run; outputs so far are kept, a final diagnostic is printed and, with `snap_final`, a final snapshot written |
 
 `steps=0` runs until Stop. A run with a step count keeps serving its final state when it ends
 (`live_hold=false` exits instead). `live_paused=true` starts paused, so you can set up the camera first.

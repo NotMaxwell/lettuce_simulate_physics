@@ -17,3 +17,7 @@ const std::vector<ScenarioInfo>& scenarios();
 // Throws std::runtime_error for an unknown scenario or a bad parameter. Uses cfg.n and cfg.seed
 // (some scenarios fix or round the count; the returned size is authoritative) and cfg.G.
 Bodies build_scenario(const Config& cfg);
+
+// The exact size build_scenario(cfg) will return, without generating anything (for the memory
+// pre-flight). Throws for the same bad count parameters build_scenario does.
+uint64_t scenario_body_count(const Config& cfg);
