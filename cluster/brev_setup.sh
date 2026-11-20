@@ -109,11 +109,19 @@ fi
 if [ "$MODE" = container ]; then
   exec > >(tee "$PWD/out/brev-host.txt") 2>&1
   echo "mode: container ($IMAGE, container $CNAME); host log out/brev-host.txt"
+  # Cap the container below the VM's RAM so a runaway allocation is OOM-killed inside it. Uncapped,
+  # a VM with no swap can stop responding (sshd included) before the kernel's OOM killer acts.
+  MEM_KB=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+  RESERVE_KB=$(( MEM_KB / 10 > 8388608 ? MEM_KB / 10 : 8388608 ))
+  MEMCAP=$(( MEM_KB > RESERVE_KB ? (MEM_KB - RESERVE_KB) * 1024 : 0 ))  # 0: no cap (tiny VM)
+  MEMCAP_ARGS=()
+  [ "$MEMCAP" -gt 0 ] && MEMCAP_ARGS=(--memory "$MEMCAP" --memory-swap "$MEMCAP")
   if "${DOCKER[@]}" container inspect "$CNAME" >/dev/null 2>&1; then
     HAVE_IMG=$("${DOCKER[@]}" inspect -f '{{.Config.Image}}' "$CNAME")
     HAVE_SRC=$("${DOCKER[@]}" inspect -f '{{range .Mounts}}{{if eq .Destination "/work"}}{{.Source}}{{end}}{{end}}' "$CNAME")
-    if [ "$HAVE_IMG" != "$IMAGE" ] || [ "$HAVE_SRC" != "$REPO" ]; then
-      echo "container $CNAME has image $HAVE_IMG, /work=$HAVE_SRC; recreating"
+    HAVE_MEM=$("${DOCKER[@]}" inspect -f '{{.HostConfig.Memory}}' "$CNAME")
+    if [ "$HAVE_IMG" != "$IMAGE" ] || [ "$HAVE_SRC" != "$REPO" ] || [ "$HAVE_MEM" != "$MEMCAP" ]; then
+      echo "container $CNAME has image $HAVE_IMG, /work=$HAVE_SRC, memory cap $HAVE_MEM; recreating"
       "${DOCKER[@]}" rm -f "$CNAME" >/dev/null || die "cannot remove $CNAME"
     fi
   fi
@@ -121,7 +129,8 @@ if [ "$MODE" = container ]; then
     echo "reusing container $CNAME"
     "${DOCKER[@]}" start "$CNAME" >/dev/null || die "docker start $CNAME failed"
   else
-    "${DOCKER[@]}" run -d --name "$CNAME" --gpus all --ipc=host --ulimit memlock=-1 -v "$REPO":/work -w /work "$IMAGE" sleep infinity >/dev/null ||
+    "${DOCKER[@]}" run -d --name "$CNAME" --gpus all --ipc=host --ulimit memlock=-1 \
+      ${MEMCAP_ARGS[@]+"${MEMCAP_ARGS[@]}"} -v "$REPO":/work -w /work "$IMAGE" sleep infinity >/dev/null ||
       die "docker run failed"
   fi
   EXE=()

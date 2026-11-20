@@ -77,6 +77,7 @@ add_library(lettuce_core STATIC
   src/simulation.cpp
   src/live.cpp
   src/parallel.cpp
+  src/memcheck.cpp
   src/stb_impl.cpp
 )
 target_include_directories(lettuce_core PUBLIC src)

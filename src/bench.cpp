@@ -14,6 +14,7 @@
 
 #include "backend.hpp"
 #include "config.hpp"
+#include "memcheck.hpp"
 #include "parallel.hpp"
 #include "scenarios.hpp"
 
@@ -99,6 +100,20 @@ int main(int argc, char** argv) {
             for (auto& nstr : ns) {
                 Config c = cfg;
                 set_key(c, "n", nstr);
+                bool any_tree = false, any_run = false;
+                for (auto& mname : methods) {
+                    any_tree = any_tree || mname == "tree";
+                    any_run = any_run || mname == "tree" || (mname == "direct" && c.n <= direct_max);
+                }
+                if (!any_run) continue;
+                // Checked before generating: building 1e9 bodies alone takes minutes.
+                std::string short_of =
+                    memory_preflight(*be, c.n, any_tree ? ForceMethod::tree : ForceMethod::direct, c.scenario);
+                if (!short_of.empty()) {
+                    if (root) std::printf("# %s n=%s skipped: %s\n", bname.c_str(), nstr.c_str(), short_of.c_str());
+                    std::fflush(stdout);
+                    continue;
+                }
                 Bodies all = build_scenario(c);
                 const uint64_t ntotal = all.size();
                 Bodies b;

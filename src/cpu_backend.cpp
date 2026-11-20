@@ -134,6 +134,13 @@ public:
 
     std::string name() const override { return "cpu: " + std::to_string(nt_) + " threads (OpenMP)"; }
 
+    // Direct: 12 state arrays + costs (52 B/body). Tree adds keys, indices and scratch (32 B/body)
+    // plus nodes; the 110 B/body total is lettuce-bench's measured peak RSS at 3e7 Plummer bodies
+    // (138 B/body) minus the bench's own 32 B/body Bodies.
+    MemoryNeed memory_need(uint64_t n, ForceMethod m) const override {
+        return {0, n * (m == ForceMethod::tree ? 110u : 52u)};
+    }
+
     void upload(const Bodies& b) override {
         n_ = b.size();
         x_ = b.x; y_ = b.y; z_ = b.z;

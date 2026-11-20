@@ -55,8 +55,18 @@ B=build/clang-release      # or build/nvcc-release, per the report's "build:" li
 $B/lettuce-bench backend=cuda method=tree n=1e6,1e7,1e8 steps=3
 $B/lettuce-bench backend=cuda method=tree n=5e8 steps=2
 ```
-Do not run `n=1e9` until the hang below is understood. On several GPUs prefix with
+`lettuce` and `lettuce-bench` check memory before generating the bodies: host (MemAvailable or the
+container's cgroup limit, 90% usable) and GPU (`cudaMemGetInfo`, 97% usable). A body count that does
+not fit is refused (bench: skipped) with how many would fit; `LETTUCE_SKIP_MEMCHECK=1` skips the check.
+The setup script caps the container at the VM's RAM minus max(10%, 8 GB), so a runaway allocation is
+OOM-killed inside it instead of wedging the VM. On several GPUs prefix with
 `mpirun -n <gpus> --bind-to none`.
+
+For the first `n=1e9` attempt (see the open issue below), log memory from a second host shell so a
+hang leaves evidence:
+`while sleep 5; do date +%T; free -m | sed -n 2p; nvidia-smi --query-gpu=memory.used --format=csv,noheader; done >> out/mem.log`
+and `sudo dmesg -w > out/dmesg.log`.
+Generating 1e9 Plummer bodies is single-threaded and takes about 3 minutes before the first step.
 
 ### Measured: Brev H200 SXM, 2026-11-20
 Nebius, 1× H200 141 GB, 16 vCPU, driver 580, built with GCC 13 + nvcc 12.8 (`nvcc-release`, the
@@ -74,8 +84,11 @@ fallback) inside `nvidia/cuda:12.8.1-devel-ubuntu24.04`. Plummer, eps 0.01, thet
 
 Open issues from that run:
 - `n=1e9` printed the bench header, then the VM stopped responding (sshd unreachable; the instance
-  had to be deleted). 5e8 ran fine. Suspect host memory (200 GB RAM) during setup or upload, not
-  GPU memory; not yet investigated.
+  had to be deleted). 5e8 ran fine. Investigated without a GPU (2026-11-19): no 32-bit overflow on
+  the 1e9 path; scenario generation peaked at 88 B/body of host memory (measured to 1e8, ~88 GB at
+  1e9 by extrapolation), now 60 B/body; the GPU needs ~112 B/body (~113 GB at 1e9, from the code
+  and the leaf count measured on the host). Neither budget explains the hang on paper, so the cause
+  is still open; the pre-flight check and the container memory cap are the guards meanwhile.
 - Two CUDA tests fail on the GPU (both duplicate-Morton-key cases): "tree with coincident bodies"
   (theta 0 rel rms 5.1e-5 > 1e-5) and "group walk at theta 0 is exact, with groups split by
   duplicate keys" (interaction count ≠ 3000·2999, pe off by 8.4e-5). The group walk had never run on
@@ -112,6 +125,8 @@ line for `cmake --preset nvcc-release -B "$BUILD"` (GCC ≥ 12, verified, for th
 For several GPUs in one job, use `cluster/asax_multigpu.slurm` (one rank per GPU; see
 [multigpu.md](multigpu.md)). First confirm your account may request more than one GPU per job.
 
-Memory: about 105–117 bytes per body on the GPU in tree mode, so an 80 GB H100 holds roughly 650M
-bodies. This is the CUDA backend author's estimate, not yet measured. Direct summation past ~10⁶
+Memory: about 112 bytes per body on the GPU in tree mode (92 B/body of body arrays plus 92 B per
+tree node, with n/K = 9.2–9.6 bodies per leaf measured for plummer, uniform and disk), so an 80 GB
+H100 holds roughly 700M bodies. Not yet measured on a GPU. Host: 60 B/body while generating
+(66 for disk/collision), then 32 B/body, per rank: every rank generates all bodies. Direct summation past ~10⁶
 bodies is only useful as a check.

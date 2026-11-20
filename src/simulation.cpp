@@ -9,6 +9,7 @@
 #include <stdexcept>
 
 #include "live.hpp"
+#include "memcheck.hpp"
 #include "parallel.hpp"
 #include "render.hpp"
 #include "scenarios.hpp"
@@ -115,6 +116,14 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log_in) {
     std::FILE* devnull = root ? nullptr : std::fopen("/dev/null", "w");
     std::FILE* log = root ? log_in : devnull;
 
+    // Chosen first so the memory pre-flight can ask it what n bodies will cost.
+    std::string note;
+    auto local = select_backend(cfg, note);
+    auto preflight = [&](uint64_t total, const std::string& scenario) {
+        std::string why = memory_preflight(*local, total, resolve_method(cfg, total), scenario);
+        if (!why.empty()) throw std::runtime_error(why);
+    };
+
     // Every rank ends up with an even share of the bodies; the first tree force call rebalances.
     Bodies bodies;
     uint64_t step0 = 0;
@@ -131,6 +140,7 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log_in) {
         }
         uint64_t total = 0;
         for (auto c : counts) total += c;
+        preflight(total, "");
         uint64_t first, last;
         par::even_share(total, first, last);
         uint64_t base = 0;
@@ -153,6 +163,7 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log_in) {
     } else {
         // Deterministic from the seed, so every rank builds the same set and keeps its share.
         // Costs N bodies of host memory per rank at start-up (distributed generation would fix that).
+        preflight(cfg.n, cfg.scenario);
         Bodies all = build_scenario(cfg);
         auto unused = cfg.unused_params();
         if (!unused.empty()) {
@@ -182,8 +193,6 @@ RunSummary run_simulation(const Config& cfg, std::FILE* log_in) {
     }
     par::barrier();  // out_dir exists before any rank writes into it
 
-    std::string note;
-    auto local = select_backend(cfg, note);
     par::DistOptions dopt;
     dopt.rebalance_every = cfg.rebalance_every;
     auto be = par::make_distributed(std::move(local), dopt);

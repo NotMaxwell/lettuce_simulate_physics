@@ -7,6 +7,7 @@
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <utility>
 
 namespace {
 
@@ -35,6 +36,9 @@ struct Rng {
 struct Pts {
     std::vector<double> x, y, z, vx, vy, vz, m;
     size_t size() const { return x.size(); }
+    void reserve(size_t n) {
+        for (auto* v : {&x, &y, &z, &vx, &vy, &vz, &m}) v->reserve(n);
+    }
     void add(double px, double py, double pz, double pvx, double pvy, double pvz, double pm) {
         x.push_back(px); y.push_back(py); z.push_back(pz);
         vx.push_back(pvx); vy.push_back(pvy); vz.push_back(pvz);
@@ -43,7 +47,9 @@ struct Pts {
 };
 
 // Subtracts the centre-of-mass position and velocity in double before rounding to float.
-Bodies finish(const Pts& p) {
+// Converts one column at a time and frees its doubles straight away: holding all 56 B/body of
+// doubles next to the 32 B/body result set the host-memory peak (88 GB at 1e9 bodies).
+Bodies finish(Pts&& p) {
     const size_t n = p.size();
     double M = 0, c[3] = {0, 0, 0}, v[3] = {0, 0, 0};
     for (size_t i = 0; i < n; ++i) {
@@ -53,10 +59,16 @@ Bodies finish(const Pts& p) {
     }
     for (int k = 0; k < 3; ++k) { c[k] /= M; v[k] /= M; }
     Bodies b;
-    b.reserve(n);
-    for (size_t i = 0; i < n; ++i)
-        b.push(p.x[i] - c[0], p.y[i] - c[1], p.z[i] - c[2], p.vx[i] - v[0], p.vy[i] - v[1],
-               p.vz[i] - v[2], p.m[i]);
+    auto convert = [n](std::vector<double>& src, std::vector<float>& dst, double shift) {
+        dst.resize(n);
+        for (size_t i = 0; i < n; ++i) dst[i] = float(src[i] - shift);
+        std::vector<double>().swap(src);
+    };
+    convert(p.x, b.x, c[0]); convert(p.y, b.y, c[1]); convert(p.z, b.z, c[2]);
+    convert(p.vx, b.vx, v[0]); convert(p.vy, b.vy, v[1]); convert(p.vz, b.vz, v[2]);
+    convert(p.m, b.m, 0);
+    b.id.resize(n);
+    for (size_t i = 0; i < n; ++i) b.id[i] = static_cast<uint32_t>(i);
     return b;
 }
 
@@ -111,11 +123,12 @@ Bodies build_plummer(const Config& c) {
     double cut = positive(c, "plummer.cut", 20);
     Rng rng(c.seed);
     Pts p;
+    p.reserve(c.n);
     for (uint64_t i = 0; i < c.n; ++i) {
         auto s = sample_plummer(rng, c.G, M, a, cut);
         p.add(s.x, s.y, s.z, s.vx, s.vy, s.vz, M / c.n);
     }
-    return finish(p);
+    return finish(std::move(p));
 }
 
 Bodies build_kepler(const Config& c) {
@@ -128,7 +141,7 @@ Bodies build_kepler(const Config& c) {
     Pts p;
     p.add(-m2 / M * ra, 0, 0, 0, -m2 / M * va, 0, m1);
     p.add(m1 / M * ra, 0, 0, 0, m1 / M * va, 0, m2);
-    return finish(p);
+    return finish(std::move(p));
 }
 
 Bodies build_uniform(const Config& c) {
@@ -140,6 +153,7 @@ Bodies build_uniform(const Config& c) {
     double omega = spin * std::sqrt(c.G * M / (R * R * R));
     Rng rng(c.seed);
     Pts p;
+    p.reserve(c.n);
     for (uint64_t i = 0; i < c.n; ++i) {
         double x, y, z;
         if (shape == "cube") {
@@ -153,7 +167,7 @@ Bodies build_uniform(const Config& c) {
         double vz = sigma * rng.normal();
         p.add(x, y, z, vx, vy, vz, M / c.n);
     }
-    return finish(p);
+    return finish(std::move(p));
 }
 
 struct DiskParams {
@@ -226,8 +240,9 @@ Bodies build_disk(const Config& c) {
     DiskParams d = read_disk(c);
     Rng rng(c.seed);
     Pts p;
+    p.reserve(c.n);
     add_disk(p, rng, c, d, c.n, {});
-    return finish(p);
+    return finish(std::move(p));
 }
 
 Bodies build_collision(const Config& c) {
@@ -244,6 +259,7 @@ Bodies build_collision(const Config& c) {
 
     Rng rng(c.seed);
     Pts p;
+    p.reserve(c.n);
     DiskPlacement a, b;
     a.cx = -sep / 2; a.cy = -impact / 2; a.vx = vrel * M2 / (M1 + M2);
     b.cx = sep / 2;  b.cy = impact / 2;  b.vx = -vrel * M1 / (M1 + M2);
@@ -251,7 +267,7 @@ Bodies build_collision(const Config& c) {
     b.spin = retro ? -1 : 1;
     add_disk(p, rng, c, d, n1, a);
     add_disk(p, rng, c, d, n2, b);
-    return finish(p);
+    return finish(std::move(p));
 }
 
 struct Planet { const char* name; double a, e, inc, node, peri, mass; };
@@ -319,7 +335,7 @@ Bodies build_solar(const Config& c) {
         orbit_state(c.G * (1 + kAsteroidMass), a, e, inc, node, omega, M, pos, vel);
         p.add(pos[0], pos[1], pos[2], vel[0], vel[1], vel[2], kAsteroidMass);
     }
-    return finish(p);
+    return finish(std::move(p));
 }
 
 Bodies build_systems(const Config& c) {
@@ -359,7 +375,7 @@ Bodies build_systems(const Config& c) {
                   st.vz + v * (-sn * e1z + ct * e2z), fm * ms);
         }
     }
-    return finish(p);
+    return finish(std::move(p));
 }
 
 }  // namespace

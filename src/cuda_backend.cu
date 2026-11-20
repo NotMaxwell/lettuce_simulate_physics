@@ -17,7 +17,8 @@
 //   ~ 105-117 B/body total, so 80 GB holds ~650M bodies. Nodes are sized from the actual K.
 //   Remote LETs (compute_forces_with) add 48 B per LET node and 16 B per LET body, grow-only.
 //
-// Limits: n < 2^31 (int body/node indices; checked in upload()).
+// Limits: int body and node indices. upload() refuses n >= 2^31-1 bodies; build_tree_impl()
+// refuses a tree of more than 2^31-1 nodes (2K-1 for K leaves).
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
 #include <cub/device/device_select.cuh>
@@ -70,6 +71,7 @@ public:
         cap_ = bytes;
     }
     template <class T> T* as() const { return static_cast<T*>(p_); }
+    std::size_t capacity() const { return cap_; }
     friend void swap(DevBuf& a, DevBuf& b) noexcept {
         std::swap(a.p_, b.p_);
         std::swap(a.cap_, b.cap_);
@@ -1097,6 +1099,36 @@ public:
 
     std::string name() const override { return name_; }
 
+    // Mirrors reserve_bodies (92 B/body) and build_tree_impl + make_groups (92 B per node, 2K-1
+    // nodes, plus 8 B per leaf), with K = n/8 leaves: lettuce's leaf rule replayed on the host gives
+    // n/K = 9.2-9.6 for plummer, uniform and disk at 1e6-1e8. Host: export_let's node copy (48 B/node).
+    MemoryNeed memory_need(uint64_t n, ForceMethod m) const override {
+        MemoryNeed r;
+        r.device = 92 * n + (uint64_t(256) << 20);  // + CUB temporary storage and the small buffers
+        if (m == ForceMethod::tree) {
+            const uint64_t K = n / 8 + 1, nodes = 2 * K - 1;
+            r.device += 92 * nodes + 8 * K;
+            r.host = 48 * nodes;
+        }
+        return r;
+    }
+
+    bool device_memory(uint64_t& free_bytes, uint64_t& total_bytes) override {
+        CK(cudaSetDevice(dev_));
+        std::size_t f = 0, t = 0;
+        CK(cudaMemGetInfo(&f, &t));
+        // What this backend already holds counts as free: a grow-only buffer that must grow is freed
+        // before it is reallocated, and the estimate covers every buffer again.
+        std::size_t held = 0;
+        for (const DevBuf* b : {&x_, &y_, &z_, &vx_, &vy_, &vz_, &m_, &id_, &ax_, &ay_, &az_, &pot_, &posm_, &keys_[0],
+                                &keys_[1], &idx_[0], &idx_[1], &nodeA_, &nodeB_, &nodeC_, &bmin_, &bmax_, &parent_,
+                                &counter_, &nodeR_, &groups_, &counts_, &temp_})
+            held += b->capacity();
+        free_bytes = f + held;
+        total_bytes = t;
+        return true;
+    }
+
     void upload(const Bodies& b) override {
         CK(cudaSetDevice(dev_));
         const std::size_t n = b.size();
@@ -1691,6 +1723,8 @@ private:
         CK(cudaMemcpyAsync(&K, dK, sizeof K, cudaMemcpyDeviceToHost, s));
         CK(cudaStreamSynchronize(s));
         if (K < 1 || K > n) throw std::runtime_error("cuda tree build: bad leaf count " + std::to_string(K));
+        if (2 * static_cast<std::size_t>(K) - 1 > static_cast<std::size_t>(INT32_MAX))
+            throw std::runtime_error("cuda tree build: " + std::to_string(K) + " leaves exceed the 2^31-1 node index limit");
 
         const std::size_t nodes = 2 * static_cast<std::size_t>(K) - 1;
         for (DevBuf* b : {&nodeA_, &nodeB_, &nodeC_, &bmin_, &bmax_}) b->reserve(nodes * sizeof(float4));

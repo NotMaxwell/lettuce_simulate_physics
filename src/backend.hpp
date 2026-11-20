@@ -18,6 +18,13 @@ struct ForceParams {
     ForceMethod method = ForceMethod::direct;
 };
 
+// Storage a backend allocates for n resident bodies, so a run can be refused before its bodies are
+// generated. Estimates, not bounds: tree storage depends on how the bodies are distributed.
+struct MemoryNeed {
+    uint64_t device = 0;  // device bytes
+    uint64_t host = 0;    // host bytes, beyond the caller's own Bodies
+};
+
 // Reductions over the current state, in double. Velocities are whatever the backend holds, so
 // call this only when they are synchronous with positions (after the closing half kick).
 struct Diag {
@@ -119,6 +126,15 @@ public:
     // not rebuild it. compute_forces(p, pot) is equivalent to build_tree(p) + compute_forces_with(p, pot, {}).
     virtual void compute_forces_with(const ForceParams& p, bool potential,
                                      const std::vector<const LetTree*>& remote) = 0;
+    // Pre-flight support (memcheck.hpp). Zero where the backend cannot tell.
+    virtual MemoryNeed memory_need(uint64_t n, ForceMethod m) const { (void)n; (void)m; return {}; }
+    // Free and total memory of the backend's device, free including what the backend itself holds
+    // (it can be reused for the next upload); false for a host-only backend.
+    virtual bool device_memory(uint64_t& free_bytes, uint64_t& total_bytes) {
+        (void)free_bytes; (void)total_bytes;
+        return false;
+    }
+
     // Optional: per-body cost of the last force call (e.g. interactions), in download() order, for
     // load balancing. Returns false if not provided; the MPI layer then balances by body count.
     virtual bool body_costs(std::vector<float>& cost) { (void)cost; return false; }

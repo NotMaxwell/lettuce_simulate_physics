@@ -188,6 +188,8 @@ public:
         calls_since_balance_ = opt_.rebalance_every;  // the first tree force call rebalances
     }
     void download(Bodies& b) override { local_->download(b); }
+    MemoryNeed memory_need(uint64_t n, ForceMethod m) const override { return local_->memory_need(n, m); }
+    bool device_memory(uint64_t& f, uint64_t& t) override { return local_->device_memory(f, t); }
 
     void compute_forces(const ForceParams& p, bool potential) override {
         auto t0 = Clock::now();
