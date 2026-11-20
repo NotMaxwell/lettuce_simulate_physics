@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include "backend.hpp"
@@ -28,6 +29,7 @@ constexpr int kMaxLevel = 21;     // Morton bits per axis
 constexpr int kSmallLeaf = 4;     // accepted leaves this small are summed directly: exact and no dearer
 constexpr int kRadixBits = 11;
 constexpr int kRadixBuckets = 1 << kRadixBits;
+constexpr std::size_t kParMin = 1 << 16;  // key restarts on fewer bodies than this run serially
 
 // One cache line. Children of a node are contiguous and have larger indices than the node,
 // so a reverse index sweep is a valid bottom-up order.
@@ -404,52 +406,64 @@ private:
         ox_ = mnx; oy_ = mny; oz_ = mnz; side_ = side;
 
         grow(key_, n); grow(key2_, n); grow(idx_, n); grow(idx2_, n);
+        grow(tmpf_, n); grow(tmpu_, n);
+        make_keys(0, n, ox_, oy_, oz_, side, true);
+        radix_sort(0, n, nt_);
+        // Bodies stay sorted between calls, so the next sort starts from nearly sorted input and
+        // the permute is close to a streaming copy.
+        permute(0, n, true);
+    }
+
+    // Morton keys of bodies [lo, hi) in the cube of the given side at (ox, oy, oz); idx_ = identity.
+    void make_keys(std::size_t lo, std::size_t hi, double ox, double oy, double oz, double side, bool par) {
         const double s = double(1u << kMaxLevel) / side;
         const double lim = double((1u << kMaxLevel) - 1);
-#pragma omp parallel for num_threads(nt_) schedule(static)
-        for (long i = 0; i < ln; ++i) {
+        const long l0 = long(lo), l1 = long(hi);
+#pragma omp parallel for num_threads(nt_) schedule(static) if (par)
+        for (long i = l0; i < l1; ++i) {
             auto q = [&](float v, double o) { return uint64_t(std::clamp((double(v) - o) * s, 0.0, lim)); };
-            key_[i] = spread21(q(x_[i], ox_)) << 2 | spread21(q(y_[i], oy_)) << 1 | spread21(q(z_[i], oz_));
+            key_[i] = spread21(q(x_[i], ox)) << 2 | spread21(q(y_[i], oy)) << 1 | spread21(q(z_[i], oz));
             idx_[i] = uint32_t(i);
-        }
-        radix_sort();
-
-        // Gather every array into sorted order; bodies stay sorted between calls, so the next
-        // sort starts from nearly sorted input and the permute is close to a streaming copy.
-        grow(tmpf_, n); grow(tmpu_, n);
-        for (auto* a : {&x_, &y_, &z_, &vx_, &vy_, &vz_, &m_}) {
-            float* src = a->data();
-            float* dst = tmpf_.data();
-#pragma omp parallel for num_threads(nt_) schedule(static)
-            for (long i = 0; i < ln; ++i) dst[i] = src[idx_[i]];
-            std::memcpy(src, dst, n * sizeof(float));
-        }
-#pragma omp parallel for num_threads(nt_) schedule(static)
-        for (long i = 0; i < ln; ++i) tmpu_[i] = id_[idx_[i]];
-        std::memcpy(id_.data(), tmpu_.data(), n * sizeof(uint32_t));
-        if (cost_.size() == n) {
-#pragma omp parallel for num_threads(nt_) schedule(static)
-            for (long i = 0; i < ln; ++i) tmpf_[i] = cost_[idx_[i]];
-            std::memcpy(cost_.data(), tmpf_.data(), n * sizeof(float));
         }
     }
 
-    // Stable parallel LSD radix sort of (key_, idx_); passes whose digit is constant are skipped.
-    void radix_sort() {
-        const std::size_t n = n_;
-        const int T = nt_;
+    // Gathers every body array in [lo, hi) into the order idx_ gives.
+    void permute(std::size_t lo, std::size_t hi, bool par) {
+        const long l0 = long(lo), l1 = long(hi);
+        const std::size_t n = hi - lo;
+        for (auto* a : {&x_, &y_, &z_, &vx_, &vy_, &vz_, &m_}) {
+            float* src = a->data();
+            float* dst = tmpf_.data();
+#pragma omp parallel for num_threads(nt_) schedule(static) if (par)
+            for (long i = l0; i < l1; ++i) dst[i] = src[idx_[i]];
+            std::memcpy(src + lo, dst + lo, n * sizeof(float));
+        }
+#pragma omp parallel for num_threads(nt_) schedule(static) if (par)
+        for (long i = l0; i < l1; ++i) tmpu_[i] = id_[idx_[i]];
+        std::memcpy(id_.data() + lo, tmpu_.data() + lo, n * sizeof(uint32_t));
+        if (cost_.size() == n_) {
+#pragma omp parallel for num_threads(nt_) schedule(static) if (par)
+            for (long i = l0; i < l1; ++i) tmpf_[i] = cost_[idx_[i]];
+            std::memcpy(cost_.data() + lo, tmpf_.data() + lo, n * sizeof(float));
+        }
+    }
+
+    // Stable LSD radix sort of (key_, idx_) over [lo, hi) with T threads; passes whose digit is
+    // constant are skipped.
+    void radix_sort(std::size_t lo, std::size_t hi, int T) {
+        const std::size_t n = hi - lo;
         hist_.assign(std::size_t(T) * kRadixBuckets, 0);
-        uint64_t *ks = key_.data(), *kd = key2_.data();
-        uint32_t *is = idx_.data(), *id = idx2_.data();
+        uint64_t *ks = key_.data() + lo, *kd = key2_.data() + lo;
+        uint32_t *is = idx_.data() + lo, *id = idx2_.data() + lo;
         for (int shift = 0; shift < 63; shift += kRadixBits) {
             bool skip = false;
 #pragma omp parallel num_threads(T)
             {
                 const int t = omp_get_thread_num(), nth = omp_get_num_threads();
-                const std::size_t lo = n * t / nth, hi = n * (t + 1) / nth;
+                const std::size_t b0 = n * t / nth, b1 = n * (t + 1) / nth;
                 std::size_t* h = &hist_[std::size_t(t) * kRadixBuckets];
                 std::fill(h, h + kRadixBuckets, 0);
-                for (std::size_t i = lo; i < hi; ++i) ++h[(ks[i] >> shift) & (kRadixBuckets - 1)];
+                for (std::size_t i = b0; i < b1; ++i) ++h[(ks[i] >> shift) & (kRadixBuckets - 1)];
 #pragma omp barrier
 #pragma omp single
                 {
@@ -466,7 +480,7 @@ private:
                     }
                 }
                 if (!skip) {
-                    for (std::size_t i = lo; i < hi; ++i) {
+                    for (std::size_t i = b0; i < b1; ++i) {
                         std::size_t dst = h[(ks[i] >> shift) & (kRadixBuckets - 1)]++;
                         kd[dst] = ks[i];
                         id[dst] = is[i];
@@ -475,14 +489,60 @@ private:
             }
             if (!skip) { std::swap(ks, kd); std::swap(is, id); }
         }
-        if (ks != key_.data()) { key_.swap(key2_); idx_.swap(idx2_); }
+        if (ks == key_.data() + lo) return;
+        if (lo == 0 && hi == n_) {
+            key_.swap(key2_); idx_.swap(idx2_);
+        } else {
+            std::memcpy(key_.data() + lo, ks, n * sizeof(uint64_t));
+            std::memcpy(idx_.data() + lo, is, n * sizeof(uint32_t));
+        }
+    }
+
+    // Re-keys bodies [lo, hi) in their own bounding cube, re-sorts them and returns that cube.
+    // False (nothing changed) if they all coincide.
+    bool rekey(uint32_t lo, uint32_t hi, double& gx, double& gy, double& gz, double& half) {
+        const long l0 = long(lo), l1 = long(hi);
+        float mnx = x_[lo], mny = y_[lo], mnz = z_[lo], mxx = mnx, mxy = mny, mxz = mnz;
+#pragma omp parallel for num_threads(nt_) if (hi - lo >= kParMin) \
+    reduction(min : mnx, mny, mnz) reduction(max : mxx, mxy, mxz)
+        for (long i = l0; i < l1; ++i) {
+            mnx = std::min(mnx, x_[i]); mny = std::min(mny, y_[i]); mnz = std::min(mnz, z_[i]);
+            mxx = std::max(mxx, x_[i]); mxy = std::max(mxy, y_[i]); mxz = std::max(mxz, z_[i]);
+        }
+        double side = std::max({double(mxx) - mnx, double(mxy) - mny, double(mxz) - mnz});
+        if (side == 0) return false;
+        side *= 1 + 1e-6;
+        const bool par = hi - lo >= kParMin;
+        make_keys(lo, hi, mnx, mny, mnz, side, par);
+        if (!par) {
+            // Ties broken by index: the same order a stable radix sort gives.
+            std::vector<std::pair<uint64_t, uint32_t>> kv(hi - lo);
+            for (uint32_t i = lo; i < hi; ++i) kv[i - lo] = {key_[i], i};
+            std::sort(kv.begin(), kv.end());
+            for (uint32_t i = lo; i < hi; ++i) { key_[i] = kv[i - lo].first; idx_[i] = kv[i - lo].second; }
+        } else {
+            radix_sort(lo, hi, nt_);
+        }
+        permute(lo, hi, par);
+        half = 0.5 * side;
+        gx = mnx + half; gy = mny + half; gz = mnz + half;
+        return true;
     }
 
     // ---- build -----------------------------------------------------------------------------
-    void build_node(uint32_t ni, int level, double gx, double gy, double gz, double half, bool in_group) {
+    // level counts Morton levels within the current key frame, depth counts levels from the root.
+    void build_node(uint32_t ni, int level, int depth, double gx, double gy, double gz, double half, bool in_group) {
         const uint32_t lo = nodes_[ni].lo, hi = nodes_[ni].hi;
+        max_depth_ = std::max(max_depth_, depth);
+        bool leaf = hi - lo <= uint32_t(kLeafMax);
+        // Keys exhausted with too many bodies: unless they coincide (kept as one exact leaf),
+        // restart the keys in this node's own bounding cube. Otherwise one far body packs a whole
+        // cluster into one leaf and one walk group, and the walk goes O(N^2).
+        if (!leaf && level == kMaxLevel) {
+            if (rekey(lo, hi, gx, gy, gz, half)) level = 0;
+            else leaf = true;
+        }
         geo_[ni] = {float(gx), float(gy), float(gz), float(half)};
-        const bool leaf = hi - lo <= uint32_t(kLeafMax) || level == kMaxLevel;
         if (!in_group && (hi - lo <= uint32_t(kGroupMax) || leaf)) {
             groups_.push_back({0, 0, 0, 0, 0, 0, lo, hi});
             in_group = true;
@@ -517,19 +577,20 @@ private:
         uint32_t c = first;
         for (int o = 0; o < 8; ++o) {
             if (bound[o + 1] == bound[o]) continue;
-            build_node(c++, level + 1, gx + ((o & 4) ? q : -q), gy + ((o & 2) ? q : -q), gz + ((o & 1) ? q : -q), q,
-                       in_group);
+            build_node(c++, level + 1, depth + 1, gx + ((o & 4) ? q : -q), gy + ((o & 2) ? q : -q),
+                       gz + ((o & 1) ? q : -q), q, in_group);
         }
     }
 
     void build_octree(double theta) {
         nodes_.clear(); geo_.clear(); groups_.clear(); leaves_.clear();
+        max_depth_ = 0;
         Node root{};
         root.lo = 0; root.hi = uint32_t(n_);
         nodes_.push_back(root);
         geo_.resize(1);
         const double h = 0.5 * side_;
-        build_node(0, 0, ox_ + h, oy_ + h, oz_ + h, h, false);
+        build_node(0, 0, 0, ox_ + h, oy_ + h, oz_ + h, h, false);
 
         const float inv_theta = theta > 0 ? float(1.0 / theta) : std::numeric_limits<float>::max();
         auto finish = [&](Node& nd, const Geo& g) {
@@ -610,7 +671,8 @@ private:
 #pragma omp parallel num_threads(nt_) reduction(+ : inter)
         {
             WalkScratch& s = scratch_[omp_get_thread_num()];
-            if (s.stack.size() < 8 * (kMaxLevel + 2)) s.stack.resize(8 * (kMaxLevel + 2));
+            const std::size_t stack_need = 8 * std::size_t(max_depth_ + 2);
+            if (s.stack.size() < stack_need) s.stack.resize(stack_need);
 #pragma omp for schedule(dynamic, 4)
             for (long g = 0; g < ng; ++g) {
                 const Group& gr = groups_[g];
@@ -769,7 +831,7 @@ private:
             } else if (nd.nchild == 0) {
                 push_bodies(s, nd.lo, nd.hi);
             } else {
-                // Depth-first with at most 7 pending siblings per level: bounded by 8*(levels+1).
+                // Depth-first with at most 7 pending siblings per level: bounded by 8*(max_depth_+1).
                 for (uint32_t c = nd.first + nd.nchild; c-- > nd.first;) s.stack[sp++] = c;
             }
         }
@@ -840,6 +902,7 @@ private:
     std::vector<Geo> geo_;
     std::vector<Group> groups_;
     std::vector<uint32_t> leaves_;
+    int max_depth_ = 0;  // deepest node; key restarts let it exceed kMaxLevel
     std::vector<WalkScratch> scratch_;
 };
 

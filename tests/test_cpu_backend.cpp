@@ -299,3 +299,37 @@ TEST("cpu: huge theta is finite and momentum-sane") {
         CHECK(std::fabs(px) < 1.0);
     }
 }
+
+// One far escaper used to pack the whole cluster into a single depth-21 Morton cell, i.e. one leaf
+// and one walk group, so the walk went O(N^2). A tight clump inside the cluster needs a second key
+// restart, and its coincident subset must stay one exact leaf.
+TEST("cpu: far escaper keeps the tree accurate and the walk O(N log N)") {
+    Bodies b = plummer(20000, 7);
+    for (int i = 0; i < 60; ++i) {
+        const float d = i < 20 ? 0.f : 1e-6f * float(i % 7 - 3);
+        b.x[i] = 0.3f + d; b.y[i] = 0.3f - 0.5f * d; b.z[i] = 0.3f + 0.25f * d;
+    }
+    auto be = make_cpu_backend(0);
+    be->upload(b);
+    be->compute_forces(tree(0.6), false);
+    const double base = double(be->times().interactions);
+
+    Bodies f = b;
+    f.x[100] = 1e8f;
+    auto ad = accel(*be, f, ForceParams{.eps = 0.01});
+    const double e6 = rel_rms(accel(*be, f, tree(0.6)), ad);
+    const double esc = double(be->times().interactions);
+    const double e0 = rel_rms(accel(*be, f, tree(0.0)), ad);
+    std::fprintf(stderr, "  escaper: rel rms theta=0.6 %.3g, theta=0 %.3g; interactions %.3g vs %.3g without\n", e6, e0,
+                 esc, base);
+    CHECK(e6 <= 1e-3);
+    CHECK(e0 <= 1e-5);
+    CHECK(esc <= 1.2 * base);
+
+    Bodies o;
+    be->download(o);
+    std::vector<int> seen(o.size(), 0);
+    for (uint32_t id : o.id) ++seen[id];
+    CHECK(std::all_of(seen.begin(), seen.end(), [](int s) { return s == 1; }));
+    CHECK(all_finite(o));
+}
