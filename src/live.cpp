@@ -13,6 +13,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <stdexcept>
 
@@ -22,14 +23,29 @@ using Clock = std::chrono::steady_clock;
 
 extern const char* const kPage;
 
+// Per-connection-thread shutdown probe, so send_all need not be threaded through every helper.
+thread_local const std::function<bool()>* t_quit = nullptr;
+
+constexpr int kSendStallMs = 10000;
+
+// A stalled peer must neither block shutdown nor pin a thread forever: wait in short polls, give up
+// when the server quits or the socket makes no progress for kSendStallMs.
 bool send_all(int fd, const void* data, size_t len) {
     const char* p = static_cast<const char*>(data);
+    int stalled_ms = 0;
     while (len > 0) {
-        ssize_t k = ::send(fd, p, len, 0);
+        ssize_t k = ::send(fd, p, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (k > 0) {
+            p += k;
+            len -= static_cast<size_t>(k);
+            stalled_ms = 0;
+            continue;
+        }
         if (k < 0 && errno == EINTR) continue;
-        if (k <= 0) return false;
-        p += k;
-        len -= static_cast<size_t>(k);
+        if (k == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) return false;
+        if ((t_quit && (*t_quit)()) || stalled_ms >= kSendStallMs) return false;
+        pollfd pf{fd, POLLOUT, 0};
+        if (::poll(&pf, 1, 100) == 0) stalled_ms += 100;
     }
     return true;
 }
@@ -64,6 +80,14 @@ bool parse_num(const std::string& s, double& v) {
     if (s.empty() || *end != 0 || !std::isfinite(x)) return false;
     v = x;
     return true;
+}
+
+// JSON has no nan/inf; the page treats null as "no value".
+std::string json_num(double v, const char* fmt) {
+    if (!std::isfinite(v)) return "null";
+    char b[64];
+    std::snprintf(b, sizeof b, fmt, v);
+    return b;
 }
 
 std::string json_str(const std::string& s) {
@@ -203,6 +227,8 @@ void LiveView::render_loop() {
         ro.height = height_;
         ro.view = std::to_string(yaw_) + "," + std::to_string(pitch_);
         ro.extent = base_extent_ > 0 ? base_extent_ / zoom_ : 0;
+        const double used_zoom = zoom_;
+        const uint64_t used_gen = fit_gen_;
         ro.color = color_;
         const int quality = opt_.quality;
         busy_ = true;
@@ -224,7 +250,8 @@ void LiveView::render_loop() {
         busy_ = false;
         if (jpeg.empty()) continue;
         // An auto-fitted frame fixes the extent, so zooming and rotating do not rescale on their own.
-        if (ro.extent == 0) base_extent_ = fitted * zoom_;
+        // The fitted extent is for the zoom it was rendered at; a "fit" request meanwhile voids it.
+        if (ro.extent == 0 && used_gen == fit_gen_) base_extent_ = fitted * used_zoom;
         jpeg_ = std::move(jpeg);
         ++seq_;
         render_ms_ = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -263,6 +290,12 @@ void LiveView::accept_loop() {
 }
 
 void LiveView::serve(int fd) {
+    const std::function<bool()> quit = [this] {
+        std::lock_guard lk(mu_);
+        return quit_;
+    };
+    t_quit = &quit;
+    struct Reset { ~Reset() { t_quit = nullptr; } } reset;
     std::string buf;
     char chunk[4096];
     while (true) {
@@ -352,17 +385,18 @@ void LiveView::serve(int fd) {
 std::string LiveView::status_json() {
     std::lock_guard lk(mu_);
     const LiveStats& s = stats_;
-    char num[1024];
-    std::snprintf(num, sizeof num,
-                  "\"n\":%llu,\"step\":%llu,\"last_step\":%llu,\"time\":%.9g,\"diag_step\":%llu,\"de\":%.6g,"
-                  "\"virial\":%.6g,\"ms_per_step\":%.6g,\"finished\":%s,\"paused\":%s,\"stopped\":%s,"
-                  "\"yaw\":%.6g,\"pitch\":%.6g,\"zoom\":%.6g,\"width\":%d,\"height\":%d,\"fps\":%.3g,"
-                  "\"render_ms\":%.4g,\"clients\":%d,\"frame\":%llu",
-                  static_cast<unsigned long long>(s.n), static_cast<unsigned long long>(s.step),
-                  static_cast<unsigned long long>(s.last_step), s.time, static_cast<unsigned long long>(s.diag_step),
-                  s.de, s.virial, s.ms_per_step, s.finished ? "true" : "false", paused_ ? "true" : "false",
-                  stop_ ? "true" : "false", yaw_, pitch_, zoom_, width_, height_, fps_, render_ms_, clients_,
-                  static_cast<unsigned long long>(seq_));
+    auto u = [](uint64_t v) { return std::to_string(v); };
+    auto bl = [](bool v) { return v ? "true" : "false"; };
+    const std::string num =
+        "\"n\":" + u(s.n) + ",\"step\":" + u(s.step) + ",\"last_step\":" + u(s.last_step) +
+        ",\"time\":" + json_num(s.time, "%.9g") + ",\"diag_step\":" + u(s.diag_step) +
+        ",\"de\":" + json_num(s.de, "%.6g") + ",\"virial\":" + json_num(s.virial, "%.6g") +
+        ",\"ms_per_step\":" + json_num(s.ms_per_step, "%.6g") + ",\"finished\":" + bl(s.finished) +
+        ",\"paused\":" + bl(paused_) + ",\"stopped\":" + bl(stop_) + ",\"yaw\":" + json_num(yaw_, "%.6g") +
+        ",\"pitch\":" + json_num(pitch_, "%.6g") + ",\"zoom\":" + json_num(zoom_, "%.6g") +
+        ",\"width\":" + std::to_string(width_) + ",\"height\":" + std::to_string(height_) +
+        ",\"fps\":" + json_num(fps_, "%.3g") + ",\"render_ms\":" + json_num(render_ms_, "%.4g") +
+        ",\"clients\":" + std::to_string(clients_) + ",\"frame\":" + u(seq_);
     return "{\"scenario\":" + json_str(s.scenario) + ",\"backend\":" + json_str(s.backend) +
            ",\"method\":" + json_str(s.method) + ",\"color\":" +
            json_str(color_ == ColorMode::speed ? "speed" : "density") + "," + num + "}";
@@ -377,7 +411,7 @@ std::string LiveView::control(const std::string& query) {
         if (q.count("yaw") && parse_num(q["yaw"], v)) { yaw_ = std::remainder(v, 360.0); camera = true; }
         if (q.count("pitch") && parse_num(q["pitch"], v)) { pitch_ = std::remainder(v, 360.0); camera = true; }
         if (q.count("zoom") && parse_num(q["zoom"], v) && v > 0) { zoom_ = std::clamp(v, 1e-4, 1e6); camera = true; }
-        if (q.count("fit")) { base_extent_ = 0; zoom_ = 1; camera = true; }
+        if (q.count("fit")) { base_extent_ = 0; zoom_ = 1; ++fit_gen_; camera = true; }
         if (q.count("color")) {
             color_ = q["color"] == "speed" ? ColorMode::speed : ColorMode::density;
             camera = true;

@@ -85,6 +85,7 @@ private:
     // Camera, guarded by mu_.
     double yaw_ = 0, pitch_ = 0, zoom_ = 1;
     double base_extent_ = 0;  // 0 = refit on the next frame
+    uint64_t fit_gen_ = 0;    // bumped by each fit request, to void an in-flight fit
     ColorMode color_ = ColorMode::density;
     int width_, height_;
     bool camera_dirty_ = false;

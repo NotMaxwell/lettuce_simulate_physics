@@ -78,6 +78,8 @@ void append_bytes(void* ctx, void* data, int size) {
 
 }  // namespace
 
+void validate_view(const std::string& view) { parse_view(view); }
+
 Image render_image(const Bodies& b, const RenderOptions& o) {
     if (o.width < 1 || o.height < 1 || o.width > 65536 || o.height > 65536)
         throw std::runtime_error("render: bad image size");
@@ -93,8 +95,16 @@ Image render_image(const Bodies& b, const RenderOptions& o) {
         return std::sqrt(b.vx[i] * b.vx[i] + b.vy[i] * b.vy[i] + b.vz[i] * b.vz[i]);
     };
 
+    // One NaN/inf body would poison the centroid and the percentile (nth_element needs a strict
+    // weak order), so non-finite bodies are dropped from everything below.
+    auto finite = [&](size_t i) {
+        return std::isfinite(sx(i)) && std::isfinite(sy(i)) && std::isfinite(b.m[i]) &&
+               (!by_speed || std::isfinite(speed(i)));
+    };
+
     double mtot = 0, cx = 0, cy = 0, mv2 = 0;
     for (size_t i = 0; i < n; ++i) {
+        if (!finite(i)) continue;
         mtot += b.m[i];
         cx += b.m[i] * sx(i);
         cy += b.m[i] * sy(i);
@@ -106,10 +116,13 @@ Image render_image(const Bodies& b, const RenderOptions& o) {
 
     double extent = o.extent;
     if (extent == 0) {
-        std::vector<float> d(n);
-        for (size_t i = 0; i < n; ++i) d[i] = static_cast<float>(std::hypot(sx(i) - cx, sy(i) - cy));
-        if (n > 0) {
-            size_t k = std::min(n - 1, static_cast<size_t>(0.99 * static_cast<double>(n)));
+        std::vector<float> d;
+        d.reserve(n);
+        for (size_t i = 0; i < n; ++i)
+            if (finite(i)) d.push_back(static_cast<float>(std::hypot(sx(i) - cx, sy(i) - cy)));
+        if (!d.empty()) {
+            const size_t m = d.size();
+            size_t k = std::min(m - 1, static_cast<size_t>(0.99 * static_cast<double>(m)));
             std::nth_element(d.begin(), d.begin() + k, d.end());
             extent = 1.2 * d[k];
         }
@@ -122,6 +135,7 @@ Image render_image(const Bodies& b, const RenderOptions& o) {
     const size_t npix = static_cast<size_t>(W) * H;
     std::vector<float> img(npix * ch, 0.f);
     auto splat = [&](float* im, size_t i) {
+        if (!finite(i)) return;
         double px = (sx(i) - cx) * scale + W * 0.5 - 0.5;
         double py = H * 0.5 - (sy(i) - cy) * scale - 0.5;
         double fx0 = std::floor(px), fy0 = std::floor(py);

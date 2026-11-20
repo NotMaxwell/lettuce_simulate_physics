@@ -1,4 +1,6 @@
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -75,5 +77,37 @@ TEST("render: unwritable path throws") {
     b.push(0, 0, 0, 0, 0, 0, 1);
     bool threw = false;
     try { render_png(b, RenderOptions{}, ".scratch/no_such_dir/x.png"); } catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
+}
+
+TEST("render: non-finite bodies are skipped, not poisoning the frame") {
+    Bodies b;
+    for (int i = 0; i < 200; ++i) {
+        double t = i * 0.3;
+        b.push(std::cos(t), std::sin(t), 0, 0, 0, 0, 1.0);
+    }
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    RenderOptions o;
+    o.width = 64;
+    o.height = 64;
+    Image clean = render_image(b, o);
+    b.push(nan, 0, 0, 0, 0, 0, 1.0);
+    b.push(0, inf, 0, 0, 0, 0, 1.0);
+    b.push(0, 0, 0, nan, 0, 0, 1.0);
+    Image dirty = render_image(b, o);
+    CHECK_NEAR(dirty.extent, clean.extent, 0.01);
+    int lit = 0;
+    for (unsigned char v : dirty.rgb) lit += v > 40;
+    CHECK(lit > 50);
+    o.color = ColorMode::speed;
+    CHECK(render_image(b, o).extent > 0);
+}
+
+TEST("render: validate_view") {
+    validate_view("xy");
+    validate_view("10,20");
+    bool threw = false;
+    try { validate_view("nope"); } catch (const std::runtime_error&) { threw = true; }
     CHECK(threw);
 }

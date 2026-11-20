@@ -29,4 +29,6 @@ struct Image {
 // Throw std::runtime_error on a bad view string, bad size, or a write failure.
 Image render_image(const Bodies& b, const RenderOptions& o);
 void render_png(const Bodies& b, const RenderOptions& o, const std::string& path);
+// Throw std::runtime_error unless `view` is a valid view string.
+void validate_view(const std::string& view);
 std::vector<unsigned char> encode_jpeg(const Image& img, int quality);

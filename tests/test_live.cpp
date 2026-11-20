@@ -5,7 +5,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <thread>
 
@@ -125,5 +127,55 @@ TEST("live: a busy port is reported, not ignored") {
         threw = true;
     }
     CHECK(threw);
+    std::fclose(log);
+}
+
+TEST("live: non-finite stats stay valid JSON") {
+    LiveOptions o;
+    o.port = 0;
+    std::FILE* log = std::fopen("/dev/null", "w");
+    LiveView v(o, log);
+    LiveStats s;
+    s.de = std::numeric_limits<double>::quiet_NaN();
+    s.virial = std::numeric_limits<double>::infinity();
+    v.set_stats(s);
+    std::string st = body_of(http_get(v.port(), "/status"));
+    CHECK(st.find("\"de\":null") != std::string::npos);
+    CHECK(st.find("\"virial\":null") != std::string::npos);
+    CHECK(st.find("nan") == std::string::npos && st.find("inf") == std::string::npos);
+    std::fclose(log);
+}
+
+TEST("live: a stalled stream client does not block shutdown") {
+    std::FILE* log = std::fopen("/dev/null", "w");
+    int fd;
+    auto t0 = std::chrono::steady_clock::now();
+    {
+        LiveOptions o;
+        o.port = 0;
+        o.width = 1024;
+        o.height = 1024;
+        LiveView v(o, log);
+        Bodies b = little_cluster();
+        v.submit(b);
+        fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        int rcv = 1024;
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof rcv);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_port = htons(static_cast<uint16_t>(v.port()));
+        ::inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+        CHECK(::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) == 0);
+        const char req[] = "GET /stream HTTP/1.1\r\nHost: x\r\n\r\n";
+        ::send(fd, req, sizeof req - 1, 0);
+        // Never read: frames fill the socket buffers and the server's send stalls.
+        for (int i = 0; i < 20; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            v.submit(b = little_cluster());
+        }
+    }
+    double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    ::close(fd);
+    CHECK(secs < 8.0);
     std::fclose(log);
 }
