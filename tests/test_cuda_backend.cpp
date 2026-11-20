@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <memory>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -481,4 +482,114 @@ TEST("cuda: group walk at theta 0 is exact, with groups split by duplicate keys"
         CHECK(g.times.interactions == 3000ull * 2999ull);
         CHECK_NEAR(g.diag.pe / ref.pe, 1.0, 1e-5);
     }
+}
+
+// One body 1e8 away puts the whole cluster into one cell of the global Morton cube. The tree must
+// still split the cluster spatially (refined key runs) instead of walking it like direct summation.
+TEST("cuda: tree with a far escaper vs cpu direct") {
+    CUDA_BACKEND(be);
+    auto cpu = make_cpu_backend(0);
+    std::string w;
+    auto g32 = cuda_with("group", "32", w);
+    auto body = cuda_with("body", nullptr, w);
+    CHECK(cpu && g32 && body);
+    if (!cpu || !g32 || !body) return;
+    const std::size_t n = 20000;
+    const Bodies base = plummer(n, 10);
+    Bodies b = base;
+    b.push(1e8, 0, 0, 0, 0, 0, base.m[0]);
+    const double eps = 0.01;
+    const ForceParams p = params(ForceMethod::tree, eps, 0.6);
+    Got ref = accel(*cpu, b, params(ForceMethod::direct, eps), true);
+    for (Backend* tb : {be.get(), g32.get(), body.get()}) {
+        Got plain = accel(*tb, base, p, false);
+        Got g = accel(*tb, b, p, true);
+        const double e = rel_rms(g.a, ref.a);
+        std::fprintf(stderr, "  [%s] rel rms %.3g, pe-1 %.3g, %.1f int/body (without escaper %.1f), build %.3f ms\n",
+                     walk_label(*tb).c_str(), e, g.diag.pe / ref.diag.pe - 1, double(g.times.interactions) / double(n + 1),
+                     double(plain.times.interactions) / double(n), g.times.build_ms);
+        CHECK(all_finite(g.a));
+        CHECK(e <= 1e-3);
+        CHECK_NEAR(g.diag.pe / ref.diag.pe, 1.0, 1e-3);
+        // Leaves cut from the cluster by sorted index span all of it, and the walk is ~n^2.
+        CHECK(g.times.interactions <= 2 * plain.times.interactions + 2 * (n + 1));
+    }
+    // A few steps through refined builds keep every body exactly once.
+    be->upload(b);
+    be->compute_forces(p, false);
+    for (int s = 0; s < 3; ++s) {
+        be->kick(0.005);
+        be->drift(0.01);
+        be->compute_forces(p, false);
+        be->kick(0.005);
+    }
+    Bodies out;
+    be->download(out);
+    CHECK(out.size() == b.size());
+    std::vector<int> seen(b.size(), 0);
+    bool ok = out.size() == b.size();
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        if (out.id[i] >= b.size()) { ok = false; continue; }
+        ++seen[out.id[i]];
+        ok = ok && std::isfinite(out.x[i]) && out.m[i] == b.m[out.id[i]];
+    }
+    CHECK(ok);
+    CHECK(std::all_of(seen.begin(), seen.end(), [](int c) { return c == 1; }));
+}
+
+TEST("cuda: tree at theta 0 is exact with a far escaper and coincident bodies") {
+    CUDA_BACKEND(be);
+    std::string w;
+    auto g32 = cuda_with("group", "32", w);
+    auto body = cuda_with("body", nullptr, w);
+    CHECK(g32 && body);
+    if (!g32 || !body) return;
+    // The escaper makes the cube one long run; inside it 100 coincident bodies stay one run of
+    // identical subkeys (zero extent), which is cut into index chunks.
+    Bodies b = cube(3000, 11);
+    for (std::size_t i = 0; i < 100; ++i) { b.x[i] = 0.25f; b.y[i] = -0.5f; b.z[i] = 0.125f; }
+    b.push(1e8, 0, 0, 0, 0, 0, b.m[0]);
+    const unsigned long long N = b.size();
+    const double eps = 0.05;
+    Ref ref = brute(b, 1, eps);
+    for (Backend* tb : {be.get(), g32.get(), body.get()}) {
+        for (double theta : {0.0, 0.6}) {
+            Got g = accel(*tb, b, params(ForceMethod::tree, eps, theta), true);
+            const double e = rel_rms(g.a, ref.a);
+            std::fprintf(stderr, "  [%s] theta=%.1f: rel rms %.3g, pe-1 %.3g, interactions %llu (exact %llu)\n",
+                         walk_label(*tb).c_str(), theta, e, g.diag.pe / ref.pe - 1,
+                         (unsigned long long)g.times.interactions, N * (N - 1));
+            CHECK(all_finite(g.a));
+            if (theta == 0.0) {
+                CHECK(e <= 1e-5);
+                CHECK(g.times.interactions == N * (N - 1));
+                CHECK_NEAR(g.diag.pe / ref.pe, 1.0, 1e-5);
+            } else {
+                CHECK(e <= 1e-2);
+                // Self pairs from a coincident cell taken as a far field would add ~4e-4.
+                CHECK_NEAR(g.diag.pe / ref.pe, 1.0, 2e-4);
+            }
+        }
+    }
+}
+
+TEST("cuda: build_tree invalidates accelerations and potential") {
+    CUDA_BACKEND(be);
+    Bodies b = plummer(5000, 12);
+    const ForceParams p = params(ForceMethod::tree, 0.01, 0.6);
+    be->upload(b);
+    be->compute_forces(p, true);
+    CHECK(be->diagnostics().has_pe);
+    be->build_tree(p);  // re-sorts the bodies; ax/ay/az/pot are not permuted
+    CHECK(!be->diagnostics().has_pe);
+    bool threw = false;
+    try {
+        be->kick(0.01);
+    } catch (const std::logic_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+    be->compute_forces_with(p, true, {});
+    CHECK(be->diagnostics().has_pe);
+    be->kick(0.01);
 }
