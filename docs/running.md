@@ -105,6 +105,20 @@ slower (the per-body walk gained one range load per accepted cell); then `n=1e9`
 logging above, recording peak host RSS and GPU memory against the ~60 B/body host and ~112 B/body
 GPU estimates.
 
+The duplicate-key refinement in the CUDA tree (far escaper fix) has never been compiled with real
+CUDA or run. Next GPU run also: build with both clang-release and nvcc-release; CUDA tests now
+`20 run, 0 failed, 0 skipped` (escaper, escaper + coincident theta-0, stale accelerations); bench
+a Plummer cluster with and without one body at 1e8 (tree time should stay close, as on the CPU:
+45.6 ms vs 48.0 ms at 200k, 8 threads). Unmeasured costs to look at there:
+- Any run of more than 32 identical keys, even coincident bodies the refinement cannot split,
+  triggers a second full-width radix sort, 8 gathers and a second leaf pass on every build.
+  Sorting only bodies inside runs, or skipping zero-extent runs, would avoid it.
+- `long_run_box` sends 6 atomics per warp to the same addresses for one huge run; a block-level
+  reduction would cut them about 8x.
+- At n >= 2^30 the subkey has only 11 levels, so refinement is coarser.
+- Mixed CPU and CUDA ranks: CPU trees can now be more than 63 levels deep, and `walk_remote`'s
+  height x fan-out bound can drop below 64 threads, which throws. Same-backend jobs are unaffected.
+
 Live view from your laptop: start a run with `live=8080`, then
 `ssh -L 8080:localhost:8080 <name>` and open `http://localhost:8080/`. The tunnel works even on
 instances with fixed ports.
