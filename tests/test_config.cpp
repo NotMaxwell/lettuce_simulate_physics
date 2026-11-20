@@ -188,3 +188,26 @@ TEST("config: shipped configs load, validate and use all their params") {
         CHECK(c.unused_params().empty());
     }
 }
+
+TEST("config: comment markers need leading whitespace; view and n are validated") {
+    auto path = write_tmp("cfg_hash.ini",
+        "out_dir = runs/exp#2\n"
+        "view = xz   # trailing\n"
+        "G = 2 ;c\n");
+    Config c = load_config(path);
+    CHECK(c.out_dir == "runs/exp#2");
+    CHECK(c.view == "xz");
+    CHECK_NEAR(c.G, 2, 0);
+
+    Config d;
+    apply_override(d, "out_dir=runs/exp#2");
+    CHECK(d.out_dir == "runs/exp#2");
+
+    CHECK(!error_of([&] { apply_override(d, "view=bogus"); }).empty());
+    CHECK(!error_of([&] { load_config(write_tmp("cfg_badview.ini", "view = 1,x\n")); }).empty());
+    Config big;
+    big.n = 1ull << 32;
+    CHECK(!error_of([&] { validate(big); }).empty());
+    big.n = (1ull << 32) - 1;
+    validate(big);
+}

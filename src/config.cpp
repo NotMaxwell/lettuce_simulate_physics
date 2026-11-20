@@ -9,6 +9,8 @@
 #include <fstream>
 #include <stdexcept>
 
+#include "render.hpp"
+
 namespace {
 
 [[noreturn]] void fail(const std::string& msg) { throw std::runtime_error(msg); }
@@ -86,8 +88,12 @@ BackendKind parse_backend(const std::string& v) {
 }
 
 std::string strip_comment(const std::string& line) {
-    size_t p = line.find_first_of("#;");
-    return trim(p == std::string::npos ? line : line.substr(0, p));
+    // Only a leading or whitespace-preceded marker starts a comment, so values like runs/exp#2 survive
+    // and a file value matches what the same text gives as a command-line override.
+    for (size_t p = 0; p < line.size(); ++p)
+        if ((line[p] == '#' || line[p] == ';') && (p == 0 || std::isspace(static_cast<unsigned char>(line[p - 1]))))
+            return trim(line.substr(0, p));
+    return trim(line);
 }
 
 std::string fmt_double(double d) {
@@ -141,7 +147,10 @@ void set_key(Config& c, const std::string& key, const std::string& v) {
     else if (key == "render_every") c.render_every = parse_uint(key, v);
     else if (key == "render_width") c.render_width = parse_int(key, v);
     else if (key == "render_height") c.render_height = parse_int(key, v);
-    else if (key == "view") c.view = v;
+    else if (key == "view") {
+        validate_view(v);
+        c.view = v;
+    }
     else if (key == "render_extent") c.render_extent = parse_double(key, v);
     else if (key == "restart") c.restart = v;
     else if (key == "live") c.live = parse_int(key, v);
@@ -194,6 +203,12 @@ Config load_config(const std::string& path) {
 
 void validate(const Config& c) {
     if (c.n < 1) fail("n must be >= 1");
+    if (c.n > UINT32_MAX) fail("n must be < 2^32 (body ids are 32-bit)");
+    try {
+        validate_view(c.view);
+    } catch (const std::exception& e) {
+        fail(std::string("view: ") + e.what());
+    }
     if (!(c.G > 0)) fail("G must be > 0");
     if (!(c.dt > 0)) fail("dt must be > 0");
     if (!(c.eps >= 0)) fail("eps must be >= 0");
