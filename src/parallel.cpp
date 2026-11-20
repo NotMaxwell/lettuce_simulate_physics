@@ -369,7 +369,7 @@ private:
             dest[i] = int(std::upper_bound(split.begin(), split.end(), key[i]) - split.begin());
             ++per[dest[i]];
         }
-        cap_destinations(order, per, dest);
+        cap_destinations(key, order, per, dest);
         for (int r = 0; r < P; ++r) send[r].reserve(per[r] * sizeof(Rec));
         for (size_t i : order) {
             Rec rec;
@@ -392,20 +392,20 @@ private:
         balance_ms_ = ms_since(t0);
     }
 
-    // Enforces max_rank_bodies: if a key range drew more bodies than the cap, bodies are reassigned
-    // by global position (range, then source rank, then key order within a rank) so that no rank
-    // exceeds it. Domains may then overlap slightly; the LET exchange stays exact for any split.
-    void cap_destinations(const std::vector<uint32_t>& order, std::vector<uint64_t>& per, std::vector<int>& dest) {
+    // Enforces max_rank_bodies. If a key range drew more bodies than the cap, the rank boundaries
+    // are moved to global positions in key order (ties on one key broken by source rank, then local
+    // order), found by a collective bisection on the key. Capped ranks therefore still own
+    // contiguous key ranges and neighbours share at most the one finest Morton cell at a boundary.
+    void cap_destinations(const std::vector<uint64_t>& key, const std::vector<uint32_t>& order,
+                          std::vector<uint64_t>& per, std::vector<int>& dest) {
         const int P = g_size;
-        std::vector<uint64_t> tot(P), pre(P, 0);
+        std::vector<uint64_t> tot(P);
         check(MPI_Allreduce(per.data(), tot.data(), P, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD), "Allreduce");
         uint64_t ntot = 0;
         for (auto t : tot) ntot += t;
         const uint64_t cap = max_rank_bodies(ntot);
         if (*std::max_element(tot.begin(), tot.end()) <= cap) return;
-        check(MPI_Exscan(per.data(), pre.data(), P, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD), "Exscan");
-        if (g_rank == 0) std::fill(pre.begin(), pre.end(), 0);  // Exscan leaves rank 0's undefined
-        // Range d starts at start[d] in the global order; bound[d] is where capped rank d starts.
+        // Range d starts at start[d] in the global key order; bound[d] is where capped rank d starts.
         // Each bound is clamped to within cap of the previous one and high enough that the ranks
         // after it can still take the rest, which cap * P >= ntot guarantees is possible.
         std::vector<uint64_t> start(P + 1, 0), bound(P + 1, 0);
@@ -416,13 +416,52 @@ private:
             uint64_t lo = std::max(bound[d - 1], ntot > rest ? ntot - rest : 0);
             bound[d] = std::clamp(start[d], lo, bound[d - 1] + cap);
         }
-        std::vector<uint64_t> seen(P, 0);
+        const size_t n = order.size();
+        std::vector<uint64_t> sk(n);
+        for (size_t p = 0; p < n; ++p) sk[p] = key[order[p]];
+        auto count_le = [&](uint64_t k) { return uint64_t(std::upper_bound(sk.begin(), sk.end(), k) - sk.begin()); };
+        auto count_lt = [&](uint64_t k) { return uint64_t(std::lower_bound(sk.begin(), sk.end(), k) - sk.begin()); };
+        // thr[d]: the key of the body at global position bound[d], i.e. the least key with more than
+        // bound[d] bodies at or below it. Keys use 63 bits, so UINT64_MAX (bound at the end) is no body's.
+        const int B = P - 1;
+        std::vector<uint64_t> lo(B, 0), hi(B, UINT64_MAX), mid(B), cnt(B), gcnt(B);
+        for (;;) {
+            bool open = false;
+            for (int d = 0; d < B; ++d) {
+                open = open || lo[d] < hi[d];
+                mid[d] = lo[d] + (hi[d] - lo[d]) / 2;
+                cnt[d] = count_le(mid[d]);
+            }
+            if (!open) break;  // lo/hi come from global counts, so every rank leaves together
+            check(MPI_Allreduce(cnt.data(), gcnt.data(), B, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD), "Allreduce");
+            for (int d = 0; d < B; ++d) {
+                if (lo[d] >= hi[d]) continue;
+                if (gcnt[d] > bound[d + 1]) hi[d] = mid[d]; else lo[d] = mid[d] + 1;
+            }
+        }
+        const std::vector<uint64_t>& thr = lo;
+        // Bodies with key == thr[d] straddle bound d: below them lie lt_g[d] bodies of smaller key
+        // and eq_pre[d] equal-key bodies on lower ranks.
+        std::vector<uint64_t> lt(B), eq(B), lt_g(B), eq_pre(B, 0);
+        for (int d = 0; d < B; ++d) {
+            lt[d] = count_lt(thr[d]);
+            eq[d] = count_le(thr[d]) - lt[d];
+        }
+        check(MPI_Allreduce(lt.data(), lt_g.data(), B, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD), "Allreduce");
+        check(MPI_Exscan(eq.data(), eq_pre.data(), B, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD), "Exscan");
+        if (g_rank == 0) std::fill(eq_pre.begin(), eq_pre.end(), 0);  // Exscan leaves rank 0's undefined
+        // Is the body at local sorted position p at or past bound d + 1?
+        auto past = [&](size_t p, int d) {
+            if (sk[p] != thr[d]) return sk[p] > thr[d];
+            return lt_g[d] + eq_pre[d] + (p - lt[d]) >= bound[d + 1];
+        };
+        // Global positions grow along the local key order, so destinations do too: one sweep.
         std::fill(per.begin(), per.end(), 0);
-        for (uint32_t i : order) {
-            int d = dest[i];
-            uint64_t g = start[d] + pre[d] + seen[d]++;
-            dest[i] = int(std::upper_bound(bound.begin() + 1, bound.begin() + P, g) - (bound.begin() + 1));
-            ++per[dest[i]];
+        int d = 0;
+        for (size_t p = 0; p < n; ++p) {
+            while (d < B && past(p, d)) ++d;
+            dest[order[p]] = d;
+            ++per[d];
         }
     }
 

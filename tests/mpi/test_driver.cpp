@@ -7,6 +7,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -199,6 +201,45 @@ TEST("mpi: rebalance never gives a rank more than max_rank_bodies") {
     be->download(got);
     CHECK(got.size() <= par::max_rank_bodies(all.size()));
     CHECK(par::sum(uint64_t(got.size())) == all.size());
+    // The capped split must follow key order: cut by source rank inside the clump's key range,
+    // neighbouring ranks would both span that whole range, their bounding boxes would overlap
+    // and each would send the other most of its bodies as LET. Keys as the rebalance computes them
+    // (positions have not moved: no kicks or drifts here).
+    float lo[3] = {3e38f, 3e38f, 3e38f}, hi[3] = {-3e38f, -3e38f, -3e38f};
+    for (size_t i = 0; i < all.size(); ++i) {
+        const float v[3] = {all.x[i], all.y[i], all.z[i]};
+        for (int k = 0; k < 3; ++k) {
+            lo[k] = std::min(lo[k], v[k]);
+            hi[k] = std::max(hi[k], v[k]);
+        }
+    }
+    const double side = std::max({double(hi[0]) - lo[0], double(hi[1]) - lo[1], double(hi[2]) - lo[2], 1e-30});
+    const double scale = double((1u << 21) - 1) / side;
+    auto spread = [](uint64_t v) {
+        uint64_t r = 0;
+        for (int b = 0; b < 21; ++b) r |= ((v >> b) & 1) << (3 * b);
+        return r;
+    };
+    auto morton = [&](size_t i) {
+        auto q = [&](float v, float o) { return uint64_t(std::clamp((double(v) - o) * scale, 0.0, 2097151.0)); };
+        return spread(q(got.x[i], lo[0])) << 2 | spread(q(got.y[i], lo[1])) << 1 | spread(q(got.z[i], lo[2]));
+    };
+    uint64_t kmin = UINT64_MAX, kmax = 0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        kmin = std::min(kmin, morton(i));
+        kmax = std::max(kmax, morton(i));
+    }
+    bool ordered = true;
+    uint64_t prev_max = 0;
+    for (int r = 0; r < par::size(); ++r) {
+        const bool me = par::rank() == r;
+        const uint64_t nr = par::sum(uint64_t(me ? got.size() : 0));
+        const uint64_t rmin = par::sum(me ? kmin : uint64_t(0)), rmax = par::sum(me ? kmax : uint64_t(0));
+        if (nr == 0) continue;
+        ordered = ordered && rmin >= prev_max;  // neighbours may share only the boundary key
+        prev_max = rmax;
+    }
+    CHECK(ordered);
     Bodies gathered;
     par::gather_sample(*be, gathered, UINT64_MAX / 2);
     if (par::root()) CHECK(std::set<uint32_t>(gathered.id.begin(), gathered.id.end()).size() == all.size());
