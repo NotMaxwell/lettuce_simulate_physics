@@ -10,6 +10,7 @@
 //   ax,ay,az,pot                    16 B
 //   interaction counts               4 B   per-body cost for body_costs()
 //   posm (float4 pos+mass)          16 B   gathered copy for coalesced 16-byte loads in kernels
+//                                          (scratch and subkeys while refining long runs)
 //   Morton keys, double-buffered    16 B   (the alternate also holds leaf flags/scan/starts)
 //   sort indices, double-buffered    8 B   (the alternate is the permutation scratch / group slots)
 //   = 92 B, plus tree nodes: 96 B per node (incl. an 8 B body range), 2K-1 nodes for K leaves
@@ -26,6 +27,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -102,7 +104,12 @@ constexpr int BS = 256;          // elementwise / build kernels
 constexpr int DIRECT_BS = 256;   // direct tile = block; 8 warps hide the rsqrt latency on sm_90
 constexpr int WALK_BS = 128;     // smaller blocks balance the uneven per-body walk cost better
 constexpr int LEAF_MAX = 32;
-constexpr int STACK = 96;        // radix-tree depth <= 63 key bits + log2(#duplicate-key runs)
+// Bounds on the internal nodes of one root-to-leaf radix-tree path. Node prefix lengths (delta)
+// strictly increase downwards and take at most 63 values on the 63-bit key, 63 on the 63-bit
+// subkey (refined trees only) and 31 on the leaf-index tie-break (K < 2^31).
+constexpr int DEPTH_KEY = 96;    // >= 63 + 31
+constexpr int DEPTH_SUB = 160;   // >= 63 + 63 + 31
+constexpr int STACK = DEPTH_SUB; // per-body walk: at most one pending sibling per internal node above
 constexpr int REDUCE_BLOCKS = 1024;
 constexpr int DIAG_N = 13;
 
@@ -360,30 +367,167 @@ __device__ __forceinline__ uint32_t quantize(float v, float lo, float scale) {
     return static_cast<uint32_t>(q);
 }
 
+__device__ __forceinline__ uint64_t morton3(float x, float y, float z, float lx, float ly, float lz, float scale) {
+    return spread3(quantize(x, lx, scale)) << 2 | spread3(quantize(y, ly, scale)) << 1 | spread3(quantize(z, lz, scale));
+}
+
 __global__ void morton_kernel(const float* __restrict__ x, const float* __restrict__ y, const float* __restrict__ z,
                               const float4* __restrict__ cube, uint64_t* __restrict__ keys,
                               uint32_t* __restrict__ idx, int n) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float4 c = *cube;
-    keys[i] = spread3(quantize(x[i], c.x, c.w)) << 2 | spread3(quantize(y[i], c.y, c.w)) << 1 |
-              spread3(quantize(z[i], c.z, c.w));
+    keys[i] = morton3(x[i], y[i], z[i], c.x, c.y, c.z, c.w);
     idx[i] = static_cast<uint32_t>(i);
 }
 
-// Common leading octal digits of two 63-bit keys (21 = identical).
-__device__ __forceinline__ int common_octs(uint64_t a, uint64_t b) {
-    return a == b ? 21 : (__clzll(static_cast<long long>(a ^ b)) - 1) / 3;
+// ---------------------------------------------------------------- tree: refining duplicate-key runs
+//
+// One global cube can put a whole cluster on a few keys (one far escaper is enough). A run of
+// > 32 identical keys cut into leaves by sorted index gives spatially random leaves whose boxes
+// all span the cluster, and the walk degrades to direct summation. Such runs are refined once:
+// each body of a long run gets a subkey, the Morton key of its position in the run's own
+// bounding cube, and the run is re-sorted by it. The tree then works on (key, subkey) as one
+// longer key; bodies outside long runs have subkey 0. A run whose bodies coincide (zero extent)
+// gets subkeys 0 and is still cut into index chunks, as are runs still identical after the subkey.
+//
+// The re-sort is one radix sort of all n bodies by (segment start << so3 | subkey >> (63 - so3)),
+// where the segment start is the run's first index for run bodies and i otherwise: segments keep
+// their order and positions, and only long runs change internally. With pbits = bits(n - 1) the
+// subkey keeps so3 = 3 min(21, (64 - pbits) / 3) bits (>= 11 levels at n < 2^31), its low bits zero.
+
+// Order-preserving float <-> int map for atomicMin/Max (an involution).
+__device__ __forceinline__ int ord_float(float f) {
+    const int b = __float_as_int(f);
+    return b >= 0 ? b : b ^ 0x7fffffff;
 }
+__device__ __forceinline__ float unord_float(int o) { return __int_as_float(o >= 0 ? o : o ^ 0x7fffffff); }
+
+// flags[i] = 1 iff body i starts a run of > LEAF_MAX identical keys.
+__global__ void long_run_starts(const uint64_t* __restrict__ keys, uint32_t* __restrict__ flags, int n) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const uint64_t k = keys[i];
+    flags[i] = (i == 0 || keys[i - 1] != k) && i + LEAF_MAX < n && keys[i + LEAF_MAX] == k ? 1u : 0u;
+}
+
+// incl = inclusive scan of the flags; run r = incl - 1 gets info[7r] = first body, then the
+// box as ord_float (lo xyz, hi xyz), initialised empty here.
+__global__ void long_run_init(const uint32_t* __restrict__ flags, const uint32_t* __restrict__ incl,
+                              int* __restrict__ info, int n) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || !flags[i]) return;
+    int* R = info + 7 * (static_cast<long long>(incl[i]) - 1);
+    R[0] = static_cast<int>(i);
+    R[1] = R[2] = R[3] = INT_MAX;
+    R[4] = R[5] = R[6] = INT_MIN;
+}
+
+// Run of body i, or -1. The last long-run start at or before i is incl[i] - 1; i belongs to it
+// iff it has the same key (keys are sorted).
+__device__ __forceinline__ int long_run_of(const uint64_t* __restrict__ keys, const uint32_t* __restrict__ incl,
+                                           const int* __restrict__ info, long long i) {
+    const uint32_t c = incl[i];
+    if (c == 0) return -1;
+    const int r = static_cast<int>(c - 1);
+    return keys[i] == keys[info[7 * static_cast<long long>(r)]] ? r : -1;
+}
+
+// Run boxes by atomics; a warp whose bodies all lie in one run (the common case: runs are long
+// and contiguous) reduces first and issues one set of atomics. Requires blockDim.x % 32 == 0.
+__global__ void long_run_box(const uint64_t* __restrict__ keys, const uint32_t* __restrict__ incl,
+                             const float* __restrict__ x, const float* __restrict__ y, const float* __restrict__ z,
+                             int* __restrict__ info, int n) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    int r = -1;
+    int lo[3] = {0, 0, 0};
+    if (i < n) {
+        r = long_run_of(keys, incl, info, i);
+        if (r >= 0) { lo[0] = ord_float(x[i]); lo[1] = ord_float(y[i]); lo[2] = ord_float(z[i]); }
+    }
+    int hi[3] = {lo[0], lo[1], lo[2]};
+    const int r0 = __shfl_sync(0xffffffffu, r, 0);
+    const bool uniform = __all_sync(0xffffffffu, r == r0);
+    if (uniform) {
+        if (r0 < 0) return;
+        for (int o = 16; o > 0; o >>= 1)
+            for (int c = 0; c < 3; ++c) {
+                lo[c] = min(lo[c], __shfl_xor_sync(0xffffffffu, lo[c], o));
+                hi[c] = max(hi[c], __shfl_xor_sync(0xffffffffu, hi[c], o));
+            }
+        if ((threadIdx.x & 31) != 0) return;
+    } else if (r < 0) {
+        return;
+    }
+    const int ru = uniform ? r0 : r;
+    int* R = info + 7 * static_cast<long long>(ru);
+    for (int c = 0; c < 3; ++c) {
+        atomicMin(&R[1 + c], lo[c]);
+        atomicMax(&R[4 + c], hi[c]);
+    }
+}
+
+// Sort keys for the re-sort (see above) and the identity permutation.
+__global__ void long_run_keys(const uint64_t* __restrict__ keys, const uint32_t* __restrict__ incl,
+                              const int* __restrict__ info, const float* __restrict__ x,
+                              const float* __restrict__ y, const float* __restrict__ z, int so3,
+                              uint64_t* __restrict__ key2, uint32_t* __restrict__ idx, int n) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    uint64_t seg = static_cast<uint64_t>(i), sub = 0;
+    const int r = long_run_of(keys, incl, info, i);
+    if (r >= 0) {
+        const int* R = info + 7 * static_cast<long long>(r);
+        seg = static_cast<uint64_t>(R[0]);
+        const float lx = unord_float(R[1]), ly = unord_float(R[2]), lz = unord_float(R[3]);
+        const float side = fmaxf(unord_float(R[4]) - lx, fmaxf(unord_float(R[5]) - ly, unord_float(R[6]) - lz));
+        float scale = side > 0.f ? 2097152.f / side : 0.f;
+        // A denormal side overflows the scale; such a run is coincident for all purposes. Tested on
+        // the bits, as in bbox_final.
+        if ((__float_as_uint(scale) & 0x7f800000u) == 0x7f800000u) scale = 0.f;
+        sub = morton3(x[i], y[i], z[i], lx, ly, lz, scale) >> (63 - so3);
+    }
+    key2[i] = seg << so3 | sub;
+    idx[i] = static_cast<uint32_t>(i);
+}
+
+// Sorted sort keys -> subkeys (63-bit, low 63 - so3 bits zero; 0 outside long runs). In place allowed.
+__global__ void long_run_subkeys(const uint64_t* key2, uint64_t* sub, int so3, int n) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) sub[i] = (key2[i] & ((1ull << so3) - 1)) << (63 - so3);
+}
+
+// ---------------------------------------------------------------- tree: leaves
+//
+// Keys are (key, subkey) pairs; sub == nullptr means all subkeys are 0. Octree levels 0..21 come
+// from the key, levels 22..42 from the subkey (only long runs have one: they lie in a single
+// level-21 cell, and the subkey's cube is inside it, so cells stay nested and contiguous).
+
+// Common leading octal digits of two keys (42 = identical pairs).
+__device__ __forceinline__ int common_octs(uint64_t a, uint64_t b, uint64_t sa, uint64_t sb) {
+    if (a != b) return (__clzll(static_cast<long long>(a ^ b)) - 1) / 3;
+    return sa == sb ? 42 : 21 + (__clzll(static_cast<long long>(sa ^ sb)) - 1) / 3;
+}
+
+__device__ __forceinline__ uint64_t sub_at(const uint64_t* __restrict__ sub, long long i) { return sub ? sub[i] : 0ull; }
 
 // Leaf scheme: a leaf is the smallest octree cell (level L, key prefix of 3L bits) that holds
 // <= 32 bodies. Cells are contiguous in sorted order, so the cell of body i at level L has >= 33
 // bodies iff some window [j, j+32] containing i has common_octs(key[j], key[j+32]) >= L. Hence
 // L_i = 1 + max over those windows (0 if n <= 32), and all bodies of one leaf get the same L.
-// L_i = 22 means > 32 identical keys; such runs are split into fixed chunks of 32.
-__global__ void window_octs(const uint64_t* __restrict__ keys, uint8_t* __restrict__ D, int n) {
+// L_i = 43 means > 32 identical pairs; such runs are split into fixed chunks of 32.
+// Without subkeys, any window of identical keys (a long run) sets *dup: the tree needs refining.
+__global__ void window_octs(const uint64_t* __restrict__ keys, const uint64_t* __restrict__ sub,
+                            uint8_t* __restrict__ D, int* __restrict__ dup, int n) {
     long long j = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (j + LEAF_MAX < n) D[j] = static_cast<uint8_t>(common_octs(keys[j], keys[j + LEAF_MAX]));
+    bool eq = false;
+    if (j + LEAF_MAX < n) {
+        const int d = common_octs(keys[j], keys[j + LEAF_MAX], sub_at(sub, j), sub_at(sub, j + LEAF_MAX));
+        D[j] = static_cast<uint8_t>(d);
+        eq = !sub && d == 42;
+    }
+    // One atomic per warp at most: a long run would otherwise hit one address once per body.
+    if (__ballot_sync(0xffffffffu, eq) && (threadIdx.x & 31) == 0) atomicOr(dup, 1);
 }
 
 __global__ void leaf_level(const uint8_t* __restrict__ D, uint8_t* __restrict__ L, int n) {
@@ -397,36 +541,42 @@ __global__ void leaf_level(const uint8_t* __restrict__ D, uint8_t* __restrict__ 
 
 struct LeafId {
     int level;
-    uint64_t prefix;
+    uint64_t prefix, sprefix;
     long long run;
 };
 
-__device__ LeafId leaf_id(const uint64_t* __restrict__ keys, const uint8_t* __restrict__ L, long long i) {
+__device__ LeafId leaf_id(const uint64_t* __restrict__ keys, const uint64_t* __restrict__ sub,
+                          const uint8_t* __restrict__ L, long long i) {
     const int l = L[i];
-    const uint64_t k = keys[i];
-    LeafId r{l, 0, 0};
+    const uint64_t k = keys[i], s = sub_at(sub, i);
+    LeafId r{l, 0, 0, 0};
     if (l <= 21) {
         r.prefix = k >> (63 - 3 * l);
+    } else if (l <= 42) {
+        r.prefix = k;
+        r.sprefix = s >> (63 - 3 * (l - 21));
     } else {
         r.prefix = k;
-        long long a = 0, b = i;  // lower_bound of k in keys[0..i]
+        r.sprefix = s;
+        long long a = 0, b = i;  // lower_bound of (k, s) in [0, i]
         while (a < b) {
             long long mid = a + (b - a) / 2;
-            if (keys[mid] < k) a = mid + 1; else b = mid;
+            const uint64_t km = keys[mid];
+            if (km < k || (km == k && sub_at(sub, mid) < s)) a = mid + 1; else b = mid;
         }
         r.run = (i - a) / LEAF_MAX;
     }
     return r;
 }
 
-__global__ void leaf_flags(const uint64_t* __restrict__ keys, const uint8_t* __restrict__ L,
-                           uint32_t* __restrict__ flags, int n) {
+__global__ void leaf_flags(const uint64_t* __restrict__ keys, const uint64_t* __restrict__ sub,
+                           const uint8_t* __restrict__ L, uint32_t* __restrict__ flags, int n) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     uint32_t f = 1;
     if (i > 0) {
-        LeafId a = leaf_id(keys, L, i), b = leaf_id(keys, L, i - 1);
-        f = (a.level != b.level || a.prefix != b.prefix || a.run != b.run) ? 1u : 0u;
+        LeafId a = leaf_id(keys, sub, L, i), b = leaf_id(keys, sub, L, i - 1);
+        f = (a.level != b.level || a.prefix != b.prefix || a.sprefix != b.sprefix || a.run != b.run) ? 1u : 0u;
     }
     flags[i] = f;
 }
@@ -451,33 +601,40 @@ __global__ void leaf_starts(const uint32_t* __restrict__ incl, int* __restrict__
 // nodeC = (Qyz, rcrit^2, a, b) with a,b = children for internal nodes, or a = first body,
 // b = ~count (< 0) for leaves.
 
-__device__ __forceinline__ int delta(const uint64_t* __restrict__ keys, const int* __restrict__ start, int K,
-                                     int i, long long j) {
+// Common prefix length of the leaves' first (key, subkey, leaf index) as one 64+64+32-bit string
+// (key and subkey have a zero top bit). Equal pairs only happen for chunks of one run.
+__device__ __forceinline__ int delta(const uint64_t* __restrict__ keys, const uint64_t* __restrict__ sub,
+                                     const int* __restrict__ start, int K, int i, long long j) {
     if (j < 0 || j >= K) return -1;
-    const uint64_t a = keys[start[i]], b = keys[start[j]];
-    // Equal first keys only happen for chunks of one duplicate run; the index breaks the tie.
-    if (a == b) return 64 + __clz(static_cast<unsigned>(i ^ static_cast<int>(j)));
-    return __clzll(static_cast<long long>(a ^ b));
+    const int si = start[i], sj = start[j];
+    const uint64_t a = keys[si], b = keys[sj];
+    if (a != b) return __clzll(static_cast<long long>(a ^ b));
+    if (sub) {
+        const uint64_t sa = sub[si], sb = sub[sj];
+        if (sa != sb) return 64 + __clzll(static_cast<long long>(sa ^ sb));
+    }
+    return 128 + __clz(static_cast<unsigned>(i ^ static_cast<int>(j)));
 }
 
-__global__ void build_radix(const uint64_t* __restrict__ keys, const int* __restrict__ start, int K,
-                            float4* __restrict__ nodeC, int* __restrict__ parent, int2* __restrict__ range) {
+__global__ void build_radix(const uint64_t* __restrict__ keys, const uint64_t* __restrict__ sub,
+                            const int* __restrict__ start, int K, float4* __restrict__ nodeC,
+                            int* __restrict__ parent, int2* __restrict__ range) {
     long long gi = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (gi >= K - 1) return;
     const int i = static_cast<int>(gi);
-    const int d = delta(keys, start, K, i, i + 1) - delta(keys, start, K, i, (long long)i - 1) >= 0 ? 1 : -1;
-    const int dmin = delta(keys, start, K, i, (long long)i - d);
+    const int d = delta(keys, sub, start, K, i, i + 1) - delta(keys, sub, start, K, i, (long long)i - 1) >= 0 ? 1 : -1;
+    const int dmin = delta(keys, sub, start, K, i, (long long)i - d);
     long long lmax = 2;
-    while (delta(keys, start, K, i, i + lmax * d) > dmin) lmax <<= 1;
+    while (delta(keys, sub, start, K, i, i + lmax * d) > dmin) lmax <<= 1;
     long long l = 0;
     for (long long t = lmax >> 1; t >= 1; t >>= 1)
-        if (delta(keys, start, K, i, i + (l + t) * d) > dmin) l += t;
+        if (delta(keys, sub, start, K, i, i + (l + t) * d) > dmin) l += t;
     const long long j = i + l * d;
-    const int dnode = delta(keys, start, K, i, j);
+    const int dnode = delta(keys, sub, start, K, i, j);
     long long s = 0, t = l;
     do {
         t = (t + 1) >> 1;
-        if (delta(keys, start, K, i, i + (s + t) * d) > dnode) s += t;
+        if (delta(keys, sub, start, K, i, i + (s + t) * d) > dnode) s += t;
     } while (t > 1);
     const long long gamma = i + s * d + min(d, 0);
     const int left = (min((long long)i, j) == gamma) ? static_cast<int>(K - 1 + gamma) : static_cast<int>(gamma);
@@ -1137,6 +1294,7 @@ public:
         reserve_bodies(n);
         n_ = static_cast<int>(n);
         has_pe_ = false;
+        acc_ok_ = true;  // zeroed below
         kick_rec_ = drift_rec_ = false;
         tree_ok_ = host_nodes_ok_ = costs_ok_ = false;
         t_ = PhaseTimes{};
@@ -1210,7 +1368,11 @@ public:
         t_.sort_ms = t_.build_ms = 0;
         if (p.method != ForceMethod::tree || n_ == 0) return;
         cudaStream_t s = stream_->s;
-        costs_ok_ = false;  // the sort reorders the bodies
+        // The sort reorders the bodies but not ax/ay/az/pot or the counts: all stale until the next
+        // compute_forces_with (kick refuses to use them, diagnostics drops the pe).
+        costs_ok_ = false;
+        has_pe_ = false;
+        acc_ok_ = false;
         CK(cudaEventRecord(ev_[0].e, s));
         sort_bodies();
         CK(cudaEventRecord(ev_[1].e, s));
@@ -1230,6 +1392,7 @@ public:
         if (n_ == 0) {
             t_.sort_ms = t_.build_ms = 0;
             has_pe_ = potential;
+            acc_ok_ = true;
             return;
         }
         const bool tree = p.method == ForceMethod::tree;
@@ -1271,7 +1434,7 @@ public:
             CK_LAUNCH();
         } else {
             const WalkSrc src{nodeA_.as<float4>(), nodeB_.as<float4>(), nodeC_.as<float4>(), nodeR_.as<int2>(),
-                              posm_.as<float4>(), nullptr, 0, GSTACK - STACK - 1, 1};
+                              posm_.as<float4>(), nullptr, 0, GSTACK - (refined_ ? DEPTH_SUB : DEPTH_KEY) - 1, 1};
             launch_group(potential, false, src, groups(tree), group_bound(tree), eps2, G, out);
         }
         walk_remote(remote, tree, potential, eps2, G, out);
@@ -1287,6 +1450,7 @@ public:
         t_.force_ms = t_.sort_ms + t_.build_ms + t_.walk_ms;
         t_.interactions = h.inter + (tree ? 0ull : static_cast<uint64_t>(n) * static_cast<uint64_t>(n - 1));
         has_pe_ = potential;
+        acc_ok_ = true;
         costs_ok_ = true;
     }
 
@@ -1403,6 +1567,8 @@ public:
     void kick(double dt) override {
         CK(cudaSetDevice(dev_));
         if (n_ == 0) return;
+        if (!acc_ok_)
+            throw std::logic_error("cuda kick: accelerations are stale (build_tree since the last force call)");
         cudaStream_t s = stream_->s;
         CK(cudaEventRecord(ev_[4].e, s));
         kick_kernel<<<grid_for(n_, BS), BS, 0, s>>>(vx_.as<float>(), vy_.as<float>(), vz_.as<float>(), ax_.as<float>(),
@@ -1691,8 +1857,9 @@ private:
         scratch_sel_ = 1 - vs;
     }
 
-    // Returns the number of leaves K. Host-synchronises once to read K for sizing.
-    int build_tree_impl(double theta) {
+    // Leaf levels, flags and starts for the current keys (sub: subkeys or null). Host-synchronises
+    // to read K, and, without subkeys, whether some run of identical keys needs refining.
+    int build_leaves(const uint64_t* sub, bool& dup) {
         cudaStream_t s = stream_->s;
         const int n = n_;
         const unsigned g = grid_for(n, BS);
@@ -1703,28 +1870,101 @@ private:
         uint32_t* incl = reinterpret_cast<uint32_t*>(region + (static_cast<std::size_t>(n) + 1) * 4);
         uint8_t* D = idx_[scratch_sel_].as<uint8_t>();
         uint8_t* L = D + n;
+        int* dK = reinterpret_cast<int*>(small_.as<char>() + 48);  // K, dup
+        CK(cudaMemsetAsync(dK, 0, 2 * sizeof(int), s));
         if (n > LEAF_MAX) {
-            window_octs<<<grid_for(n - LEAF_MAX, BS), BS, 0, s>>>(keys, D, n);
+            window_octs<<<grid_for(n - LEAF_MAX, BS), BS, 0, s>>>(keys, sub, D, dK + 1, n);
             CK_LAUNCH();
         }
         leaf_level<<<g, BS, 0, s>>>(D, L, n);
         CK_LAUNCH();
-        leaf_flags<<<g, BS, 0, s>>>(keys, L, flags, n);
+        leaf_flags<<<g, BS, 0, s>>>(keys, sub, L, flags, n);
         CK_LAUNCH();
         std::size_t need = 0;
         CK(cub::DeviceScan::InclusiveSum(nullptr, need, flags, incl, n, s));
         reserve_temp(need);
         need = temp_bytes_;
         CK(cub::DeviceScan::InclusiveSum(temp_.as<void>(), need, flags, incl, n, s));
-        int* dK = reinterpret_cast<int*>(small_.as<char>() + 48);
         leaf_starts<<<g, BS, 0, s>>>(incl, start, dK, n);
         CK_LAUNCH();
-        int K = 0;
-        CK(cudaMemcpyAsync(&K, dK, sizeof K, cudaMemcpyDeviceToHost, s));
+        int h[2] = {0, 0};
+        CK(cudaMemcpyAsync(h, dK, sizeof h, cudaMemcpyDeviceToHost, s));
         CK(cudaStreamSynchronize(s));
+        const int K = h[0];
+        dup = h[1] != 0;
         if (K < 1 || K > n) throw std::runtime_error("cuda tree build: bad leaf count " + std::to_string(K));
         if (2 * static_cast<std::size_t>(K) - 1 > static_cast<std::size_t>(INT32_MAX))
             throw std::runtime_error("cuda tree build: " + std::to_string(K) + " leaves exceed the 2^31-1 node index limit");
+        return K;
+    }
+
+    // Refines the runs of > LEAF_MAX identical keys (see long_run_starts), re-sorts the bodies and
+    // returns the subkeys. Uses only buffers that are free between sort_bodies and the leaf build:
+    // idx_[0] flags then the identity permutation, idx_[1] their scan, keys_[1 - key_sel_] the
+    // alternate sort keys, posm_ bytes [0, 8n) the sort keys then the subkeys and [8n, 8n + 28R)
+    // the run info (R <= n/33 runs, so 28R < 8n). posm_ is repacked once the subkeys are dead.
+    const uint64_t* refine_runs() {
+        cudaStream_t s = stream_->s;
+        const int n = n_;
+        const unsigned g = grid_for(n, BS);
+        const uint64_t* keys = keys_[key_sel_].as<uint64_t>();
+        uint32_t* flags = idx_[0].as<uint32_t>();
+        uint32_t* incl = idx_[1].as<uint32_t>();
+        uint64_t* key2 = posm_.as<uint64_t>();
+        int* info = reinterpret_cast<int*>(posm_.as<char>() + static_cast<std::size_t>(n) * 8);
+        long_run_starts<<<g, BS, 0, s>>>(keys, flags, n);
+        CK_LAUNCH();
+        std::size_t need = 0;
+        CK(cub::DeviceScan::InclusiveSum(nullptr, need, flags, incl, n, s));
+        reserve_temp(need);
+        need = temp_bytes_;
+        CK(cub::DeviceScan::InclusiveSum(temp_.as<void>(), need, flags, incl, n, s));
+        long_run_init<<<g, BS, 0, s>>>(flags, incl, info, n);
+        CK_LAUNCH();
+        long_run_box<<<g, BS, 0, s>>>(keys, incl, x_.as<float>(), y_.as<float>(), z_.as<float>(), info, n);
+        CK_LAUNCH();
+        int pbits = 0;  // bits of n - 1, the largest segment start
+        while ((1ll << pbits) < n) ++pbits;
+        const int so3 = 3 * std::min(21, (64 - pbits) / 3);
+        long_run_keys<<<g, BS, 0, s>>>(keys, incl, info, x_.as<float>(), y_.as<float>(), z_.as<float>(), so3, key2,
+                                       idx_[0].as<uint32_t>(), n);
+        CK_LAUNCH();
+        cub::DoubleBuffer<uint64_t> kb(key2, keys_[1 - key_sel_].as<uint64_t>());
+        cub::DoubleBuffer<uint32_t> vb(idx_[0].as<uint32_t>(), idx_[1].as<uint32_t>());
+        need = 0;
+        CK(cub::DeviceRadixSort::SortPairs(nullptr, need, kb, vb, n, 0, pbits + so3, s));
+        reserve_temp(need);
+        need = temp_bytes_;
+        CK(cub::DeviceRadixSort::SortPairs(temp_.as<void>(), need, kb, vb, n, 0, pbits + so3, s));
+        long_run_subkeys<<<g, BS, 0, s>>>(kb.Current(), key2, so3, n);
+        CK_LAUNCH();
+        // Keys are unchanged: only bodies with identical keys moved.
+        const int vs = vb.selector;
+        const uint32_t* perm = idx_[vs].as<uint32_t>();
+        for (DevBuf* b : {&x_, &y_, &z_, &m_, &vx_, &vy_, &vz_, &id_}) {
+            gather_u32<<<g, BS, 0, s>>>(b->as<uint32_t>(), perm, idx_[1 - vs].as<uint32_t>(), n);
+            CK_LAUNCH();
+            swap(*b, idx_[1 - vs]);
+        }
+        scratch_sel_ = 1 - vs;
+        return key2;
+    }
+
+    // Returns the number of leaves K. Host-synchronises once to read K for sizing (twice if long
+    // runs need refining: the first leaf build then only detects them).
+    int build_tree_impl(double theta) {
+        cudaStream_t s = stream_->s;
+        const int n = n_;
+        bool dup = false;
+        const uint64_t* sub = nullptr;
+        int K = build_leaves(nullptr, dup);
+        refined_ = dup;
+        if (dup) {
+            sub = refine_runs();
+            K = build_leaves(sub, dup);
+        }
+        const uint64_t* keys = keys_[key_sel_].as<uint64_t>();
+        const int* start = reinterpret_cast<const int*>(keys_[1 - key_sel_].as<char>());
 
         const std::size_t nodes = 2 * static_cast<std::size_t>(K) - 1;
         for (DevBuf* b : {&nodeA_, &nodeB_, &nodeC_, &bmin_, &bmax_}) b->reserve(nodes * sizeof(float4));
@@ -1734,8 +1974,13 @@ private:
         CK(cudaMemsetAsync(parent_.as<int>(), 0xff, sizeof(int), s));  // root's parent = -1
         if (K > 1) {
             CK(cudaMemsetAsync(counter_.as<int>(), 0, static_cast<std::size_t>(K - 1) * sizeof(int), s));
-            build_radix<<<grid_for(K - 1, BS), BS, 0, s>>>(keys, start, K, nodeC_.as<float4>(), parent_.as<int>(),
+            build_radix<<<grid_for(K - 1, BS), BS, 0, s>>>(keys, sub, start, K, nodeC_.as<float4>(), parent_.as<int>(),
                                                            nodeR_.as<int2>());
+            CK_LAUNCH();
+        }
+        if (sub) {  // the subkeys lived in posm_
+            pack_posm<<<grid_for(n, BS), BS, 0, s>>>(x_.as<float>(), y_.as<float>(), z_.as<float>(), m_.as<float>(),
+                                                     posm_.as<float4>(), n);
             CK_LAUNCH();
         }
         const float inv_theta = theta > 1.0 / RCRIT_MAX ? static_cast<float>(1.0 / theta) : RCRIT_MAX;
@@ -1763,6 +2008,8 @@ private:
     bool tree_ok_ = false;       // tree (and groups) match the current positions
     bool host_nodes_ok_ = false; // hA_/hB_/hC_ hold the current tree
     bool costs_ok_ = false;      // counts_ are the last force call's, in the current body order
+    bool acc_ok_ = false;        // ax/ay/az are for the current body order
+    bool refined_ = false;       // the current tree has subkeys (deeper: DEPTH_SUB)
     std::vector<float4> hA_, hB_, hC_, hLA_, hLB_, hLC_, hLBody_;
     int key_sel_ = 0, scratch_sel_ = 1;
     std::size_t temp_bytes_ = 0;
