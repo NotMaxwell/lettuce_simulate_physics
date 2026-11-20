@@ -34,6 +34,9 @@ build/clang-release/lettuce --list                     # scenarios
 build/clang-release/lettuce configs/solar.ini --print  # effective configuration
 ```
 
+In `.ini` files, `#` and `;` start a comment only at the start of a line or after whitespace,
+so values such as `out_dir = runs/exp#2` are kept whole.
+
 | Scenario | What it is |
 |---|---|
 | `plummer` | star cluster in virial equilibrium |

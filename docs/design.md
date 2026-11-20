@@ -24,7 +24,11 @@ per-body time steps yet.
   (`method = auto` switches at `auto_direct_max`).
 - **tree**: Barnes-Hut, O(N log N), after the design in the `gpu-physics` branch's
   `docs/sim3d.md`:
-  1. Bounding cube, 63-bit Morton keys (21 bits per axis).
+  1. Bounding cube, 63-bit Morton keys (21 bits per axis). When the 21 levels run out with more
+     than a leaf's worth of non-coincident bodies (a far escaper shrinks the cluster to a few
+     cells), those bodies are re-keyed inside their own bounding cube and subdivided further
+     (CPU: per node; CUDA: a secondary key per run of identical keys). Without this the walk
+     degrades to O(N^2).
   2. Stable radix sort of the bodies by key. Bodies *stay* in sorted order between steps, so a
      backend's arrays are permuted and `Bodies::id` carries identity.
   3. Tree over the sorted keys, leaves of up to ~32 consecutive bodies.
