@@ -1,19 +1,83 @@
 #!/bin/bash
 # Set up, build and test on a Brev GPU instance (Ubuntu 22.04 or 24.04 with the NVIDIA driver and
-# CUDA, normally in /usr/local/cuda). Run from the repo root:
-#   bash cluster/brev_setup.sh
-# Everything is also written to out/brev-report.txt; paste that file back when asking for help.
+# CUDA, normally in /usr/local/cuda). Two ways to run it:
+#   bash cluster/brev_setup.sh        from the repo root
+#   paste the whole file into Brev's "Setup Script" box (runs as root on a fresh VM, no repo yet)
+# Outside a repo root it clones/updates the fork into $LETTUCE_DIR. As root with a sudo-capable
+# login user it re-runs itself as that user so the clone, build and out/ belong to them.
+# The report is <repo>/out/brev-report.txt; paste that file back when asking for help.
+#
+# Env: LETTUCE_DIR (default ~/lettuce_simulate_physics), LETTUCE_BRANCH (default main),
+#      CUDA_HOME, LLVM, LLVM_NEW.
 #
 # It picks the toolchain itself: Clang 18 (Clang 20 when CUDA is newer than 12.3, which Clang 18
 # does not know), installed from apt.llvm.org when the distro lacks it; CMake from pip when the
 # distro's is older than 3.24; and if the Clang build fails anyway, the GCC + nvcc fallback.
 set -uo pipefail
+
+die() { echo "FATAL: $*"; exit 1; }
+export HOME=${HOME:-/root}
+
+if [ "$(id -u)" -eq 0 ]; then SUDO=(); else SUDO=(sudo); fi
+# First boot: unattended-upgrades may hold the dpkg lock for minutes.
+aptg() { "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 "$@"; }
+
+if [ "$(id -u)" -eq 0 ] && [ -z "${LETTUCE_REEXEC:-}" ]; then
+  SELF_SRC=$(readlink -f "${BASH_SOURCE[0]:-}" 2>/dev/null)
+  [ -n "${LETTUCE_DIR:-}" ] || { [ -f CMakePresets.json ] && [ -f cluster/brev_setup.sh ] && LETTUCE_DIR=$PWD; }
+  cd /
+  RUSER=${SUDO_USER:-}
+  if [ -z "$RUSER" ] || [ "$RUSER" = root ]; then RUSER=$(getent passwd 1000 | cut -d: -f1); fi
+  if [ -n "$RUSER" ] && [ "$RUSER" != root ] && command -v sudo >/dev/null && sudo -n -u "$RUSER" sudo -n true 2>/dev/null; then
+    ENVV=(LETTUCE_REEXEC=1)
+    for v in CUDA_HOME LLVM LLVM_NEW LETTUCE_DIR LETTUCE_BRANCH; do
+      if [ -n "${!v:-}" ]; then ENVV+=("$v=${!v}"); fi
+    done
+    echo "running as root; re-running as $RUSER"
+    # The script may live somewhere that user cannot read: hand over a copy.
+    if [ -f "$SELF_SRC" ] && [ -r "$SELF_SRC" ] &&
+       SELF=$(mktemp /tmp/brev_setup.XXXXXX.sh) && cp "$SELF_SRC" "$SELF" && chmod 755 "$SELF"; then
+      sudo -u "$RUSER" -H env "${ENVV[@]}" bash "$SELF" "$@"; rc=$?
+      rm -f "$SELF"
+      exit $rc
+    fi
+    # Pasted via bash -c or stdin: no file to copy, so clone as the user and run the repo's copy.
+    DIR=${LETTUCE_DIR:-$(getent passwd "$RUSER" | cut -d: -f6)/lettuce_simulate_physics}
+    command -v git >/dev/null || { aptg update -qq && aptg install -y -qq git; } || die "cannot install git"
+    if [ -d "$DIR/.git" ]; then
+      sudo -u "$RUSER" -H git -C "$DIR" pull --ff-only || echo "WARNING: git pull failed; building the existing checkout"
+    else
+      sudo -u "$RUSER" -H git clone --branch "${LETTUCE_BRANCH:-main}" \
+        https://github.com/NotMaxwell/lettuce_simulate_physics.git "$DIR" || die "git clone failed"
+    fi
+    cd "$DIR" || die "cannot cd to $DIR"
+    sudo -u "$RUSER" -H env "${ENVV[@]}" LETTUCE_DIR="$DIR" bash "$DIR/cluster/brev_setup.sh" "$@"
+    exit $?
+  fi
+  echo "no sudo-capable login user (or script not readable); staying root"
+fi
+if [ "$(id -u)" -eq 0 ]; then export OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1; fi
+
+LETTUCE_DIR=${LETTUCE_DIR:-${HOME:-/root}/lettuce_simulate_physics}
+if [ -f CMakePresets.json ] && [ -f cluster/brev_setup.sh ]; then REPO=$PWD; else REPO=$LETTUCE_DIR; fi
+echo "report will be at $REPO/out/brev-report.txt"
+
+if [ "$REPO" != "$PWD" ]; then
+  command -v git >/dev/null || { aptg update -qq && aptg install -y -qq git; } || die "cannot install git"
+  if [ -d "$REPO/.git" ]; then
+    git -C "$REPO" pull --ff-only || echo "WARNING: git pull failed; building the existing checkout"
+  else
+    git clone --branch "${LETTUCE_BRANCH:-main}" https://github.com/NotMaxwell/lettuce_simulate_physics.git "$REPO" ||
+      die "git clone failed"
+  fi
+  cd "$REPO" || die "cannot cd to $REPO"
+fi
+
 mkdir -p out
-REPORT=out/brev-report.txt
+REPORT=$PWD/out/brev-report.txt
 exec > >(tee "$REPORT") 2>&1
 
 step() { echo; echo "=== $*"; }
-die() { echo "FATAL: $*"; exit 1; }
 
 step "machine"
 . /etc/os-release && echo "$PRETTY_NAME"
@@ -30,13 +94,13 @@ if [ "$(printf '%s\n' "$CUDA_VER" 12.3 | sort -V | tail -1)" != "12.3" ]; then L
 echo "using LLVM $LLVM"
 
 step "packages"
-sudo apt-get update -qq
-sudo apt-get install -y -qq ninja-build libopenmpi-dev openmpi-bin g++-12 python3-pip wget gnupg lsb-release \
+aptg update -qq
+aptg install -y -qq ninja-build libopenmpi-dev openmpi-bin g++-12 python3-pip wget gnupg lsb-release \
   software-properties-common || die "apt-get install failed"
-if ! sudo apt-get install -y -qq "clang-$LLVM" "lld-$LLVM" "libc++-$LLVM-dev" "libc++abi-$LLVM-dev" "libomp-$LLVM-dev"; then
+if ! aptg install -y -qq "clang-$LLVM" "lld-$LLVM" "libc++-$LLVM-dev" "libc++abi-$LLVM-dev" "libomp-$LLVM-dev"; then
   echo "clang-$LLVM not in this distro's apt; adding apt.llvm.org"
   wget -q https://apt.llvm.org/llvm.sh -O /tmp/llvm.sh || die "cannot download llvm.sh"
-  sudo bash /tmp/llvm.sh "$LLVM" all || die "llvm.sh failed"
+  "${SUDO[@]}" bash /tmp/llvm.sh "$LLVM" all || die "llvm.sh failed"
 fi
 CMV=$(cmake --version 2>/dev/null | awk 'NR==1{print $3}')
 if [ -z "$CMV" ] || [ "$(printf '%s\n' "$CMV" 3.24 | sort -V | head -1)" != "3.24" ]; then
