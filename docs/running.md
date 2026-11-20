@@ -84,16 +84,26 @@ fallback) inside `nvidia/cuda:12.8.1-devel-ubuntu24.04`. Plummer, eps 0.01, thet
 
 Open issues from that run:
 - `n=1e9` printed the bench header, then the VM stopped responding (sshd unreachable; the instance
-  had to be deleted). 5e8 ran fine. Investigated without a GPU (2026-11-19): no 32-bit overflow on
+  had to be deleted). 5e8 ran fine. Investigated without a GPU: no 32-bit overflow on
   the 1e9 path; scenario generation peaked at 88 B/body of host memory (measured to 1e8, ~88 GB at
   1e9 by extrapolation), now 60 B/body; the GPU needs ~112 B/body (~113 GB at 1e9, from the code
   and the leaf count measured on the host). Neither budget explains the hang on paper, so the cause
   is still open; the pre-flight check and the container memory cap are the guards meanwhile.
-- Two CUDA tests fail on the GPU (both duplicate-Morton-key cases): "tree with coincident bodies"
-  (theta 0 rel rms 5.1e-5 > 1e-5) and "group walk at theta 0 is exact, with groups split by
-  duplicate keys" (interaction count ≠ 3000·2999, pe off by 8.4e-5). The group walk had never run on
-  a GPU before this.
-- The Clang CUDA build failed: CUDA 12.8's `crt/host_defines.h` rejects libc++ on x86.
+- Two CUDA tests failed (both duplicate-Morton-key cases): "tree with coincident bodies" (theta 0
+  rel rms 5.1e-5 > 1e-5) and "group walk at theta 0 is exact, with groups split by duplicate keys"
+  (interaction count ≠ 3000·2999, pe off by 8.4e-5). Fixed in 5f7bab6 (zero-extent cells were never
+  opened at theta 0; rounding could let a group's own bodies in as a cell), reproduced and checked
+  with a host port of the walk logic; not yet confirmed on a GPU.
+- The Clang CUDA build failed: CUDA 12.8's `crt/host_defines.h` rejects libc++ on x86. Fixed in
+  c4c04ea (`_ALLOW_UNSUPPORTED_LIBCPP` for CUDA TUs); compiles in the CUDA 12.8 container, not yet run
+  on a GPU.
+
+Next GPU run must confirm: the report's `build:` line says `build/clang-release`; CUDA tests
+`17 run, 0 failed, 0 skipped`, with the coincident-bodies test at interactions 89700 for all three
+walks and the theta-0 exact test at 8997000 for group 64 and 32; the bench numbers above are not
+slower (the per-body walk gained one range load per accepted cell); then `n=1e9` with the memory
+logging above, recording peak host RSS and GPU memory against the ~60 B/body host and ~112 B/body
+GPU estimates.
 
 Live view from your laptop: start a run with `live=8080`, then
 `ssh -L 8080:localhost:8080 <name>` and open `http://localhost:8080/`. The tunnel works even on
