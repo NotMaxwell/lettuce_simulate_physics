@@ -45,6 +45,8 @@ is the fallback and the reference the CUDA backend is checked against.
 - `live.*` browser live view: HTTP + MJPEG server, render thread, pause/step/stop gate
 - `parallel.*` MPI: one rank per GPU, cost-balanced Morton domains, LET exchange (`docs/multigpu.md`);
   degrades to one rank without MPI. Driver code that runs per step must stay collective.
+- `memcheck.*` collective pre-flight host/GPU memory estimate; refuses (`lettuce`) or skips
+  (`lettuce-bench`) an n that won't fit, before generating bodies. `LETTUCE_SKIP_MEMCHECK=1` overrides.
 - `main.cpp` (`lettuce`), `bench.cpp` (`lettuce-bench`), `render_main.cpp` (`lettuce-render`)
 - Design notes: `docs/design.md`. Running on Brev / ASA-X: `docs/running.md`.
 
